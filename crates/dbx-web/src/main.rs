@@ -22,6 +22,16 @@ use tower_http::cors::{Any, CorsLayer};
 
 use state::WebState;
 
+fn web_body_limit_bytes() -> usize {
+    const DEFAULT_MB: usize = 1024;
+    let mb = std::env::var("DBX_MAX_UPLOAD_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MB);
+    mb.saturating_mul(1024 * 1024)
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -52,7 +62,7 @@ async fn main() {
     };
 
     // Password hash: env var takes priority, then database
-    let password_hash = if let Some(pw) = std::env::var("DBX_PASSWORD").ok() {
+    let password_hash = if let Ok(pw) = std::env::var("DBX_PASSWORD") {
         let salt = SaltString::generate(&mut OsRng);
         Some(Argon2::default().hash_password(pw.as_bytes(), &salt).expect("Failed to hash password").to_string())
     } else {
@@ -65,7 +75,9 @@ async fn main() {
         password_hash: RwLock::new(password_hash),
         sessions: RwLock::new(HashSet::new()),
         sse_channels: RwLock::new(HashMap::new()),
+        sql_file_executions: RwLock::new(HashMap::new()),
         login_rate_limit: tokio::sync::Mutex::new(state::LoginRateLimit { fail_count: 0, locked_until: None }),
+        export_files: RwLock::new(HashMap::new()),
     });
 
     // CORS
@@ -82,7 +94,9 @@ async fn main() {
         // Connection
         .route("/connection/test", post(routes::connection::test_connection))
         .route("/connection/connect", post(routes::connection::connect_db))
+        .route("/connection/final-proxy-port", post(routes::connection::connection_final_proxy_port))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
+        .route("/connection/close-database", post(routes::connection::close_database_connection))
         .route("/connection/save", post(routes::connection::save_connections))
         .route("/connection/list", get(routes::connection::load_connections))
         .route("/plugins", get(routes::plugins::list_plugins))
@@ -99,6 +113,9 @@ async fn main() {
         .route("/agents/installed-local", get(routes::agents::list_installed_agents_local))
         .route("/agents/installed", get(routes::agents::list_installed_agents))
         .route("/agents/storage-usage", get(routes::agents::get_driver_store_usage))
+        .route("/agents/runtime", get(routes::agents::get_driver_runtime_summary))
+        .route("/agents/runtime/stop", post(routes::agents::stop_driver_runtime))
+        .route("/agents/runtime/restart", post(routes::agents::restart_driver_runtime))
         .route("/agents/install", post(routes::agents::install_agent))
         .route("/agents/upgrade-all", post(routes::agents::upgrade_all_agents))
         .route("/agents/uninstall", post(routes::agents::uninstall_agent))
@@ -117,6 +134,7 @@ async fn main() {
         .route("/schema/schemas", get(routes::schema::list_schemas))
         .route("/schema/tables", get(routes::schema::list_tables))
         .route("/schema/objects", get(routes::schema::list_objects))
+        .route("/schema/completion-objects", get(routes::schema::list_completion_objects))
         .route("/schema/object-source", get(routes::schema::get_object_source))
         .route("/schema/columns", get(routes::schema::list_columns))
         .route("/schema/indexes", get(routes::schema::list_indexes))
@@ -130,6 +148,12 @@ async fn main() {
             post(routes::schema_cache::save_schema_cache).get(routes::schema_cache::load_schema_cache),
         )
         .route("/schema/cache-prefix", delete(routes::schema_cache::delete_schema_cache_prefix))
+        .route(
+            "/tab-runtime-cache",
+            post(routes::tab_runtime_cache::save_tab_runtime_cache)
+                .get(routes::tab_runtime_cache::load_tab_runtime_cache)
+                .delete(routes::tab_runtime_cache::delete_tab_runtime_cache),
+        )
         // Query
         .route("/query/execute", post(routes::query::execute_query))
         .route("/query/execute-multi", post(routes::query::execute_multi))
@@ -142,6 +166,8 @@ async fn main() {
         .route("/query/build-sorted-sql", post(routes::query::build_sorted_query_sql))
         .route("/query/build-explain-sql", post(routes::query::build_explain_sql))
         .route("/query/build-dropped-file-preview-sql", post(routes::query::build_dropped_file_preview_sql))
+        .route("/query/get-explain-info", post(routes::query::get_explain_info))
+        .route("/query/build-create-user-sql", post(routes::query::build_create_user_sql))
         .route("/query/build-table-select-sql", post(routes::query::build_table_select_sql))
         .route("/query/build-database-search-sql", post(routes::query::build_database_search_sql))
         .route("/query/build-search-result-where", post(routes::query::build_search_result_where))
@@ -150,6 +176,7 @@ async fn main() {
         .route("/query/build-duckdb-attach-database-sql", post(routes::query::build_duckdb_attach_database_sql))
         .route("/query/build-drop-object-sql", post(routes::query::build_drop_object_sql))
         .route("/query/build-drop-table-sql", post(routes::query::build_drop_table_sql))
+        .route("/query/build-drop-table-child-object-sql", post(routes::query::build_drop_table_child_object_sql))
         .route("/query/build-empty-table-sql", post(routes::query::build_empty_table_sql))
         .route("/query/build-truncate-table-sql", post(routes::query::build_truncate_table_sql))
         .route("/query/build-drop-database-sql", post(routes::query::build_drop_database_sql))
@@ -168,6 +195,7 @@ async fn main() {
         .route("/query/build-view-ddl-sql", post(routes::query::build_view_ddl_sql))
         .route("/query/build-table-structure-change-sql", post(routes::query::build_table_structure_change_sql))
         .route("/query/build-create-table-sql", post(routes::query::build_create_table_sql))
+        .route("/query/build-single-column-alter-sql", post(routes::query::build_single_column_alter_sql))
         .route("/query/analyze-editability", post(routes::query::analyze_editable_query_editability))
         .route("/query/prepare-data-grid-save", post(routes::query::prepare_data_grid_save))
         .route(
@@ -193,6 +221,7 @@ async fn main() {
         .route("/query/build-database-sql-export", post(routes::query::build_database_sql_export))
         .route("/data-compare/prepare", post(routes::data_compare::prepare_data_compare))
         .route("/data-compare/prepare-from-tables", post(routes::data_compare::prepare_data_compare_from_tables))
+        .route("/data-compare/prepare-missing-target", post(routes::data_compare::prepare_data_compare_missing_target))
         .route("/data-compare/build-sync-plan", post(routes::data_compare::build_data_compare_sync_plan))
         .route("/query/cancel", post(routes::query::cancel_query))
         .route("/query/close-session", post(routes::query::close_query_session))
@@ -213,9 +242,18 @@ async fn main() {
         .route("/redis/list-remove", post(routes::redis::list_remove))
         .route("/redis/set-add", post(routes::redis::set_add))
         .route("/redis/set-remove", post(routes::redis::set_remove))
+        .route("/redis/zadd", post(routes::redis::zadd))
+        .route("/redis/stream-add", post(routes::redis::stream_add))
+        .route("/redis/json-set", post(routes::redis::json_set))
+        .route("/redis/check-json-module", post(routes::redis::check_json_module))
         .route("/redis/delete-keys", post(routes::redis::delete_keys))
         .route("/redis/flush-db", post(routes::redis::flush_db))
         .route("/redis/execute-command", post(routes::redis::execute_command))
+        // etcd
+        .route("/etcd/list-prefix", post(routes::etcd::list_prefix))
+        .route("/etcd/get", post(routes::etcd::get))
+        .route("/etcd/put", post(routes::etcd::put))
+        .route("/etcd/delete", post(routes::etcd::delete))
         // MongoDB
         .route("/mongo/list-databases", post(routes::mongo::list_databases))
         .route("/mongo/list-collections", post(routes::mongo::list_collections))
@@ -257,6 +295,11 @@ async fn main() {
         .route("/export/database", post(routes::database_export::start_database_export))
         .route("/export/database/progress/{exportId}", get(routes::database_export::database_export_progress))
         .route("/export/database/cancel", post(routes::database_export::cancel_database_export))
+        // Table export
+        .route("/export/table", post(routes::table_export::start_table_export))
+        .route("/export/table/progress/{exportId}", get(routes::table_export::table_export_progress))
+        .route("/export/table/download/{exportId}", get(routes::table_export::table_export_download))
+        .route("/export/table/cancel", post(routes::table_export::cancel_table_export))
         // SQL file
         .route("/sql-file/preview", post(routes::sql_file::preview_sql_file))
         .route("/sql-file/execute", post(routes::sql_file::execute_sql_file))
@@ -277,13 +320,14 @@ async fn main() {
             "/app-settings/pinned-tree-node-ids",
             get(routes::app_settings::load_pinned_tree_node_ids).post(routes::app_settings::save_pinned_tree_node_ids),
         )
+        .route("/app-settings/config/decrypt", post(routes::app_settings::decrypt_config))
         .layer(middleware::from_fn_with_state(web_state.clone(), auth::auth_middleware))
         .with_state(web_state.clone());
 
     // Build app
     let mut app = Router::new()
         .nest("/api", api)
-        .layer(DefaultBodyLimit::max(300 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(web_body_limit_bytes()))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(cors);
 

@@ -30,16 +30,11 @@ import {
   X,
   Zap,
   TestTube,
-} from "lucide-vue-next";
+} from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import LightDropdown from "@/components/ui/LightDropdown.vue";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useTheme } from "@/composables/useTheme";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -66,7 +61,12 @@ import {
 import type { AiMessage } from "@/lib/api";
 import type { ConnectionConfig, QueryTab, TableInfo } from "@/types/database";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
-import { resolveDefaultDatabase } from "@/lib/defaultDatabase";
+import {
+  decodeSelectableDatabaseValue,
+  encodeSelectableDatabaseValue,
+  formatDatabaseLabel,
+  resolveDefaultDatabase,
+} from "@/lib/defaultDatabase";
 import { isSchemaAware } from "@/lib/databaseCapabilities";
 import { copyToClipboard } from "@/lib/clipboard";
 import { formatAiTableMention, parseAiTableMentions, type AiTableMention } from "@/lib/aiTableMentions";
@@ -166,6 +166,27 @@ const activePlaceholder = computed(
   () => `${t(`ai.placeholders.${activeAction.value}`)} ${t("ai.tableMentionPlaceholderHint")}`,
 );
 const activeModeHint = computed(() => t(`ai.modeHints.${assistantMode.value}`));
+const assistantModeItems = computed(() => [
+  {
+    value: "ask",
+    label: t("ai.modes.ask"),
+    title: t("ai.modeHints.ask"),
+    icon: MessageSquarePlus,
+  },
+  {
+    value: "agent",
+    label: t("ai.modes.agent"),
+    title: t("ai.modeHints.agent"),
+    icon: Bot,
+  },
+]);
+const actionMenuItems = computed(() =>
+  actionButtons.map((button) => ({
+    value: button.action,
+    label: t(button.key),
+    icon: button.icon,
+  })),
+);
 const aiCodeAppearance = computed(() => (isDark.value ? "dark" : "light"));
 
 const { databaseOptions: allDbOptions, loadDatabaseOptions } = useDatabaseOptions();
@@ -173,6 +194,32 @@ const { databaseOptions: allDbOptions, loadDatabaseOptions } = useDatabaseOption
 const dbOptions = computed(() => {
   if (!props.connection) return [];
   return allDbOptions.value[props.connection.id] || [];
+});
+
+const dbSelectOptions = computed(() => {
+  const connection = props.connection;
+  if (!connection) return [];
+  return dbOptions.value.map((database) => ({
+    database,
+    value: encodeSelectableDatabaseValue(connection.db_type, database),
+    label: formatDatabaseLabel(connection, database, {
+      defaultDatabase: t("editor.defaultDatabase"),
+      noDatabase: t("editor.noDatabase"),
+    }),
+  }));
+});
+
+const selectedDatabaseSelectValue = computed(() =>
+  props.connection ? encodeSelectableDatabaseValue(props.connection.db_type, props.tab?.database || "") : "",
+);
+
+const selectedDatabaseLabel = computed(() => {
+  if (!props.connection) return t("editor.selectDatabase");
+  if (!props.tab) return t("editor.selectDatabase");
+  return formatDatabaseLabel(props.connection, props.tab.database || "", {
+    defaultDatabase: t("editor.defaultDatabase"),
+    noDatabase: t("editor.noDatabase"),
+  });
 });
 
 async function loadDatabases() {
@@ -201,10 +248,11 @@ async function changeConnection(connectionId: string) {
   }
 }
 
-function changeDatabase(database: string) {
+function changeDatabase(value: string) {
   const tab = props.tab;
-  if (!tab) return;
-  queryStore.updateDatabase(tab.id, database);
+  const connection = props.connection;
+  if (!tab || !connection) return;
+  queryStore.updateDatabase(tab.id, decodeSelectableDatabaseValue(connection.db_type, value));
 }
 
 function appendAssistantDelta(assistantIdx: number, delta: string) {
@@ -674,7 +722,9 @@ const messageRenderer = computed(() => {
       class="flex items-center gap-2 border-b px-3 shrink-0"
       :class="settings.editorSettings.appLayout === 'classic' ? 'h-9' : 'h-10'"
     >
-      <span class="flex-1 truncate text-xs font-medium">{{ chatTitle }}</span>
+      <span class="flex flex-1 self-stretch items-center truncate text-xs font-medium" data-tauri-drag-region>
+        {{ chatTitle }}
+      </span>
       <Button variant="ghost" size="icon" class="h-6 w-6" @click="startNewChat" :title="t('ai.newChat')">
         <MessageSquarePlus class="h-3.5 w-3.5" />
       </Button>
@@ -867,7 +917,7 @@ const messageRenderer = computed(() => {
           <template v-if="connection">
             <Database class="h-3 w-3 shrink-0 text-foreground/40" />
             <Select
-              :model-value="tab?.database || ''"
+              :model-value="selectedDatabaseSelectValue"
               @update:model-value="(v: any) => changeDatabase(v)"
               @update:open="
                 (open: boolean) => {
@@ -878,14 +928,14 @@ const messageRenderer = computed(() => {
               <SelectTrigger
                 class="h-5 w-auto border-0 rounded-md bg-transparent dark:bg-transparent p-0 px-1 text-xs text-foreground/80 shadow-none focus:ring-0 focus-visible:ring-0 [&_svg]:size-3"
               >
-                <SelectValue :placeholder="t('editor.selectDatabase')">{{
-                  tab?.database || t("editor.selectDatabase")
-                }}</SelectValue>
+                <SelectValue :placeholder="t('editor.selectDatabase')">{{ selectedDatabaseLabel }}</SelectValue>
               </SelectTrigger>
               <SelectContent>
-                <SelectItem v-for="db in dbOptions" :key="db" :value="db">{{ db }}</SelectItem>
-                <SelectItem v-if="!dbOptions.length && tab?.database" :value="tab.database">{{
-                  tab.database
+                <SelectItem v-for="option in dbSelectOptions" :key="option.value" :value="option.value">{{
+                  option.label
+                }}</SelectItem>
+                <SelectItem v-if="!dbSelectOptions.length && connection && tab" :value="selectedDatabaseSelectValue">{{
+                  selectedDatabaseLabel
                 }}</SelectItem>
               </SelectContent>
             </Select>
@@ -954,78 +1004,19 @@ const messageRenderer = computed(() => {
           @keydown="onPromptKeydown"
         />
         <div class="flex items-center gap-1.5">
-          <DropdownMenu>
-            <DropdownMenuTrigger as-child>
-              <button
-                class="flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
-                :title="activeModeHint"
-              >
-                <component :is="assistantMode === 'agent' ? Bot : MessageSquarePlus" class="h-3 w-3" />
-                <span>{{ t(`ai.modes.${assistantMode}`) }}</span>
-                <svg
-                  class="h-3 w-3 opacity-50"
-                  xmlns="http://www.w3.org/2000/svg"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                >
-                  <path d="m6 9 6 6 6-6" />
-                </svg>
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start">
-              <DropdownMenuItem class="text-xs gap-1.5" :title="t('ai.modeHints.ask')" @click="assistantMode = 'ask'">
-                <Check class="h-3 w-3 shrink-0" :class="{ 'opacity-0': assistantMode !== 'ask' }" />
-                <MessageSquarePlus class="h-3 w-3 shrink-0 text-muted-foreground" />
-                <span>{{ t("ai.modes.ask") }}</span>
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                class="text-xs gap-1.5"
-                :title="t('ai.modeHints.agent')"
-                @click="assistantMode = 'agent'"
-              >
-                <Check class="h-3 w-3 shrink-0" :class="{ 'opacity-0': assistantMode !== 'agent' }" />
-                <Bot class="h-3 w-3 shrink-0 text-muted-foreground" />
-                <span>{{ t("ai.modes.agent") }}</span>
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <DropdownMenu>
-            <DropdownMenuTrigger as-child>
-              <button
-                class="flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
-              >
-                <component :is="actionButtons.find((b) => b.action === activeAction)?.icon" class="h-3 w-3" />
-                <span>{{ t(`ai.actions.${activeAction}`) }}</span>
-                <svg
-                  class="h-3 w-3 opacity-50"
-                  xmlns="http://www.w3.org/2000/svg"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                >
-                  <path d="m6 9 6 6 6-6" />
-                </svg>
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" class="w-max min-w-0">
-              <DropdownMenuItem
-                v-for="btn in actionButtons"
-                :key="btn.action"
-                class="text-xs gap-1.5"
-                @click="selectAction(btn.action)"
-              >
-                <component :is="btn.icon" class="h-3 w-3" />
-                <span>{{ t(btn.key) }}</span>
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <LightDropdown
+            v-model="assistantMode"
+            :items="assistantModeItems"
+            :aria-label="activeModeHint"
+            item-class="text-xs px-2"
+          />
+          <LightDropdown
+            :model-value="activeAction"
+            :items="actionMenuItems"
+            content-class="w-max min-w-0"
+            item-class="text-xs px-2"
+            @update:model-value="(value) => selectAction(value as AiAction)"
+          />
           <span class="flex-1" />
           <button
             v-if="isGenerating"

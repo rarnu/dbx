@@ -10,6 +10,8 @@ pub struct TableInfo {
     pub name: String,
     pub table_type: String, // "TABLE" or "VIEW"
     pub comment: Option<String>,
+    pub parent_schema: Option<String>,
+    pub parent_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +22,8 @@ pub struct ObjectInfo {
     pub comment: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    pub parent_schema: Option<String>,
+    pub parent_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,6 +32,9 @@ pub enum ObjectSourceKind {
     View,
     Procedure,
     Function,
+    Sequence,
+    Package,
+    PackageBody,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +62,15 @@ pub struct ColumnInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     pub columns: Vec<String>,
+    /// Database type name for each column, parallel to `columns`. May be empty
+    /// when a driver cannot supply types (e.g. schemaless stores or fallback
+    /// query paths); consumers must tolerate a shorter/empty vector.
+    #[serde(default)]
+    pub column_types: Vec<String>,
+    /// Sortable for each column. Parallel to `columns`. Optional and may
+    /// be shorter/empty when a driver cannot supply sortable information.
+    #[serde(default)]
+    pub column_sortables: Vec<bool>,
     pub rows: Vec<Vec<serde_json::Value>>,
     pub affected_rows: u64,
     pub execution_time_ms: u128,
@@ -82,6 +98,8 @@ pub struct IndexInfo {
 pub struct ForeignKeyInfo {
     pub name: String,
     pub column: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_schema: Option<String>,
     pub ref_table: String,
     pub ref_column: String,
 }

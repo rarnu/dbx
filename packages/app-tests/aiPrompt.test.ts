@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import test from "node:test";
+import { test } from "vitest";
 import type { AiContext } from "../../apps/desktop/src/lib/ai.ts";
 
 class MemoryStorage {
@@ -22,8 +22,11 @@ class MemoryStorage {
   }
 }
 
+const localStorage = new MemoryStorage();
+localStorage.setItem("dbx-locale", "zh-CN");
+
 Object.defineProperty(globalThis, "localStorage", {
-  value: new MemoryStorage(),
+  value: localStorage,
   configurable: true,
 });
 
@@ -76,6 +79,15 @@ test("prompt gives explicit guidance for truncated schema context", () => {
   assert.match(prompt, /Schema context is truncated/);
   assert.match(prompt, /如果请求可能涉及未出现的表或字段，不要猜测/);
   assert.match(prompt, /@table/);
+});
+
+test("focused table context is not presented as a complete table list", () => {
+  const prompt = buildSystemPrompt("generate", context({ schemaScope: "focused_table" }), "agent");
+
+  assert.match(prompt, /focused table only; not a complete database table list/);
+  assert.match(prompt, /当前打开的表/);
+  assert.match(prompt, /只读元数据查询/);
+  assert.doesNotMatch(prompt, /Schema context is complete\./);
 });
 
 test("prompt enforces database dialect and single executable statement safety", () => {

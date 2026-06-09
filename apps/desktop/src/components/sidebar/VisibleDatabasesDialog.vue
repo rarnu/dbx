@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { CheckSquare, Loader2, Search, Square } from "lucide-vue-next";
+import { CheckSquare, Loader2, Search, Square } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { useConnectionStore } from "@/stores/connectionStore";
 import {
+  canSaveVisibleDatabaseSelection,
   filterDatabaseNamesForConnection,
   isSystemDatabaseName,
   normalizeVisibleDatabaseSelection,
@@ -45,6 +46,7 @@ const filteredDatabaseNames = computed(() => {
 });
 const selectedCount = computed(() => selectedNames.value.size);
 const totalCount = computed(() => listedDatabaseNames.value.length);
+const canSaveSelection = computed(() => canSaveVisibleDatabaseSelection([...selectedNames.value]));
 const hasSystemDatabases = computed(() =>
   databaseNames.value.some((database) => isSystemDatabaseName(connection.value?.db_type, database)),
 );
@@ -126,6 +128,7 @@ async function showAllDatabases() {
 }
 
 async function saveSelection() {
+  if (!canSaveSelection.value) return;
   await connectionStore.setVisibleDatabases(props.connectionId, [...selectedNames.value]);
   emit("update:open", false);
 }
@@ -169,6 +172,9 @@ async function saveSelection() {
           </button>
         </div>
       </div>
+      <p v-if="!isLoading && !errorMessage && !canSaveSelection" class="text-xs text-destructive">
+        {{ t("visibleDatabases.emptySelection") }}
+      </p>
 
       <label
         v-if="hasSystemDatabases"
@@ -211,7 +217,7 @@ async function saveSelection() {
 
       <DialogFooter>
         <Button variant="outline" @click="emit('update:open', false)">{{ t("dangerDialog.cancel") }}</Button>
-        <Button :disabled="isLoading || !!errorMessage" @click="saveSelection">
+        <Button :disabled="isLoading || !!errorMessage || !canSaveSelection" @click="saveSelection">
           {{ t("visibleDatabases.save") }}
         </Button>
       </DialogFooter>

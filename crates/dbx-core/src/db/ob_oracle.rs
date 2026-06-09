@@ -56,7 +56,16 @@ pub async fn list_tables(pool: &mysql_async::Pool, schema: &str) -> Result<Vec<T
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
 
-    Ok(rows.iter().map(|row| TableInfo { name: get_str(row, 0), table_type: get_str(row, 1), comment: None }).collect())
+    Ok(rows
+        .iter()
+        .map(|row| TableInfo {
+            name: get_str(row, 0),
+            table_type: get_str(row, 1),
+            comment: None,
+            parent_schema: None,
+            parent_name: None,
+        })
+        .collect())
 }
 
 fn list_objects_sql(schema: &str) -> String {
@@ -70,6 +79,11 @@ fn list_objects_sql(schema: &str) -> String {
          SELECT OBJECT_NAME, OBJECT_TYPE, CASE WHEN OBJECT_TYPE = 'PROCEDURE' THEN 2 ELSE 3 END AS SORT_ORDER \
          FROM ALL_PROCEDURES \
          WHERE OWNER = {s} AND OBJECT_TYPE IN ('PROCEDURE', 'FUNCTION') AND PROCEDURE_NAME IS NULL \
+         UNION ALL \
+         SELECT OBJECT_NAME, CASE OBJECT_TYPE WHEN 'PACKAGE BODY' THEN 'PACKAGE_BODY' ELSE OBJECT_TYPE END AS OBJECT_TYPE, \
+                CASE WHEN OBJECT_TYPE = 'PACKAGE' THEN 4 ELSE 5 END AS SORT_ORDER \
+         FROM ALL_OBJECTS \
+         WHERE OWNER = {s} AND OBJECT_TYPE IN ('PACKAGE', 'PACKAGE BODY') \
          ORDER BY SORT_ORDER, OBJECT_NAME",
         s = quote_value(schema),
     )
@@ -90,6 +104,8 @@ pub async fn list_objects(pool: &mysql_async::Pool, schema: &str) -> Result<Vec<
             comment: None,
             created_at: None,
             updated_at: None,
+            parent_schema: None,
+            parent_name: None,
         })
         .collect())
 }
@@ -198,7 +214,7 @@ pub async fn list_foreign_keys(
 ) -> Result<Vec<ForeignKeyInfo>, String> {
     let sql = format!(
         "SELECT ac.CONSTRAINT_NAME, acc.COLUMN_NAME, \
-         ac2.TABLE_NAME AS R_TABLE, acc2.COLUMN_NAME AS R_COLUMN \
+         ac2.OWNER AS R_OWNER, ac2.TABLE_NAME AS R_TABLE, acc2.COLUMN_NAME AS R_COLUMN \
          FROM ALL_CONSTRAINTS ac \
          JOIN ALL_CONS_COLUMNS acc ON ac.CONSTRAINT_NAME = acc.CONSTRAINT_NAME AND ac.OWNER = acc.OWNER \
          JOIN ALL_CONSTRAINTS ac2 ON ac.R_CONSTRAINT_NAME = ac2.CONSTRAINT_NAME AND ac.R_OWNER = ac2.OWNER \
@@ -218,8 +234,9 @@ pub async fn list_foreign_keys(
         .map(|row| ForeignKeyInfo {
             name: get_str(row, 0),
             column: get_str(row, 1),
-            ref_table: get_str(row, 2),
-            ref_column: get_str(row, 3),
+            ref_schema: Some(get_str(row, 2)),
+            ref_table: get_str(row, 3),
+            ref_column: get_str(row, 4),
         })
         .collect())
 }
@@ -266,5 +283,8 @@ mod tests {
         assert!(sql.contains("ALL_PROCEDURES"));
         assert!(sql.contains("'PROCEDURE'"));
         assert!(sql.contains("'FUNCTION'"));
+        assert!(sql.contains("ALL_OBJECTS"));
+        assert!(sql.contains("'PACKAGE'"));
+        assert!(sql.contains("'PACKAGE BODY'"));
     }
 }

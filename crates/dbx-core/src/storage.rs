@@ -8,21 +8,53 @@ use uuid::Uuid;
 use crate::ai::{AiChatMessage, AiConfig, AiConversation};
 use crate::db::sqlite::{connect_path_create_if_missing, SqliteHandle};
 use crate::history::{HistoryEntry, MAX_HISTORY};
-use crate::models::connection::ConnectionConfig;
+use crate::models::connection::{ConnectionConfig, TransportLayerConfig};
 use crate::saved_sql::{SavedSqlFile, SavedSqlFolder, SavedSqlLibrary};
+
+const SSH_TUNNEL_SECRET_PREFIX: &str = "ssh_tunnels.";
+const TRANSPORT_LAYER_SECRET_PREFIX: &str = "transport_layers.";
 
 pub struct Storage {
     db: SqliteHandle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabRuntimeCacheEntry {
+    pub key: String,
+    pub payload: Vec<u8>,
+    pub row_count: i64,
+    pub column_count: i64,
+    pub byte_size: i64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopSettings {
     pub show_tray_icon: bool,
+    pub icon_theme: DesktopIconTheme,
+    #[serde(default)]
+    pub debug_logging_enabled: bool,
 }
 
 impl Default for DesktopSettings {
     fn default() -> Self {
-        Self { show_tray_icon: true }
+        Self { show_tray_icon: true, icon_theme: DesktopIconTheme::Default, debug_logging_enabled: false }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopIconTheme {
+    Default,
+    Black,
+}
+
+impl DesktopIconTheme {
+    fn from_settings_value(value: Option<&serde_json::Value>) -> Self {
+        match value.and_then(|value| value.as_str()) {
+            Some("black") => Self::Black,
+            _ => Self::Default,
+        }
     }
 }
 
@@ -78,6 +110,14 @@ const SCHEMA_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS schema_cache (
         cache_key TEXT PRIMARY KEY,
         payload_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS tab_runtime_cache (
+        cache_key TEXT PRIMARY KEY,
+        payload BLOB NOT NULL,
+        row_count INTEGER NOT NULL DEFAULT 0,
+        column_count INTEGER NOT NULL DEFAULT 0,
+        byte_size INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS saved_sql_folders (
@@ -154,6 +194,68 @@ fn ensure_history_columns_sync(conn: &Connection) -> Result<(), String> {
         conn.execute(&format!("ALTER TABLE history ADD COLUMN {name} {definition}"), []).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+fn ssh_tunnel_secret_segment(index: usize, hop: &crate::models::connection::SshTunnelConfig) -> String {
+    if hop.id.trim().is_empty() {
+        index.to_string()
+    } else {
+        hop.id.clone()
+    }
+}
+
+fn ssh_tunnel_password_key(index: usize, hop: &crate::models::connection::SshTunnelConfig) -> String {
+    format!("{}{}.password", SSH_TUNNEL_SECRET_PREFIX, ssh_tunnel_secret_segment(index, hop))
+}
+
+fn ssh_tunnel_key_passphrase_key(index: usize, hop: &crate::models::connection::SshTunnelConfig) -> String {
+    format!("{}{}.key_passphrase", SSH_TUNNEL_SECRET_PREFIX, ssh_tunnel_secret_segment(index, hop))
+}
+
+fn transport_layer_secret_segment(index: usize, layer: &TransportLayerConfig) -> String {
+    let id = layer.id().trim();
+    if id.is_empty() {
+        index.to_string()
+    } else {
+        id.to_string()
+    }
+}
+
+fn transport_layer_ssh_password_key(index: usize, layer: &TransportLayerConfig) -> String {
+    format!("{}{}.ssh_password", TRANSPORT_LAYER_SECRET_PREFIX, transport_layer_secret_segment(index, layer))
+}
+
+fn transport_layer_ssh_key_passphrase_key(index: usize, layer: &TransportLayerConfig) -> String {
+    format!("{}{}.ssh_key_passphrase", TRANSPORT_LAYER_SECRET_PREFIX, transport_layer_secret_segment(index, layer))
+}
+
+fn transport_layer_proxy_password_key(index: usize, layer: &TransportLayerConfig) -> String {
+    format!("{}{}.proxy_password", TRANSPORT_LAYER_SECRET_PREFIX, transport_layer_secret_segment(index, layer))
+}
+
+fn scrub_transport_layer_secrets(config: &mut ConnectionConfig) {
+    for layer in &mut config.transport_layers {
+        match layer {
+            TransportLayerConfig::Ssh(ssh) => {
+                ssh.password.clear();
+                ssh.key_passphrase.clear();
+            }
+            TransportLayerConfig::Proxy(proxy) => {
+                proxy.password.clear();
+            }
+        }
+    }
+}
+
+fn delete_secret_prefix_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    connection_id: &str,
+    key_prefix: &str,
+) -> Result<(), String> {
+    let like = format!("{key_prefix}%");
+    tx.execute("DELETE FROM connection_secrets WHERE connection_id = ?1 AND key LIKE ?2", params![connection_id, like])
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 // History
@@ -326,6 +428,14 @@ impl Storage {
         let mut settings = self.load_app_settings_json().await?;
         settings.remove("run_in_background");
         settings.insert("show_tray_icon".to_string(), serde_json::Value::Bool(desktop_settings.show_tray_icon));
+        settings.insert(
+            "icon_theme".to_string(),
+            serde_json::to_value(desktop_settings.icon_theme).map_err(|e| e.to_string())?,
+        );
+        settings.insert(
+            "debug_logging_enabled".to_string(),
+            serde_json::Value::Bool(desktop_settings.debug_logging_enabled),
+        );
         self.save_app_settings_json(&settings).await
     }
 
@@ -337,6 +447,11 @@ impl Storage {
                 .and_then(|value| value.as_bool())
                 .or_else(|| settings.get("run_in_background").and_then(|value| value.as_bool()))
                 .unwrap_or_else(|| DesktopSettings::default().show_tray_icon),
+            icon_theme: DesktopIconTheme::from_settings_value(settings.get("icon_theme")),
+            debug_logging_enabled: settings
+                .get("debug_logging_enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or_else(|| DesktopSettings::default().debug_logging_enabled),
         })
     }
 
@@ -490,9 +605,7 @@ impl Storage {
                 let config_id = config.id.clone();
                 let mut sanitized = config;
                 sanitized.password = String::new();
-                sanitized.ssh_password = String::new();
-                sanitized.ssh_key_passphrase = String::new();
-                sanitized.proxy_password = String::new();
+                scrub_transport_layer_secrets(&mut sanitized);
                 sanitized.redis_sentinel_password = String::new();
                 sanitized.connection_string = None;
                 let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
@@ -526,9 +639,7 @@ impl Storage {
                 let config_id = config.id.clone();
                 let mut sanitized = config.clone();
                 sanitized.password = String::new();
-                sanitized.ssh_password = String::new();
-                sanitized.ssh_key_passphrase = String::new();
-                sanitized.proxy_password = String::new();
+                scrub_transport_layer_secrets(&mut sanitized);
                 sanitized.redis_sentinel_password = String::new();
                 sanitized.connection_string = None;
                 let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
@@ -537,10 +648,38 @@ impl Storage {
                     .map_err(|e| e.to_string())?;
 
                 persist_secret_in_tx(&tx, &config.id, "password", &config.password)?;
-                persist_secret_in_tx(&tx, &config.id, "ssh_password", &config.ssh_password)?;
-                persist_secret_in_tx(&tx, &config.id, "ssh_key_passphrase", &config.ssh_key_passphrase)?;
-                persist_secret_in_tx(&tx, &config.id, "proxy_password", &config.proxy_password)?;
+                delete_secret_prefix_in_tx(&tx, &config.id, TRANSPORT_LAYER_SECRET_PREFIX)?;
+                for (index, layer) in config.transport_layers.iter().enumerate() {
+                    match layer {
+                        TransportLayerConfig::Ssh(ssh) => {
+                            persist_secret_in_tx(
+                                &tx,
+                                &config.id,
+                                &transport_layer_ssh_password_key(index, layer),
+                                &ssh.password,
+                            )?;
+                            persist_secret_in_tx(
+                                &tx,
+                                &config.id,
+                                &transport_layer_ssh_key_passphrase_key(index, layer),
+                                &ssh.key_passphrase,
+                            )?;
+                        }
+                        TransportLayerConfig::Proxy(proxy) => {
+                            persist_secret_in_tx(
+                                &tx,
+                                &config.id,
+                                &transport_layer_proxy_password_key(index, layer),
+                                &proxy.password,
+                            )?;
+                        }
+                    }
+                }
                 persist_secret_in_tx(&tx, &config.id, "redis_sentinel_password", &config.redis_sentinel_password)?;
+                persist_secret_in_tx(&tx, &config.id, "ssh_password", "")?;
+                persist_secret_in_tx(&tx, &config.id, "ssh_key_passphrase", "")?;
+                persist_secret_in_tx(&tx, &config.id, "proxy_password", "")?;
+                delete_secret_prefix_in_tx(&tx, &config.id, SSH_TUNNEL_SECRET_PREFIX)?;
                 if let Some(cs) = &config.connection_string {
                     persist_secret_in_tx(&tx, &config.id, "connection_string", cs)?;
                 } else {
@@ -581,9 +720,51 @@ impl Storage {
         for (id, json) in rows {
             let mut config: ConnectionConfig = serde_json::from_str(&json).map_err(|e| e.to_string())?;
             config.password = self.get_secret(&id, "password").await?.unwrap_or_default();
-            config.ssh_password = self.get_secret(&id, "ssh_password").await?.unwrap_or_default();
-            config.ssh_key_passphrase = self.get_secret(&id, "ssh_key_passphrase").await?.unwrap_or_default();
-            config.proxy_password = self.get_secret(&id, "proxy_password").await?.unwrap_or_default();
+            for index in 0..config.transport_layers.len() {
+                let layer_for_key = config.transport_layers[index].clone();
+                match &mut config.transport_layers[index] {
+                    TransportLayerConfig::Ssh(ssh) => {
+                        ssh.password = self
+                            .get_secret(&id, &transport_layer_ssh_password_key(index, &layer_for_key))
+                            .await?
+                            .or(match &layer_for_key {
+                                TransportLayerConfig::Ssh(layer) if layer.id == "legacy" => {
+                                    self.get_secret(&id, "ssh_password").await?
+                                }
+                                TransportLayerConfig::Ssh(layer) => {
+                                    self.get_secret(&id, &ssh_tunnel_password_key(index, layer)).await?
+                                }
+                                TransportLayerConfig::Proxy(_) => None,
+                            })
+                            .unwrap_or_default();
+                        ssh.key_passphrase = self
+                            .get_secret(&id, &transport_layer_ssh_key_passphrase_key(index, &layer_for_key))
+                            .await?
+                            .or(match &layer_for_key {
+                                TransportLayerConfig::Ssh(layer) if layer.id == "legacy" => {
+                                    self.get_secret(&id, "ssh_key_passphrase").await?
+                                }
+                                TransportLayerConfig::Ssh(layer) => {
+                                    self.get_secret(&id, &ssh_tunnel_key_passphrase_key(index, layer)).await?
+                                }
+                                TransportLayerConfig::Proxy(_) => None,
+                            })
+                            .unwrap_or_default();
+                    }
+                    TransportLayerConfig::Proxy(proxy) => {
+                        proxy.password = self
+                            .get_secret(&id, &transport_layer_proxy_password_key(index, &layer_for_key))
+                            .await?
+                            .or(match &layer_for_key {
+                                TransportLayerConfig::Proxy(layer) if layer.id == "legacy-proxy" => {
+                                    self.get_secret(&id, "proxy_password").await?
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                    }
+                }
+            }
             config.redis_sentinel_password = self.get_secret(&id, "redis_sentinel_password").await?.unwrap_or_default();
             config.connection_string = self.get_secret(&id, "connection_string").await?;
             configs.push(config.canonicalized());
@@ -878,6 +1059,69 @@ impl Storage {
     }
 }
 
+// Tab runtime cache
+
+impl Storage {
+    pub async fn save_tab_runtime_cache(
+        &self,
+        key: &str,
+        payload: Vec<u8>,
+        row_count: i64,
+        column_count: i64,
+    ) -> Result<(), String> {
+        let key = key.to_string();
+        let byte_size = payload.len() as i64;
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO tab_runtime_cache \
+                 (cache_key, payload, row_count, column_count, byte_size, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now')) \
+                 ON CONFLICT(cache_key) DO UPDATE SET \
+                 payload = excluded.payload, row_count = excluded.row_count, column_count = excluded.column_count, \
+                 byte_size = excluded.byte_size, updated_at = excluded.updated_at",
+                params![key, payload, row_count, column_count, byte_size],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn load_tab_runtime_cache(&self, key: &str) -> Result<Option<TabRuntimeCacheEntry>, String> {
+        let key = key.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT cache_key, payload, row_count, column_count, byte_size, updated_at \
+                 FROM tab_runtime_cache WHERE cache_key = ?1",
+                [key],
+                |row| {
+                    Ok(TabRuntimeCacheEntry {
+                        key: row.get(0)?,
+                        payload: row.get(1)?,
+                        row_count: row.get(2)?,
+                        column_count: row.get(3)?,
+                        byte_size: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn delete_tab_runtime_cache(&self, key: &str) -> Result<(), String> {
+        let key = key.to_string();
+        self.with_conn(move |conn| {
+            conn.execute("DELETE FROM tab_runtime_cache WHERE cache_key = ?1", [key])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .await
+    }
+}
+
 // JSON migration
 
 impl Storage {
@@ -1063,7 +1307,7 @@ fn map_from_sql_err(err: serde_json::Error) -> rusqlite::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopSettings, Storage};
+    use super::{DesktopIconTheme, DesktopSettings, Storage};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {
@@ -1076,7 +1320,7 @@ mod tests {
         let path = temp_db_path("desktop-settings-default");
         let storage = Storage::open(&path).await.unwrap();
 
-        assert_eq!(storage.load_desktop_settings().await.unwrap(), DesktopSettings { show_tray_icon: true });
+        assert_eq!(storage.load_desktop_settings().await.unwrap(), DesktopSettings::default());
     }
 
     #[tokio::test]
@@ -1087,7 +1331,10 @@ mod tests {
         settings.insert("run_in_background".to_string(), serde_json::Value::Bool(false));
         storage.save_app_settings_json(&settings).await.unwrap();
 
-        assert_eq!(storage.load_desktop_settings().await.unwrap(), DesktopSettings { show_tray_icon: false });
+        assert_eq!(
+            storage.load_desktop_settings().await.unwrap(),
+            DesktopSettings { show_tray_icon: false, ..DesktopSettings::default() }
+        );
     }
 
     #[tokio::test]
@@ -1096,10 +1343,20 @@ mod tests {
         let storage = Storage::open(&path).await.unwrap();
 
         storage.save_password_hash("hash-1").await.unwrap();
-        storage.save_desktop_settings(&DesktopSettings { show_tray_icon: false }).await.unwrap();
+        storage
+            .save_desktop_settings(&DesktopSettings {
+                show_tray_icon: false,
+                icon_theme: DesktopIconTheme::Black,
+                debug_logging_enabled: true,
+            })
+            .await
+            .unwrap();
 
         assert_eq!(storage.load_password_hash().await.unwrap(), Some("hash-1".to_string()));
-        assert_eq!(storage.load_desktop_settings().await.unwrap(), DesktopSettings { show_tray_icon: false });
+        assert_eq!(
+            storage.load_desktop_settings().await.unwrap(),
+            DesktopSettings { show_tray_icon: false, icon_theme: DesktopIconTheme::Black, debug_logging_enabled: true }
+        );
     }
 
     #[tokio::test]
@@ -1110,11 +1367,19 @@ mod tests {
         settings.insert("run_in_background".to_string(), serde_json::Value::Bool(false));
         storage.save_app_settings_json(&settings).await.unwrap();
 
-        storage.save_desktop_settings(&DesktopSettings { show_tray_icon: true }).await.unwrap();
+        storage
+            .save_desktop_settings(&DesktopSettings {
+                icon_theme: DesktopIconTheme::Black,
+                ..DesktopSettings::default()
+            })
+            .await
+            .unwrap();
 
         let settings = storage.load_app_settings_json().await.unwrap();
         assert_eq!(settings.get("run_in_background"), None);
         assert_eq!(settings.get("show_tray_icon").and_then(|value| value.as_bool()), Some(true));
+        assert_eq!(settings.get("icon_theme").and_then(|value| value.as_str()), Some("black"));
+        assert_eq!(settings.get("debug_logging_enabled").and_then(|value| value.as_bool()), Some(false));
     }
 
     #[tokio::test]
@@ -1122,11 +1387,25 @@ mod tests {
         let path = temp_db_path("password-preserve-desktop-settings");
         let storage = Storage::open(&path).await.unwrap();
 
-        storage.save_desktop_settings(&DesktopSettings { show_tray_icon: false }).await.unwrap();
+        storage
+            .save_desktop_settings(&DesktopSettings {
+                show_tray_icon: false,
+                icon_theme: DesktopIconTheme::Black,
+                ..DesktopSettings::default()
+            })
+            .await
+            .unwrap();
         storage.save_password_hash("hash-2").await.unwrap();
 
         assert_eq!(storage.load_password_hash().await.unwrap(), Some("hash-2".to_string()));
-        assert_eq!(storage.load_desktop_settings().await.unwrap(), DesktopSettings { show_tray_icon: false });
+        assert_eq!(
+            storage.load_desktop_settings().await.unwrap(),
+            DesktopSettings {
+                show_tray_icon: false,
+                icon_theme: DesktopIconTheme::Black,
+                ..DesktopSettings::default()
+            }
+        );
     }
 
     #[tokio::test]
@@ -1150,5 +1429,23 @@ mod tests {
             vec!["conn-1".to_string(), "conn-1:db:main".to_string()]
         );
         assert_eq!(storage.load_password_hash().await.unwrap(), Some("hash-3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn tab_runtime_cache_roundtrips_binary_payloads() {
+        let path = temp_db_path("tab-runtime-cache");
+        let storage = Storage::open(&path).await.unwrap();
+
+        storage.save_tab_runtime_cache("tab:1:result", vec![1, 2, 3, 4], 10, 3).await.unwrap();
+        let entry = storage.load_tab_runtime_cache("tab:1:result").await.unwrap().unwrap();
+
+        assert_eq!(entry.key, "tab:1:result");
+        assert_eq!(entry.payload, vec![1, 2, 3, 4]);
+        assert_eq!(entry.row_count, 10);
+        assert_eq!(entry.column_count, 3);
+        assert_eq!(entry.byte_size, 4);
+
+        storage.delete_tab_runtime_cache("tab:1:result").await.unwrap();
+        assert_eq!(storage.load_tab_runtime_cache("tab:1:result").await.unwrap(), None);
     }
 }

@@ -10,12 +10,13 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import * as api from "@/lib/api";
 import { isSchemaAware } from "@/lib/databaseCapabilities";
+import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
 import { copyToClipboard } from "@/lib/clipboard";
 import type { TableDiff, TableSchemaDetail } from "@/lib/schemaDiff";
 import type { TableInfo } from "@/types/database";
 import { sqlMetadataRefreshTarget } from "@/lib/sqlMetadataRefresh";
 import { useToast } from "@/composables/useToast";
-import { Loader2, Copy, Play, GitCompareArrows, ArrowLeftRight } from "lucide-vue-next";
+import { Loader2, Copy, Play, GitCompareArrows, ArrowLeftRight } from "@lucide/vue";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 
 interface SelectableTableDiff extends TableDiff {
@@ -54,6 +55,7 @@ const executedCount = ref(0);
 const executeTotal = ref(0);
 const syncErrors = ref<{ sql: string; error: string }[]>([]);
 const syncSql = ref("");
+const ignoreComments = ref(false);
 const highlightedSyncSql = computed(() => highlight(syncSql.value));
 
 const allSelected = computed(() => diffs.value.length > 0 && diffs.value.every((d) => d.selected));
@@ -66,7 +68,7 @@ function toggleAll() {
 }
 
 const sqlConnections = computed(() =>
-  store.connections.filter((c) => !["redis", "mongodb", "elasticsearch"].includes(c.db_type)),
+  store.connections.filter((c) => !["redis", "mongodb", "elasticsearch", "etcd"].includes(c.db_type)),
 );
 
 const canCompare = computed(
@@ -109,7 +111,10 @@ async function loadDatabases(connectionId: string, side: "source" | "target") {
   try {
     await store.ensureConnected(connectionId);
     const dbs = await api.listDatabases(connectionId);
-    const names = dbs.map((d) => d.name);
+    const names = databaseOptionsForConnection(
+      dbs.map((d) => d.name),
+      store.getConfig(connectionId),
+    );
     if (side === "source") {
       sourceDatabases.value = names;
       sourceDatabase.value = names.length === 1 ? names[0] : "";
@@ -185,6 +190,7 @@ async function startCompare() {
       targetDetails,
       databaseType: targetConfig?.db_type || "mysql",
       targetSchema: targetSchema.value,
+      ignoreComments: ignoreComments.value,
     });
 
     diffs.value = result.diffs.map((diff) => ({ ...diff, selected: true }));
@@ -346,6 +352,7 @@ watch(targetDatabase, (database) => {
 });
 watch(sourceSchema, () => resetResult());
 watch(targetSchema, () => resetResult());
+watch(ignoreComments, () => resetResult());
 
 watch(
   open,
@@ -372,7 +379,10 @@ watch(
 
 <template>
   <Dialog v-model:open="open">
-    <DialogContent class="sm:max-w-2xl max-h-[80vh] flex flex-col overflow-hidden" @interact-outside.prevent>
+    <DialogContent
+      class="min-w-[min(720px,calc(100vw-2rem))] resize-x sm:max-w-5xl max-h-[80vh] flex flex-col overflow-hidden"
+      @interact-outside.prevent
+    >
       <DialogHeader>
         <DialogTitle class="flex items-center gap-2">
           <GitCompareArrows class="w-4 h-4" />
@@ -492,6 +502,13 @@ watch(
           </div>
         </div>
 
+        <div class="flex items-center gap-2 rounded-md border bg-muted/20 px-3 py-2">
+          <input id="schema-diff-ignore-comments" v-model="ignoreComments" type="checkbox" class="accent-primary" />
+          <Label for="schema-diff-ignore-comments" class="cursor-pointer text-xs">
+            {{ t("diff.ignoreComments") }}
+          </Label>
+        </div>
+
         <!-- Comparing -->
         <div v-if="step === 'comparing'" class="flex items-center justify-center py-8 text-sm text-muted-foreground">
           <Loader2 class="w-4 h-4 animate-spin mr-2" />
@@ -600,6 +617,13 @@ watch(
                             >
                             <span v-if="ti < d.triggers!.length - 1">, </span>
                           </span>
+                        </template>
+                        <template v-if="d.type === 'modified' && d.sourceTableComment !== undefined">
+                          <span
+                            v-if="d.columns?.length || d.indexes?.length || d.foreignKeys?.length || d.triggers?.length"
+                            >;
+                          </span>
+                          <span>{{ t("diff.comments") }}</span>
                         </template>
                         <span v-else-if="d.type === 'added'" class="text-green-500">{{ t("diff.newTable") }}</span>
                         <span v-else-if="d.type === 'removed'" class="text-red-500">{{ t("diff.dropTable") }}</span>

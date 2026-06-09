@@ -1,5 +1,6 @@
+use percent_encoding::percent_decode_str;
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, LoadExtensionGuard, OpenFlags};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -13,6 +14,12 @@ pub struct SqliteHandle {
     conn: Arc<Mutex<Connection>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteExtensionSpec {
+    pub path: String,
+    pub entry_point: Option<String>,
+}
+
 impl SqliteHandle {
     pub fn with_connection<T, F>(&self, f: F) -> Result<T, String>
     where
@@ -24,21 +31,36 @@ impl SqliteHandle {
 }
 
 pub async fn connect_path(path: &str) -> Result<SqliteHandle, String> {
-    connect_path_with_options(path, false).await
+    connect_path_with_options(path, false, Vec::new()).await
+}
+
+pub async fn connect_path_with_extensions(
+    path: &str,
+    extensions: Vec<SqliteExtensionSpec>,
+) -> Result<SqliteHandle, String> {
+    connect_path_with_options(path, false, extensions).await
 }
 
 pub async fn connect_path_create_if_missing(path: &str) -> Result<SqliteHandle, String> {
-    connect_path_with_options(path, true).await
+    connect_path_with_options(path, true, Vec::new()).await
 }
 
-async fn connect_path_with_options(path: &str, create_if_missing: bool) -> Result<SqliteHandle, String> {
+async fn connect_path_with_options(
+    path: &str,
+    create_if_missing: bool,
+    extensions: Vec<SqliteExtensionSpec>,
+) -> Result<SqliteHandle, String> {
     let path = path.to_string();
-    tokio::task::spawn_blocking(move || open_sqlite_handle(&path, create_if_missing))
+    tokio::task::spawn_blocking(move || open_sqlite_handle(&path, create_if_missing, extensions))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn open_sqlite_handle(path: &str, create_if_missing: bool) -> Result<SqliteHandle, String> {
+fn open_sqlite_handle(
+    path: &str,
+    create_if_missing: bool,
+    extensions: Vec<SqliteExtensionSpec>,
+) -> Result<SqliteHandle, String> {
     let is_memory = is_memory_database_path(path);
     if !is_memory && !create_if_missing {
         validate_file_path(path, is_network_path)?;
@@ -65,8 +87,60 @@ fn open_sqlite_handle(path: &str, create_if_missing: bool) -> Result<SqliteHandl
     };
 
     conn.busy_timeout(std::time::Duration::from_secs(10)).map_err(|e| e.to_string())?;
+    load_sqlite_extensions(&conn, &extensions)?;
 
     Ok(SqliteHandle { conn: Arc::new(Mutex::new(conn)) })
+}
+
+fn load_sqlite_extensions(conn: &Connection, extensions: &[SqliteExtensionSpec]) -> Result<(), String> {
+    if extensions.is_empty() {
+        return Ok(());
+    }
+
+    // Extension loading is enabled only for the trusted paths from the connection config.
+    let _guard =
+        unsafe { LoadExtensionGuard::new(conn) }.map_err(|e| format!("SQLite extension loading failed: {e}"))?;
+    for extension in extensions {
+        unsafe { conn.load_extension(&extension.path, extension.entry_point.as_deref()) }
+            .map_err(|e| format!("SQLite extension load failed ({}): {e}", extension.path))?;
+    }
+    Ok(())
+}
+
+pub fn sqlite_extension_specs_from_url_params(params: Option<&str>) -> Vec<SqliteExtensionSpec> {
+    params
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('?')
+        .split('&')
+        .filter_map(|part| {
+            let (raw_key, raw_value) = part.split_once('=').unwrap_or((part, ""));
+            let key = decode_url_param(raw_key);
+            if key != "sqlite_extension" && key != "sqlite_extensions" {
+                return None;
+            }
+            Some(decode_url_param(raw_value))
+        })
+        .flat_map(|value| value.lines().filter_map(parse_sqlite_extension_spec).collect::<Vec<_>>())
+        .collect()
+}
+
+fn parse_sqlite_extension_spec(value: &str) -> Option<SqliteExtensionSpec> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (path, entry_point) = match value.rsplit_once('|') {
+        Some((path, entry_point)) if !path.trim().is_empty() && !entry_point.trim().is_empty() => {
+            (path.trim(), Some(entry_point.trim().to_string()))
+        }
+        _ => (value, None),
+    };
+    Some(SqliteExtensionSpec { path: path.to_string(), entry_point })
+}
+
+fn decode_url_param(value: &str) -> String {
+    percent_decode_str(&value.replace('+', " ")).decode_utf8_lossy().into_owned()
 }
 
 fn ensure_parent_dir(path: &str) -> Result<(), String> {
@@ -87,6 +161,7 @@ pub fn is_memory_database_path(path: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -101,6 +176,28 @@ mod tests {
         let result = execute_query(&pool, "SELECT name FROM memory_probe WHERE id = 1;").await.expect("select row");
 
         assert_eq!(result.rows[0][0], serde_json::json!("Ada"));
+    }
+
+    #[test]
+    fn sqlite_extension_specs_parse_repeated_and_multiline_url_params() {
+        let params = "cache=shared&sqlite_extension=%2Fopt%2Fregexp.dylib&sqlite_extensions=%2Fopt%2Ftext.dylib%7Csqlite3_text_init%0A%2Fopt%2Fcrypto.dylib";
+
+        assert_eq!(
+            sqlite_extension_specs_from_url_params(Some(params)),
+            vec![
+                SqliteExtensionSpec { path: "/opt/regexp.dylib".to_string(), entry_point: None },
+                SqliteExtensionSpec {
+                    path: "/opt/text.dylib".to_string(),
+                    entry_point: Some("sqlite3_text_init".to_string()),
+                },
+                SqliteExtensionSpec { path: "/opt/crypto.dylib".to_string(), entry_point: None },
+            ],
+        );
+    }
+
+    #[test]
+    fn sqlite_extension_specs_ignore_empty_values() {
+        assert!(sqlite_extension_specs_from_url_params(Some("sqlite_extension=&sqlite_extensions=%0A")).is_empty());
     }
 
     #[test]
@@ -179,6 +276,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_sqlite_math_functions_are_available() {
+        let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
+
+        let floor_result =
+            execute_query(&pool, "WITH test(x) AS (VALUES (1.1), (1.2), (1.3)) SELECT FLOOR(x) FROM test")
+                .await
+                .expect("FLOOR() should be available");
+
+        assert_eq!(floor_result.rows.len(), 3);
+        for row in floor_result.rows {
+            assert_eq!(row[0].as_f64(), Some(1.0));
+        }
+
+        let result = execute_query(&pool, "SELECT ACOS(1.0), ACOSH(1.0), ASIN(0.0), CEIL(1.2), PI()")
+            .await
+            .expect("SQLite math functions should be available");
+
+        assert_eq!(result.rows[0][0].as_f64(), Some(0.0));
+        assert_eq!(result.rows[0][1].as_f64(), Some(0.0));
+        assert_eq!(result.rows[0][2].as_f64(), Some(0.0));
+        assert_eq!(result.rows[0][3].as_f64(), Some(2.0));
+        let pi = result.rows[0][4].as_f64().expect("PI() returns a real value");
+        assert!((std::f64::consts::PI - pi).abs() < 0.00001);
+    }
+
+    #[tokio::test]
     async fn substring_rewrite_works_in_direct_query() {
         let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
 
@@ -227,6 +350,8 @@ pub async fn list_tables(pool: &SqliteHandle, _schema: &str) -> Result<Vec<Table
                         name: row.get(0)?,
                         table_type: if table_type == "view" { "VIEW".to_string() } else { "BASE TABLE".to_string() },
                         comment: None,
+                        parent_schema: None,
+                        parent_name: None,
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -327,6 +452,7 @@ pub async fn list_foreign_keys(pool: &SqliteHandle, _schema: &str, table: &str) 
                     Ok(ForeignKeyInfo {
                         name: format!("fk_{}", row.get::<_, i32>("id")?),
                         column: row.get("from")?,
+                        ref_schema: None,
                         ref_table: row.get("table")?,
                         ref_column: row.get("to")?,
                     })
@@ -511,6 +637,8 @@ fn execute_query_blocking(pool: &SqliteHandle, sql: &str, max_rows: Option<usize
 
             Ok(QueryResult {
                 columns,
+                column_types: Vec::new(),
+                column_sortables: vec![],
                 rows: result_rows,
                 affected_rows: 0,
                 execution_time_ms: start.elapsed().as_millis(),
@@ -522,6 +650,8 @@ fn execute_query_blocking(pool: &SqliteHandle, sql: &str, max_rows: Option<usize
             conn.execute_batch(sql).map_err(|e| e.to_string())?;
             Ok(QueryResult {
                 columns: vec![],
+                column_types: Vec::new(),
+                column_sortables: vec![],
                 rows: vec![],
                 affected_rows: conn.changes(),
                 execution_time_ms: start.elapsed().as_millis(),

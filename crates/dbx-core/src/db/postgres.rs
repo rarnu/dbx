@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime};
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod, Runtime};
 use futures::{SinkExt, StreamExt};
 use percent_encoding::percent_decode_str;
@@ -24,8 +24,8 @@ use crate::types::{
 };
 
 fn pg_temporal_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
-    if let Ok(v) = row.try_get::<_, DateTime<Utc>>(idx) {
-        return Some(serde_json::Value::String(v.to_rfc3339()));
+    if let Ok(v) = row.try_get::<_, DateTime<Local>>(idx) {
+        return Some(serde_json::Value::String(format_pg_timestamptz(v)));
     }
     if let Ok(v) = row.try_get::<_, NaiveDateTime>(idx) {
         return Some(serde_json::Value::String(v.to_string()));
@@ -70,6 +70,344 @@ impl<'a> FromSql<'a> for PgAnyString {
     }
 }
 
+/// A `FromSql` adapter that accepts any PostgreSQL type and returns the raw
+/// bytes unchanged. Used to decode custom types like pgvector whose binary
+/// format we handle ourselves.
+struct PgRawBytes(Vec<u8>);
+
+impl<'a> FromSql<'a> for PgRawBytes {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(PgRawBytes(raw.to_vec()))
+    }
+
+    fn accepts(_: &Type) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WkbDimensions {
+    has_z: bool,
+    has_m: bool,
+}
+
+impl WkbDimensions {
+    fn suffix(self) -> &'static str {
+        match (self.has_z, self.has_m) {
+            (false, false) => "",
+            (true, false) => " Z",
+            (false, true) => " M",
+            (true, true) => " ZM",
+        }
+    }
+
+    fn coordinate_len(self) -> usize {
+        2 + usize::from(self.has_z) + usize::from(self.has_m)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum WkbGeometry {
+    Point { dims: WkbDimensions, coords: Option<Vec<f64>> },
+    LineString { dims: WkbDimensions, points: Vec<Vec<f64>> },
+    Polygon { dims: WkbDimensions, rings: Vec<Vec<Vec<f64>>> },
+    MultiPoint { dims: WkbDimensions, points: Vec<Option<Vec<f64>>> },
+    MultiLineString { dims: WkbDimensions, lines: Vec<Vec<Vec<f64>>> },
+    MultiPolygon { dims: WkbDimensions, polygons: Vec<Vec<Vec<Vec<f64>>>> },
+    GeometryCollection { dims: WkbDimensions, geometries: Vec<WkbGeometry> },
+}
+
+impl WkbGeometry {
+    fn to_wkt(&self) -> String {
+        match self {
+            Self::Point { dims, coords } => match coords {
+                Some(coords) => format!("POINT{}({})", dims.suffix(), format_wkb_coordinate(coords)),
+                None => format!("POINT{} EMPTY", dims.suffix()),
+            },
+            Self::LineString { dims, points } => {
+                if points.is_empty() {
+                    format!("LINESTRING{} EMPTY", dims.suffix())
+                } else {
+                    format!("LINESTRING{}({})", dims.suffix(), format_wkb_coordinate_sequence(points))
+                }
+            }
+            Self::Polygon { dims, rings } => {
+                if rings.is_empty() {
+                    format!("POLYGON{} EMPTY", dims.suffix())
+                } else {
+                    format!(
+                        "POLYGON{}({})",
+                        dims.suffix(),
+                        rings
+                            .iter()
+                            .map(|ring| format!("({})", format_wkb_coordinate_sequence(ring)))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                }
+            }
+            Self::MultiPoint { dims, points } => {
+                if points.is_empty() {
+                    format!("MULTIPOINT{} EMPTY", dims.suffix())
+                } else {
+                    format!(
+                        "MULTIPOINT{}({})",
+                        dims.suffix(),
+                        points
+                            .iter()
+                            .map(|point| match point {
+                                Some(coords) => format!("({})", format_wkb_coordinate(coords)),
+                                None => "EMPTY".to_string(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                }
+            }
+            Self::MultiLineString { dims, lines } => {
+                if lines.is_empty() {
+                    format!("MULTILINESTRING{} EMPTY", dims.suffix())
+                } else {
+                    format!(
+                        "MULTILINESTRING{}({})",
+                        dims.suffix(),
+                        lines
+                            .iter()
+                            .map(|line| format!("({})", format_wkb_coordinate_sequence(line)))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                }
+            }
+            Self::MultiPolygon { dims, polygons } => {
+                if polygons.is_empty() {
+                    format!("MULTIPOLYGON{} EMPTY", dims.suffix())
+                } else {
+                    format!(
+                        "MULTIPOLYGON{}({})",
+                        dims.suffix(),
+                        polygons
+                            .iter()
+                            .map(|polygon| {
+                                format!(
+                                    "({})",
+                                    polygon
+                                        .iter()
+                                        .map(|ring| format!("({})", format_wkb_coordinate_sequence(ring)))
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                }
+            }
+            Self::GeometryCollection { dims, geometries } => {
+                if geometries.is_empty() {
+                    format!("GEOMETRYCOLLECTION{} EMPTY", dims.suffix())
+                } else {
+                    format!(
+                        "GEOMETRYCOLLECTION{}({})",
+                        dims.suffix(),
+                        geometries.iter().map(WkbGeometry::to_wkt).collect::<Vec<_>>().join(",")
+                    )
+                }
+            }
+        }
+    }
+}
+
+fn format_wkb_coordinate(coords: &[f64]) -> String {
+    coords.iter().map(|value| value.to_string()).collect::<Vec<_>>().join(" ")
+}
+
+fn format_wkb_coordinate_sequence(points: &[Vec<f64>]) -> String {
+    points.iter().map(|point| format_wkb_coordinate(point)).collect::<Vec<_>>().join(",")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WkbEndian {
+    Big,
+    Little,
+}
+
+struct WkbReader<'a> {
+    raw: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> WkbReader<'a> {
+    fn new(raw: &'a [u8]) -> Self {
+        Self { raw, pos: 0 }
+    }
+
+    fn read_u8(&mut self) -> Option<u8> {
+        let value = *self.raw.get(self.pos)?;
+        self.pos += 1;
+        Some(value)
+    }
+
+    fn read_array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let end = self.pos.checked_add(N)?;
+        let bytes: [u8; N] = self.raw.get(self.pos..end)?.try_into().ok()?;
+        self.pos = end;
+        Some(bytes)
+    }
+
+    fn read_u32(&mut self, endian: WkbEndian) -> Option<u32> {
+        let bytes = self.read_array::<4>()?;
+        Some(match endian {
+            WkbEndian::Big => u32::from_be_bytes(bytes),
+            WkbEndian::Little => u32::from_le_bytes(bytes),
+        })
+    }
+
+    fn read_f64(&mut self, endian: WkbEndian) -> Option<f64> {
+        let bytes = self.read_array::<8>()?;
+        Some(match endian {
+            WkbEndian::Big => f64::from_be_bytes(bytes),
+            WkbEndian::Little => f64::from_le_bytes(bytes),
+        })
+    }
+}
+
+fn parse_wkb_dimensions(type_word: u32) -> (u32, WkbDimensions, bool) {
+    let mut base_type = type_word & 0x1FFF_FFFF;
+    let mut dims = WkbDimensions { has_z: (type_word & 0x8000_0000) != 0, has_m: (type_word & 0x4000_0000) != 0 };
+    let has_srid = (type_word & 0x2000_0000) != 0;
+
+    if base_type >= 3000 {
+        dims.has_z = true;
+        dims.has_m = true;
+        base_type -= 3000;
+    } else if base_type >= 2000 {
+        dims.has_m = true;
+        base_type -= 2000;
+    } else if base_type >= 1000 {
+        dims.has_z = true;
+        base_type -= 1000;
+    }
+
+    (base_type, dims, has_srid)
+}
+
+fn read_wkb_point_coords(reader: &mut WkbReader<'_>, dims: WkbDimensions, allow_empty_point: bool) -> Option<Vec<f64>> {
+    let endian = match reader.read_u8()? {
+        0 => WkbEndian::Big,
+        1 => WkbEndian::Little,
+        _ => return None,
+    };
+    let type_word = reader.read_u32(endian)?;
+    let (base_type, parsed_dims, has_srid) = parse_wkb_dimensions(type_word);
+    if base_type != 1 || parsed_dims != dims {
+        return None;
+    }
+    if has_srid {
+        reader.read_u32(endian)?;
+    }
+    let coords = (0..parsed_dims.coordinate_len()).map(|_| reader.read_f64(endian)).collect::<Option<Vec<_>>>()?;
+    if allow_empty_point && coords.iter().all(|value| value.is_nan()) {
+        return None;
+    }
+    Some(coords)
+}
+
+fn parse_wkb_points(reader: &mut WkbReader<'_>, endian: WkbEndian, dims: WkbDimensions) -> Option<Vec<Vec<f64>>> {
+    let count = usize::try_from(reader.read_u32(endian)?).ok()?;
+    (0..count)
+        .map(|_| (0..dims.coordinate_len()).map(|_| reader.read_f64(endian)).collect::<Option<Vec<_>>>())
+        .collect::<Option<Vec<_>>>()
+}
+
+fn parse_wkb_geometry(reader: &mut WkbReader<'_>) -> Option<WkbGeometry> {
+    let endian = match reader.read_u8()? {
+        0 => WkbEndian::Big,
+        1 => WkbEndian::Little,
+        _ => return None,
+    };
+    let type_word = reader.read_u32(endian)?;
+    let (base_type, dims, has_srid) = parse_wkb_dimensions(type_word);
+    if has_srid {
+        reader.read_u32(endian)?;
+    }
+
+    match base_type {
+        1 => {
+            let coords = (0..dims.coordinate_len()).map(|_| reader.read_f64(endian)).collect::<Option<Vec<_>>>()?;
+            let coords = if coords.iter().all(|value| value.is_nan()) { None } else { Some(coords) };
+            Some(WkbGeometry::Point { dims, coords })
+        }
+        2 => Some(WkbGeometry::LineString { dims, points: parse_wkb_points(reader, endian, dims)? }),
+        3 => {
+            let ring_count = usize::try_from(reader.read_u32(endian)?).ok()?;
+            let rings = (0..ring_count).map(|_| parse_wkb_points(reader, endian, dims)).collect::<Option<Vec<_>>>()?;
+            Some(WkbGeometry::Polygon { dims, rings })
+        }
+        4 => {
+            let count = usize::try_from(reader.read_u32(endian)?).ok()?;
+            let points =
+                (0..count).map(|_| Some(read_wkb_point_coords(reader, dims, true))).collect::<Option<Vec<_>>>()?;
+            Some(WkbGeometry::MultiPoint { dims, points })
+        }
+        5 => {
+            let count = usize::try_from(reader.read_u32(endian)?).ok()?;
+            let lines = (0..count)
+                .map(|_| match parse_wkb_geometry(reader)? {
+                    WkbGeometry::LineString { points, .. } => Some(points),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(WkbGeometry::MultiLineString { dims, lines })
+        }
+        6 => {
+            let count = usize::try_from(reader.read_u32(endian)?).ok()?;
+            let polygons = (0..count)
+                .map(|_| match parse_wkb_geometry(reader)? {
+                    WkbGeometry::Polygon { rings, .. } => Some(rings),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(WkbGeometry::MultiPolygon { dims, polygons })
+        }
+        7 => {
+            let count = usize::try_from(reader.read_u32(endian)?).ok()?;
+            let geometries = (0..count).map(|_| parse_wkb_geometry(reader)).collect::<Option<Vec<_>>>()?;
+            Some(WkbGeometry::GeometryCollection { dims, geometries })
+        }
+        _ => None,
+    }
+}
+
+fn ewkb_to_wkt(raw: &[u8]) -> Option<String> {
+    let mut reader = WkbReader::new(raw);
+    let geometry = parse_wkb_geometry(&mut reader)?;
+    if reader.pos != raw.len() {
+        return None;
+    }
+    Some(geometry.to_wkt())
+}
+
+/// Decode pgvector binary format into a Vec<f32>.
+///
+/// pgvector binary layout (big-endian):
+/// - 2 bytes: dimensions (uint16)
+/// - 2 bytes: unused (padding)
+/// - N*4 bytes: IEEE 754 f32 values
+fn decode_pgvector_bytes(raw: &[u8]) -> Option<Vec<f32>> {
+    if raw.len() < 4 {
+        return None;
+    }
+    let dims = u16::from_be_bytes([raw[0], raw[1]]) as usize;
+    let expected_len = 4 + dims * 4;
+    if raw.len() != expected_len {
+        return None;
+    }
+    let floats: Vec<f32> =
+        raw[4..].chunks_exact(4).map(|chunk| f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])).collect();
+    Some(floats)
+}
+
 fn pg_u32_number(v: u32) -> serde_json::Value {
     serde_json::Value::Number(serde_json::Number::from(v))
 }
@@ -107,8 +445,8 @@ fn pg_array_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
     if let Ok(values) = row.try_get::<_, Vec<Option<uuid::Uuid>>>(idx) {
         return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(v.to_string())));
     }
-    if let Ok(values) = row.try_get::<_, Vec<Option<DateTime<Utc>>>>(idx) {
-        return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(v.to_rfc3339())));
+    if let Ok(values) = row.try_get::<_, Vec<Option<DateTime<Local>>>>(idx) {
+        return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(format_pg_timestamptz(v))));
     }
     if let Ok(values) = row.try_get::<_, Vec<Option<NaiveDateTime>>>(idx) {
         return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(v.to_string())));
@@ -144,6 +482,24 @@ fn pg_array_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
         return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(v.0)));
     }
     None
+}
+
+fn format_pg_timestamptz(value: DateTime<Local>) -> String {
+    value.to_rfc3339()
+}
+
+/// Render PostgreSQL's internal `"char"` type (OID 18) as the character it
+/// stores, matching psql's `charout`. The driver decodes this single-byte type
+/// as i8; emitting the numeric value would leak the raw ASCII code (issue #669).
+/// A zero byte maps to an empty string; any other byte is interpreted as a
+/// Latin-1 code point so the result is always valid UTF-8 and never panics.
+fn pg_char_to_json(byte: i8) -> serde_json::Value {
+    let b = byte as u8;
+    if b == 0 {
+        serde_json::Value::String(String::new())
+    } else {
+        serde_json::Value::String(char::from(b).to_string())
+    }
 }
 
 fn pg_value_to_json(row: &Row, idx: usize, type_name: &str) -> serde_json::Value {
@@ -199,8 +555,43 @@ fn pg_value_to_json(row: &Row, idx: usize, type_name: &str) -> serde_json::Value
         return pg_system_u32_to_json(row, idx).unwrap_or(serde_json::Value::Null);
     }
 
+    // PostgreSQL's internal "char" type (OID 18, e.g. pg_depend.deptype) is a
+    // single byte the driver decodes as i8. Without this branch it falls through
+    // to the i8 arm below and surfaces the raw ASCII code (110 for 'n') instead
+    // of the character. SQL CHAR(n) is a different type ("bpchar"), unaffected.
+    if upper == "CHAR" {
+        return row.try_get::<_, i8>(idx).map(pg_char_to_json).unwrap_or(serde_json::Value::Null);
+    }
+
     if upper.starts_with('_') {
         return pg_array_to_json_value(row, idx).unwrap_or(serde_json::Value::Null);
+    }
+
+    if upper == "VECTOR" || upper.starts_with("VECTOR(") {
+        if let Ok(PgRawBytes(raw)) = row.try_get::<_, PgRawBytes>(idx) {
+            if let Some(floats) = decode_pgvector_bytes(&raw) {
+                return serde_json::Value::Array(
+                    floats
+                        .into_iter()
+                        .map(|v| {
+                            serde_json::Number::from_f64((v as f64 * 1_000_000.0).round() / 1_000_000.0)
+                                .map(serde_json::Value::Number)
+                                .unwrap_or(serde_json::Value::Null)
+                        })
+                        .collect(),
+                );
+            }
+        }
+        return serde_json::Value::Null;
+    }
+
+    if upper == "GEOMETRY" || upper == "GEOGRAPHY" {
+        if let Ok(PgRawBytes(raw)) = row.try_get::<_, PgRawBytes>(idx) {
+            return ewkb_to_wkt(&raw)
+                .map(serde_json::Value::String)
+                .unwrap_or_else(|| super::binary_value_to_json(&raw));
+        }
+        return serde_json::Value::Null;
     }
 
     row.try_get::<_, String>(idx)
@@ -228,6 +619,7 @@ fn pg_value_to_json(row: &Row, idx: usize, type_name: &str) -> serde_json::Value
         .or_else(|e| pg_temporal_to_json_value(row, idx).ok_or(e))
         .or_else(|_| row.try_get::<_, Vec<u8>>(idx).map(|bytes| super::binary_value_to_json(&bytes)))
         .or_else(|_| row.try_get::<_, PgAnyString>(idx).map(|v| serde_json::Value::String(v.0)))
+        .or_else(|_| row.try_get::<_, PgRawBytes>(idx).map(|v| super::binary_value_to_json(&v.0)))
         .unwrap_or(serde_json::Value::Null)
 }
 
@@ -248,16 +640,30 @@ async fn execute_select_prepared(
     start: Instant,
     row_limit: usize,
 ) -> Result<QueryResult, tokio_postgres::Error> {
+    let prepared_start = Instant::now();
     let stmt = client.prepare_cached(sql).await?;
+    log::info!(
+        "[postgres][select:prepare_cached:done] elapsed_ms={} total_ms={}",
+        prepared_start.elapsed().as_millis(),
+        start.elapsed().as_millis()
+    );
     let columns: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
     let column_types: Vec<String> = stmt.columns().iter().map(|c| c.type_().name().to_string()).collect();
 
     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+    let query_start = Instant::now();
     let stream = client.query_raw(&stmt, params).await?;
+    log::info!(
+        "[postgres][select:query_raw:done] elapsed_ms={} total_ms={} column_count={}",
+        query_start.elapsed().as_millis(),
+        start.elapsed().as_millis(),
+        columns.len()
+    );
     tokio::pin!(stream);
     let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
     let mut truncated = false;
 
+    let rows_start = Instant::now();
     while let Some(row_result) = stream.next().await {
         if result_rows.len() >= row_limit {
             truncated = true;
@@ -270,15 +676,24 @@ async fn execute_select_prepared(
                 .collect(),
         );
     }
+    log::info!(
+        "[postgres][select:rows:done] elapsed_ms={} total_ms={} row_count={} truncated={}",
+        rows_start.elapsed().as_millis(),
+        start.elapsed().as_millis(),
+        result_rows.len(),
+        truncated
+    );
 
     Ok(QueryResult {
         columns,
+        column_sortables: vec![],
         rows: result_rows,
         affected_rows: 0,
         execution_time_ms: start.elapsed().as_millis(),
         truncated,
         session_id: None,
         has_more: false,
+        column_types,
     })
 }
 
@@ -322,12 +737,14 @@ async fn execute_select_text(
 
     Ok(QueryResult {
         columns,
+        column_sortables: vec![],
         rows: result_rows,
         affected_rows: 0,
         execution_time_ms: start.elapsed().as_millis(),
         truncated,
         session_id: None,
         has_more: false,
+        column_types: Vec::new(),
     })
 }
 
@@ -355,7 +772,7 @@ pub async fn connect(url: &str, fallback_timeout: Duration) -> Result<Pool, Stri
         let pg_config = tokio_postgres::Config::from_str(&postgres_url.url)
             .map_err(|e| format!("Invalid PostgreSQL connection URL: {e}"))?;
 
-        let mgr_config = ManagerConfig { recycling_method: RecyclingMethod::Fast };
+        let mgr_config = ManagerConfig { recycling_method: RecyclingMethod::Verified };
         let tls_config = postgres_tls_config(
             &pg_config,
             &postgres_url.ssl_files,
@@ -707,6 +1124,8 @@ pub async fn list_tables(pool: &Pool, schema: &str) -> Result<Vec<TableInfo>, St
             name: row.get::<_, String>(0),
             table_type: row.get::<_, String>(1),
             comment: row.try_get::<_, Option<String>>(2).ok().flatten().filter(|s| !s.is_empty()),
+            parent_schema: row.try_get::<_, Option<String>>(3).ok().flatten().filter(|s| !s.is_empty()),
+            parent_name: row.try_get::<_, Option<String>>(4).ok().flatten().filter(|s| !s.is_empty()),
         })
         .collect())
 }
@@ -716,9 +1135,14 @@ fn postgres_tables_sql() -> &'static str {
          CASE c.relkind WHEN 'r' THEN 'BASE TABLE' WHEN 'v' THEN 'VIEW' \
            WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'f' THEN 'FOREIGN TABLE' \
            WHEN 'p' THEN 'BASE TABLE' END AS table_type, \
-         obj_description(c.oid) AS table_comment \
+         obj_description(c.oid) AS table_comment, \
+         CASE WHEN pc.relkind = 'p' THEN pn.nspname ELSE NULL END AS parent_schema, \
+         CASE WHEN pc.relkind = 'p' THEN pc.relname ELSE NULL END AS parent_name \
          FROM pg_catalog.pg_class c \
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_catalog.pg_inherits i ON i.inhrelid = c.oid \
+         LEFT JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent \
+         LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
          WHERE n.nspname = $1 AND c.relkind IN ('r','v','m','f','p') \
          ORDER BY c.relname"
 }
@@ -729,6 +1153,7 @@ fn list_objects_sql(include_timestamps: bool) -> &'static str {
        CASE c.relkind \
          WHEN 'v' THEN 'VIEW' \
          WHEN 'm' THEN 'VIEW' \
+         WHEN 'S' THEN 'SEQUENCE' \
          ELSE 'TABLE' \
        END AS object_type, \
        obj_description(c.oid) AS object_comment, \
@@ -738,13 +1163,18 @@ fn list_objects_sql(include_timestamps: bool) -> &'static str {
            THEN pg_xact_commit_timestamp(c.xmin)::text END, \
          stat.modification::text \
        ) AS updated_at, \
-       CASE c.relkind WHEN 'v' THEN 1 WHEN 'm' THEN 1 ELSE 0 END AS sort_order \
+       CASE WHEN pc.relkind = 'p' THEN pn.nspname ELSE NULL END AS parent_schema, \
+       CASE WHEN pc.relkind = 'p' THEN pc.relname ELSE NULL END AS parent_name, \
+       CASE c.relkind WHEN 'v' THEN 1 WHEN 'm' THEN 1 WHEN 'S' THEN 4 ELSE 0 END AS sort_order \
      FROM pg_catalog.pg_class c \
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     LEFT JOIN pg_catalog.pg_inherits i ON i.inhrelid = c.oid \
+     LEFT JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent \
+     LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
      LEFT JOIN LATERAL pg_stat_file( \
        CASE WHEN c.relkind IN ('r','m','f','p') THEN pg_relation_filepath(c.oid) END, true \
      ) stat ON true \
-     WHERE n.nspname = $1 AND c.relkind IN ('r','v','m','f','p') \
+     WHERE n.nspname = $1 AND c.relkind IN ('r','v','m','f','p','S') \
      UNION ALL \
      SELECT p.proname AS object_name, \
        CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END AS object_type, \
@@ -752,6 +1182,8 @@ fn list_objects_sql(include_timestamps: bool) -> &'static str {
        NULL::text AS created_at, \
        CASE WHEN current_setting('track_commit_timestamp', true) = 'on' \
          THEN pg_xact_commit_timestamp(p.xmin)::text END AS updated_at, \
+       NULL::text AS parent_schema, \
+       NULL::text AS parent_name, \
        CASE p.prokind WHEN 'p' THEN 2 ELSE 3 END AS sort_order \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
@@ -763,21 +1195,29 @@ fn list_objects_sql(include_timestamps: bool) -> &'static str {
        CASE c.relkind \
          WHEN 'v' THEN 'VIEW' \
          WHEN 'm' THEN 'VIEW' \
+         WHEN 'S' THEN 'SEQUENCE' \
          ELSE 'TABLE' \
        END AS object_type, \
        obj_description(c.oid) AS object_comment, \
        NULL::text AS created_at, \
        NULL::text AS updated_at, \
-       CASE c.relkind WHEN 'v' THEN 1 WHEN 'm' THEN 1 ELSE 0 END AS sort_order \
+       CASE WHEN pc.relkind = 'p' THEN pn.nspname ELSE NULL END AS parent_schema, \
+       CASE WHEN pc.relkind = 'p' THEN pc.relname ELSE NULL END AS parent_name, \
+       CASE c.relkind WHEN 'v' THEN 1 WHEN 'm' THEN 1 WHEN 'S' THEN 4 ELSE 0 END AS sort_order \
      FROM pg_catalog.pg_class c \
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-     WHERE n.nspname = $1 AND c.relkind IN ('r','v','m','f','p') \
+     LEFT JOIN pg_catalog.pg_inherits i ON i.inhrelid = c.oid \
+     LEFT JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent \
+     LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
+     WHERE n.nspname = $1 AND c.relkind IN ('r','v','m','f','p','S') \
      UNION ALL \
      SELECT p.proname AS object_name, \
        CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END AS object_type, \
        obj_description(p.oid) AS object_comment, \
        NULL::text AS created_at, \
        NULL::text AS updated_at, \
+       NULL::text AS parent_schema, \
+       NULL::text AS parent_name, \
        CASE p.prokind WHEN 'p' THEN 2 ELSE 3 END AS sort_order \
      FROM pg_catalog.pg_proc p \
      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
@@ -805,6 +1245,8 @@ pub async fn list_objects(pool: &Pool, schema: &str) -> Result<Vec<ObjectInfo>, 
             comment: row.try_get::<_, Option<String>>(2).ok().flatten().filter(|s| !s.is_empty()),
             created_at: row.try_get::<_, Option<String>>(3).ok().flatten().filter(|s| !s.is_empty()),
             updated_at: row.try_get::<_, Option<String>>(4).ok().flatten().filter(|s| !s.is_empty()),
+            parent_schema: row.try_get::<_, Option<String>>(5).ok().flatten().filter(|s| !s.is_empty()),
+            parent_name: row.try_get::<_, Option<String>>(6).ok().flatten().filter(|s| !s.is_empty()),
         })
         .collect())
 }
@@ -826,11 +1268,7 @@ pub async fn list_schemas(pool: &Pool) -> Result<Vec<String>, String> {
     Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
 }
 
-pub async fn get_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
-    let stmt = client
-        .prepare_cached(
-            "SELECT a.attname AS column_name, \
+const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
              format_type(a.atttypid, a.atttypmod) AS full_type, \
              NOT a.attnotnull AS is_nullable, \
              pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
@@ -841,6 +1279,38 @@ pub async fn get_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<C
                AND a.attnum = ANY(i.indkey) \
              ) AS is_pk, \
              col_description(a.attrelid, a.attnum) AS column_comment, \
+             CASE a.attidentity \
+               WHEN 'd' THEN 'generated by default as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s)', pseq.seqstart, pseq.seqincrement) ELSE '' END \
+               WHEN 'a' THEN 'generated always as identity' || CASE WHEN pseq.seqstart IS NOT NULL THEN format(' (start with %s increment by %s)', pseq.seqstart, pseq.seqincrement) ELSE '' END \
+               ELSE NULL \
+             END AS column_extra, \
+             CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 \
+               THEN ((a.atttypmod - 4) >> 16) & 65535 ELSE NULL END AS numeric_precision, \
+             CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 \
+               THEN (a.atttypmod - 4) & 65535 ELSE NULL END AS numeric_scale, \
+             CASE WHEN t.typname IN ('varchar', 'bpchar') AND a.atttypmod > 0 \
+               THEN a.atttypmod - 4 ELSE NULL END AS character_maximum_length \
+             FROM pg_attribute a \
+             JOIN pg_type t ON t.oid = a.atttypid \
+             LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+             LEFT JOIN pg_depend dep ON dep.refobjid = a.attrelid AND dep.refobjsubid = a.attnum AND dep.deptype = 'i' \
+             LEFT JOIN pg_sequence pseq ON pseq.seqrelid = dep.objid \
+             WHERE a.attrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass \
+             AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum";
+
+const POSTGRES_COLUMNS_COMPAT_SQL: &str = "SELECT a.attname AS column_name, \
+             format_type(a.atttypid, a.atttypmod) AS full_type, \
+             NOT a.attnotnull AS is_nullable, \
+             pg_get_expr(ad.adbin, ad.adrelid) AS column_default, \
+             EXISTS ( \
+               SELECT 1 FROM pg_constraint co \
+               JOIN pg_index i ON i.indrelid = co.conrelid AND co.conindid = i.indexrelid \
+               WHERE co.conrelid = a.attrelid AND co.contype = 'p' \
+               AND a.attnum = ANY(i.indkey) \
+             ) AS is_pk, \
+             col_description(a.attrelid, a.attnum) AS column_comment, \
+             NULL::text AS column_extra, \
              CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 \
                THEN ((a.atttypmod - 4) >> 16) & 65535 ELSE NULL END AS numeric_precision, \
              CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 \
@@ -852,30 +1322,87 @@ pub async fn get_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<C
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
              WHERE a.attrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass \
              AND a.attnum > 0 AND NOT a.attisdropped \
-             ORDER BY a.attnum",
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    let rows = client.query(&stmt, &[&schema, &table]).await.map_err(|e| e.to_string())?;
+             ORDER BY a.attnum";
 
-    Ok(rows
-        .iter()
-        .map(|row| {
-            let full_type = row.try_get::<_, Option<String>>(1).ok().flatten().unwrap_or_default();
-            ColumnInfo {
-                name: row.get::<_, String>(0),
-                data_type: full_type,
-                is_nullable: row.get::<_, bool>(2),
-                column_default: row.try_get::<_, Option<String>>(3).ok().flatten(),
-                is_primary_key: row.get::<_, bool>(4),
-                extra: None,
-                comment: row.try_get::<_, Option<String>>(5).ok().flatten(),
-                numeric_precision: row.try_get::<_, Option<i32>>(6).ok().flatten(),
-                numeric_scale: row.try_get::<_, Option<i32>>(7).ok().flatten(),
-                character_maximum_length: row.try_get::<_, Option<i32>>(8).ok().flatten(),
+const POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL: &str = "SELECT c.column_name, \
+             CASE WHEN c.data_type = 'USER-DEFINED' THEN c.udt_name ELSE c.data_type END AS full_type, \
+             c.is_nullable = 'YES' AS is_nullable, \
+             c.column_default, \
+             EXISTS ( \
+               SELECT 1 FROM information_schema.table_constraints tc \
+               JOIN information_schema.key_column_usage kcu \
+                 ON kcu.constraint_catalog = tc.constraint_catalog \
+                AND kcu.constraint_schema = tc.constraint_schema \
+                AND kcu.constraint_name = tc.constraint_name \
+                AND kcu.table_schema = tc.table_schema \
+                AND kcu.table_name = tc.table_name \
+               WHERE tc.constraint_type = 'PRIMARY KEY' \
+                 AND tc.table_schema = c.table_schema \
+                 AND tc.table_name = c.table_name \
+                 AND kcu.column_name = c.column_name \
+             ) AS is_pk, \
+             NULL::text AS column_comment, \
+             NULL::text AS column_extra, \
+             CAST(c.numeric_precision AS int) AS numeric_precision, \
+             CAST(c.numeric_scale AS int) AS numeric_scale, \
+             CAST(c.character_maximum_length AS int) AS character_maximum_length \
+             FROM information_schema.columns c \
+             WHERE c.table_schema = $1 AND c.table_name = $2 \
+             ORDER BY c.ordinal_position";
+
+fn column_info_from_row(row: &Row) -> ColumnInfo {
+    let full_type = row.try_get::<_, Option<String>>(1).ok().flatten().unwrap_or_default();
+    ColumnInfo {
+        name: row.get::<_, String>(0),
+        data_type: full_type,
+        is_nullable: row.get::<_, bool>(2),
+        column_default: row.try_get::<_, Option<String>>(3).ok().flatten(),
+        is_primary_key: row.get::<_, bool>(4),
+        extra: row.try_get::<_, Option<String>>(6).ok().flatten(),
+        comment: row.try_get::<_, Option<String>>(5).ok().flatten(),
+        numeric_precision: row.try_get::<_, Option<i32>>(7).ok().flatten(),
+        numeric_scale: row.try_get::<_, Option<i32>>(8).ok().flatten(),
+        character_maximum_length: row.try_get::<_, Option<i32>>(9).ok().flatten(),
+    }
+}
+
+async fn get_columns_with_sql(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<ColumnInfo>, tokio_postgres::Error> {
+    let stmt = client.prepare_cached(sql).await?;
+    let rows = client.query(&stmt, &[&schema, &table]).await?;
+
+    Ok(rows.iter().map(column_info_from_row).collect())
+}
+
+pub async fn get_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
+    let client = pool.get().await.map_err(|e| e.to_string())?;
+    match get_columns_with_sql(&client, POSTGRES_COLUMNS_SQL, schema, table).await {
+        Ok(columns) => Ok(columns),
+        Err(primary_error) => match get_columns_with_sql(&client, POSTGRES_COLUMNS_COMPAT_SQL, schema, table).await {
+            Ok(columns) => Ok(columns),
+            Err(fallback_error) => {
+                let primary_message = pg_error_to_string(primary_error);
+                let fallback_message = pg_error_to_string(fallback_error);
+                match get_columns_with_sql(&client, POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL, schema, table).await {
+                    Ok(columns) => Ok(columns),
+                    Err(information_schema_error) => {
+                        let information_schema_message = pg_error_to_string(information_schema_error);
+                        log::debug!(
+                            "[postgres][get_columns:compat-failed] primary_error={} fallback_error={} information_schema_error={}",
+                            primary_message,
+                            fallback_message,
+                            information_schema_message
+                        );
+                        Err(information_schema_message)
+                    }
+                }
             }
-        })
-        .collect())
+        },
+    }
 }
 
 pub(crate) fn pg_quote_ident(ident: &str) -> String {
@@ -907,12 +1434,14 @@ pub async fn execute_query_with_max_rows(
 
         Ok(QueryResult {
             columns: vec![],
+            column_sortables: vec![],
             rows: vec![],
             affected_rows: affected,
             execution_time_ms: start.elapsed().as_millis(),
             truncated: false,
             session_id: None,
             has_more: false,
+            column_types: Vec::new(),
         })
     }
 }
@@ -927,15 +1456,54 @@ pub async fn execute_query_with_schema_and_max_rows(
     sql: &str,
     max_rows: Option<usize>,
 ) -> Result<QueryResult, String> {
+    let start = Instant::now();
+    let checkout_start = Instant::now();
     let client = pool.get().await.map_err(|e| e.to_string())?;
-    client.execute(&format!("SET search_path TO {}", pg_quote_ident(schema)), &[]).await.map_err(pg_error_to_string)?;
+    log::info!(
+        "[postgres][execute_with_schema:pool:done] elapsed_ms={} total_ms={} schema={}",
+        checkout_start.elapsed().as_millis(),
+        start.elapsed().as_millis(),
+        schema
+    );
+    if is_transaction_recovery_statement(sql) {
+        log::info!(
+            "[postgres][execute_with_schema:skip-search-path] total_ms={} reason=transaction-recovery",
+            start.elapsed().as_millis()
+        );
+        return execute_query_with_max_rows_inner(&client, sql, max_rows).await;
+    }
 
+    let set_schema_start = Instant::now();
+    client.execute(&format!("SET search_path TO {}", pg_quote_ident(schema)), &[]).await.map_err(pg_error_to_string)?;
+    log::info!(
+        "[postgres][execute_with_schema:set-search-path:done] elapsed_ms={} total_ms={}",
+        set_schema_start.elapsed().as_millis(),
+        start.elapsed().as_millis()
+    );
+
+    let query_start = Instant::now();
     let result = execute_query_with_max_rows_inner(&client, sql, max_rows).await;
+    log::info!(
+        "[postgres][execute_with_schema:query:done] elapsed_ms={} total_ms={} ok={}",
+        query_start.elapsed().as_millis(),
+        start.elapsed().as_millis(),
+        result.is_ok()
+    );
 
     // Always reset search_path so the connection is clean when returned to the pool
+    let reset_start = Instant::now();
     let _ = client.execute("RESET search_path", &[]).await;
+    log::info!(
+        "[postgres][execute_with_schema:reset-search-path:done] elapsed_ms={} total_ms={}",
+        reset_start.elapsed().as_millis(),
+        start.elapsed().as_millis()
+    );
 
     result
+}
+
+fn is_transaction_recovery_statement(sql: &str) -> bool {
+    starts_with_executable_sql_keyword(sql, &["ROLLBACK", "ABORT", "COMMIT", "END"])
 }
 
 async fn execute_query_with_max_rows_inner(
@@ -953,21 +1521,19 @@ async fn execute_query_with_max_rows_inner(
 
         Ok(QueryResult {
             columns: vec![],
+            column_sortables: vec![],
             rows: vec![],
             affected_rows: affected,
             execution_time_ms: start.elapsed().as_millis(),
             truncated: false,
             session_id: None,
             has_more: false,
+            column_types: Vec::new(),
         })
     }
 }
 
-pub async fn list_indexes(pool: &Pool, schema: &str, table: &str) -> Result<Vec<IndexInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
-    let stmt = client
-        .prepare_cached(
-            "SELECT i.relname AS index_name, \
+const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              array_agg(COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, k.n::int, true)) ORDER BY k.n) AS columns, \
              ix.indisunique AS is_unique, \
              ix.indisprimary AS is_primary, \
@@ -985,11 +1551,58 @@ pub async fn list_indexes(pool: &Pool, schema: &str, table: &str) -> Result<Vec<
              LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0 \
              WHERE n.nspname = $1 AND t.relname = $2 \
              GROUP BY i.relname, i.oid, ix.indisunique, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indnkeyatts, ix.indkey \
-             ORDER BY i.relname",
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    let rows = client.query(&stmt, &[&schema, &table]).await.map_err(|e| e.to_string())?;
+             ORDER BY i.relname";
+
+const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
+             array_agg(COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, k.n::int, true)) ORDER BY k.n) AS columns, \
+             ix.indisunique AS is_unique, \
+             ix.indisprimary AS is_primary, \
+             pg_get_expr(ix.indpred, ix.indrelid) AS filter_expr, \
+             am.amname AS index_type, \
+             NULL::smallint AS nkeyatts, \
+             ix.indkey AS indkey, \
+             obj_description(i.oid, 'pg_class') AS index_comment \
+             FROM pg_index ix \
+             JOIN pg_class t ON t.oid = ix.indrelid \
+             JOIN pg_class i ON i.oid = ix.indexrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             JOIN pg_am am ON am.oid = i.relam \
+             JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, n) ON true \
+             LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0 \
+             WHERE n.nspname = $1 AND t.relname = $2 \
+             GROUP BY i.relname, i.oid, ix.indisunique, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indkey \
+             ORDER BY i.relname";
+
+const POSTGRES_INDEXES_OPENGAUSS_SQL: &str = "SELECT i.relname AS index_name, \
+             array_agg(COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, k.n::int, true)) ORDER BY k.n) AS columns, \
+             ix.indisunique AS is_unique, \
+             ix.indisprimary AS is_primary, \
+             pg_get_expr(ix.indpred, ix.indrelid) AS filter_expr, \
+             am.amname AS index_type, \
+             NULL::smallint AS nkeyatts, \
+             ix.indkey AS indkey, \
+             obj_description(i.oid, 'pg_class') AS index_comment \
+             FROM pg_index ix \
+             JOIN pg_class t ON t.oid = ix.indrelid \
+             JOIN pg_class i ON i.oid = ix.indexrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             JOIN pg_am am ON am.oid = i.relam \
+             JOIN LATERAL ( \
+                 SELECT unnest(ix.indkey) AS attnum, generate_series(1, array_length(ix.indkey, 1)) AS n \
+             ) AS k ON true \
+             LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0 \
+             WHERE n.nspname = $1 AND t.relname = $2 \
+             GROUP BY i.relname, i.oid, ix.indisunique, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indkey \
+             ORDER BY i.relname";
+
+async fn list_indexes_with_sql(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<IndexInfo>, tokio_postgres::Error> {
+    let stmt = client.prepare_cached(sql).await?;
+    let rows = client.query(&stmt, &[&schema, &table]).await?;
 
     Ok(rows
         .iter()
@@ -1013,21 +1626,55 @@ pub async fn list_indexes(pool: &Pool, schema: &str, table: &str) -> Result<Vec<
         .collect())
 }
 
+pub async fn list_indexes(pool: &Pool, schema: &str, table: &str) -> Result<Vec<IndexInfo>, String> {
+    let client = pool.get().await.map_err(|e| e.to_string())?;
+    match list_indexes_with_sql(&client, POSTGRES_INDEXES_SQL, schema, table).await {
+        Ok(indexes) => Ok(indexes),
+        Err(primary_error) => match list_indexes_with_sql(&client, POSTGRES_INDEXES_COMPAT_SQL, schema, table).await {
+            Ok(indexes) => Ok(indexes),
+            Err(fallback_error) => {
+                match list_indexes_with_sql(&client, POSTGRES_INDEXES_OPENGAUSS_SQL, schema, table).await {
+                    Ok(indexes) => Ok(indexes),
+                    Err(opengauss_error) => {
+                        let primary_message = pg_error_to_string(primary_error);
+                        let fallback_message = pg_error_to_string(fallback_error);
+                        let opengauss_message = pg_error_to_string(opengauss_error);
+                        log::debug!(
+                        "[postgres][list_indexes:opengauss-failed] primary_error={} fallback_error={} opengauss_error={}",
+                        primary_message,
+                        fallback_message,
+                        opengauss_message
+                    );
+                        Err(opengauss_message)
+                    }
+                }
+            }
+        },
+    }
+}
+
 pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
     let client = pool.get().await.map_err(|e| e.to_string())?;
     let stmt = client
         .prepare_cached(
-            "SELECT kcu.constraint_name, kcu.column_name, \
-             ccu.table_name AS ref_table, ccu.column_name AS ref_column \
-             FROM information_schema.key_column_usage kcu \
+            "SELECT fk.constraint_name, fk.column_name, \
+             pk.table_schema AS ref_schema, pk.table_name AS ref_table, pk.column_name AS ref_column \
+             FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage fk \
+               ON fk.constraint_name = tc.constraint_name \
+               AND fk.constraint_schema = tc.constraint_schema \
+               AND fk.table_schema = tc.table_schema \
+               AND fk.table_name = tc.table_name \
              JOIN information_schema.referential_constraints rc \
-               ON kcu.constraint_name = rc.constraint_name \
-               AND kcu.constraint_schema = rc.constraint_schema \
-             JOIN information_schema.constraint_column_usage ccu \
-               ON rc.unique_constraint_name = ccu.constraint_name \
-               AND rc.unique_constraint_schema = ccu.constraint_schema \
-             WHERE kcu.table_schema = $1 AND kcu.table_name = $2 \
-             ORDER BY kcu.constraint_name",
+               ON rc.constraint_name = tc.constraint_name \
+               AND rc.constraint_schema = tc.constraint_schema \
+             JOIN information_schema.key_column_usage pk \
+               ON pk.constraint_name = rc.unique_constraint_name \
+               AND pk.constraint_schema = rc.unique_constraint_schema \
+               AND pk.ordinal_position = fk.position_in_unique_constraint \
+             WHERE tc.constraint_type = 'FOREIGN KEY' \
+               AND fk.table_schema = $1 AND fk.table_name = $2 \
+             ORDER BY fk.constraint_name, fk.ordinal_position",
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -1038,8 +1685,9 @@ pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result
         .map(|row| ForeignKeyInfo {
             name: row.get::<_, String>(0),
             column: row.get::<_, String>(1),
-            ref_table: row.get::<_, String>(2),
-            ref_column: row.get::<_, String>(3),
+            ref_schema: Some(row.get::<_, String>(2)),
+            ref_table: row.get::<_, String>(3),
+            ref_column: row.get::<_, String>(4),
         })
         .collect())
 }
@@ -1125,6 +1773,25 @@ mod tests {
     }
 
     #[test]
+    fn pg_char_type_renders_byte_as_character() {
+        // The internal "char" type (OID 18, e.g. pg_depend.deptype) is decoded
+        // as i8; we must surface the character, not the ASCII code (issue #669).
+        assert_eq!(Type::CHAR.name(), "char");
+        assert!(i8::accepts(&Type::CHAR));
+        // SQL CHAR(n)/character(n) is a different type ("bpchar") and must not
+        // be routed through the "char" branch.
+        assert_eq!(Type::BPCHAR.name(), "bpchar");
+
+        assert_eq!(pg_char_to_json(b'n' as i8), serde_json::Value::String("n".into()));
+        assert_eq!(pg_char_to_json(b'a' as i8), serde_json::Value::String("a".into()));
+        assert_eq!(pg_char_to_json(b'i' as i8), serde_json::Value::String("i".into()));
+        // A zero byte renders as an empty string (matches psql's charout).
+        assert_eq!(pg_char_to_json(0), serde_json::Value::String(String::new()));
+        // High bytes stay valid UTF-8 (Latin-1) and never panic.
+        assert_eq!(pg_char_to_json(-1), serde_json::Value::String("\u{00ff}".into()));
+    }
+
+    #[test]
     fn pg_any_string_accepts_all_types_and_decodes_utf8() {
         // Accepts any type — built-in, custom enum OIDs, domains, etc.
         assert!(PgAnyString::accepts(&Type::TEXT));
@@ -1141,6 +1808,49 @@ mod tests {
 
         // Non-UTF-8 bytes should fail gracefully
         assert!(PgAnyString::from_sql(&Type::UNKNOWN, &[0xFF, 0xFE, 0xFD]).is_err());
+    }
+
+    #[test]
+    fn pg_raw_bytes_accepts_all_types_and_preserves_binary_payloads() {
+        assert!(PgRawBytes::accepts(&Type::TEXT));
+        assert!(PgRawBytes::accepts(&Type::UNKNOWN));
+        assert!(PgRawBytes::accepts(&Type::OID));
+
+        let raw = PgRawBytes::from_sql(&Type::UNKNOWN, &[0x01, 0xAB, 0xFF]).unwrap();
+        assert_eq!(raw.0, vec![0x01, 0xAB, 0xFF]);
+    }
+
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0, "hex input must have an even number of chars");
+        (0..hex.len()).step_by(2).map(|idx| u8::from_str_radix(&hex[idx..idx + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn ewkb_point_with_srid_formats_as_wkt() {
+        let raw = decode_hex("0101000020E6100000C520B07268195D404E62105839F44340");
+        assert_eq!(ewkb_to_wkt(&raw), Some("POINT(116.397 39.908)".to_string()));
+    }
+
+    #[test]
+    fn ewkb_multi_polygon_formats_as_wkt() {
+        let raw = decode_hex(
+            "0106000020E610000002000000010300000001000000050000000000000000005D4000000000000044400000000000405D4000000000000044400000000000405D4000000000008044400000000000005D4000000000008044400000000000005D400000000000004440010300000001000000050000000000000000805D4000000000008043400000000000C05D4000000000008043400000000000C05D4000000000000044400000000000805D4000000000000044400000000000805D400000000000804340",
+        );
+        assert_eq!(
+            ewkb_to_wkt(&raw),
+            Some(
+                "MULTIPOLYGON(((116 40,117 40,117 41,116 41,116 40)),((118 39,119 39,119 40,118 40,118 39)))"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn ewkb_geometry_collection_formats_as_wkt() {
+        let raw = decode_hex(
+            "0107000020E61000000200000001010000000000000000005D4000000000000044400102000000020000000000000000405D4000000000008044400000000000805D400000000000004540",
+        );
+        assert_eq!(ewkb_to_wkt(&raw), Some("GEOMETRYCOLLECTION(POINT(116 40),LINESTRING(117 41,118 42))".to_string()));
     }
 
     #[test]
@@ -1182,7 +1892,7 @@ mod tests {
         let escaped = pg_quote_ident(malicious);
         // Double quotes should be doubled, not breaking out
         assert_eq!(escaped, r#""public""; DROP TABLE users; --""#);
-        assert!(escaped.matches('"').count() % 2 == 0, "quote count should be even");
+        assert!(escaped.matches('"').count().is_multiple_of(2), "quote count should be even");
     }
 
     // --- query_result_row_limit ---
@@ -1206,6 +1916,12 @@ mod tests {
     #[test]
     fn row_limit_allows_max_rows_override() {
         assert_eq!(query_result_row_limit(Some(5)), 5);
+    }
+
+    #[test]
+    fn timestamptz_display_preserves_local_offset() {
+        let text = format_pg_timestamptz(Local::now());
+        assert!(!text.ends_with("+00:00") || Local::now().offset().local_minus_utc() == 0);
     }
 
     // --- validate_postgres_ssl_paths ---
@@ -1349,6 +2065,10 @@ mod tests {
         assert!(sql.contains("table_name"));
         assert!(sql.contains("table_type"));
         assert!(sql.contains("table_comment"));
+        assert!(sql.contains("pg_catalog.pg_inherits"));
+        assert!(sql.contains("parent_schema"));
+        assert!(sql.contains("parent_name"));
+        assert!(sql.contains("pc.relkind = 'p'"));
         assert!(sql.contains("$1"));
         assert!(sql.contains("BASE TABLE"));
         assert!(sql.contains("VIEW"));
@@ -1357,14 +2077,60 @@ mod tests {
     }
 
     #[test]
+    fn postgres_column_metadata_reads_identity_extra() {
+        assert!(POSTGRES_COLUMNS_SQL.contains("a.attidentity"));
+        assert!(POSTGRES_COLUMNS_SQL.contains("pg_sequence"));
+        assert!(POSTGRES_COLUMNS_SQL.contains("generated by default as identity"));
+        assert!(POSTGRES_COLUMNS_SQL.contains("generated always as identity"));
+    }
+
+    #[test]
+    fn postgres_column_metadata_has_opengauss_compatible_fallback() {
+        assert!(!POSTGRES_COLUMNS_COMPAT_SQL.contains("a.attidentity"));
+        assert!(!POSTGRES_COLUMNS_COMPAT_SQL.contains("pg_sequence"));
+        assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("NULL::text AS column_extra"));
+        assert!(POSTGRES_COLUMNS_COMPAT_SQL.contains("col_description"));
+    }
+
+    #[test]
+    fn postgres_column_metadata_has_information_schema_fallback() {
+        assert!(POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("information_schema.columns"));
+        assert!(POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("information_schema.table_constraints"));
+        assert!(POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("information_schema.key_column_usage"));
+        assert!(!POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("pg_attribute"));
+        assert!(!POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("regclass"));
+    }
+
+    #[test]
+    fn postgres_index_metadata_has_legacy_catalog_fallback() {
+        assert!(POSTGRES_INDEXES_SQL.contains("ix.indnkeyatts"));
+        assert!(!POSTGRES_INDEXES_COMPAT_SQL.contains("ix.indnkeyatts"));
+        assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("NULL::smallint AS nkeyatts"));
+    }
+
+    #[test]
+    fn postgres_index_metadata_has_opengauss_compatible_fallback() {
+        assert!(!POSTGRES_INDEXES_OPENGAUSS_SQL.contains("WITH ORDINALITY"));
+        assert!(POSTGRES_INDEXES_OPENGAUSS_SQL.contains("generate_series"));
+        assert!(POSTGRES_INDEXES_OPENGAUSS_SQL.contains("array_length"));
+        assert!(POSTGRES_INDEXES_OPENGAUSS_SQL.contains("NULL::smallint AS nkeyatts"));
+    }
+
+    #[test]
     fn list_objects_sql_includes_routines() {
         let sql = list_objects_sql(true);
         assert!(sql.contains("pg_catalog.pg_class"));
         assert!(sql.contains("pg_catalog.pg_proc"));
+        assert!(sql.contains("pg_catalog.pg_inherits"));
+        assert!(sql.contains("parent_schema"));
+        assert!(sql.contains("parent_name"));
+        assert!(sql.contains("pc.relkind = 'p'"));
         assert!(sql.contains("pg_stat_file"));
         assert!(sql.contains("pg_xact_commit_timestamp"));
         assert!(sql.contains("'PROCEDURE'"));
         assert!(sql.contains("'FUNCTION'"));
+        assert!(sql.contains("'SEQUENCE'"));
+        assert!(sql.contains("'S'"));
     }
 
     #[test]
@@ -1387,6 +2153,22 @@ mod tests {
         assert!(list_objects_sql(false).contains("pg_catalog.pg_proc"));
     }
 
+    #[test]
+    fn transaction_recovery_statement_detection_matches_common_postgres_commands() {
+        assert!(is_transaction_recovery_statement("ROLLBACK"));
+        assert!(is_transaction_recovery_statement("rollback work"));
+        assert!(is_transaction_recovery_statement("ABORT TRANSACTION"));
+        assert!(is_transaction_recovery_statement("commit"));
+        assert!(is_transaction_recovery_statement("END"));
+    }
+
+    #[test]
+    fn transaction_recovery_statement_detection_ignores_regular_queries() {
+        assert!(!is_transaction_recovery_statement("SELECT 1"));
+        assert!(!is_transaction_recovery_statement("BEGIN"));
+        assert!(!is_transaction_recovery_statement("UPDATE users SET name = 'dbx'"));
+    }
+
     // --- execute_batch ---
 
     #[tokio::test]
@@ -1402,14 +2184,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_batch_whitespace_only_is_filtered() {
-        let statements = vec!["  ".to_string(), "\t\n".to_string(), "".to_string()];
+        let statements = ["  ".to_string(), "\t\n".to_string(), "".to_string()];
         let combined = statements.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(";\n");
         assert!(combined.is_empty());
     }
 
     #[test]
     fn execute_batch_joins_with_semicolons() {
-        let statements = vec!["SELECT 1".to_string(), "SELECT 2".to_string()];
+        let statements = ["SELECT 1".to_string(), "SELECT 2".to_string()];
         let combined = statements.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(";\n");
         assert_eq!(combined, "SELECT 1;\nSELECT 2");
     }

@@ -2,7 +2,7 @@
 import { computed, ref } from "vue";
 import { uuid } from "@/lib/utils";
 import { useI18n } from "vue-i18n";
-import { Plus, Trash2 } from "lucide-vue-next";
+import { Plus, Trash2 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import type { EditNode, EditNodeKind } from "@/types/editor";
@@ -194,13 +194,16 @@ function confirmRemoveChild() {
   align-items: start;
   margin: 4px 0 4px 2ch;
   padding: 7px 8px;
+  border: 1px solid var(--border);
   border: 1px solid color-mix(in oklab, var(--border) 82%, transparent);
   border-left-width: 3px;
   border-radius: 8px;
+  background: var(--muted);
   background: color-mix(in oklab, var(--background) 76%, var(--muted));
 }
 
 .json-edit-row:hover {
+  background: var(--accent);
   background: color-mix(in oklab, var(--background) 58%, var(--muted));
 }
 
@@ -271,6 +274,7 @@ function confirmRemoveChild() {
 
 .json-edit-value:focus {
   border-color: var(--ring);
+  box-shadow: 0 0 0 2px rgb(59 130 246 / 0.18);
   box-shadow: 0 0 0 2px color-mix(in oklab, var(--ring) 28%, transparent);
 }
 

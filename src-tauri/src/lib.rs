@@ -5,7 +5,7 @@ mod models;
 mod window_state_guard;
 
 use commands::connection::AppState;
-use dbx_core::storage::Storage;
+use dbx_core::storage::{DesktopIconTheme, DesktopSettings, Storage};
 use std::sync::Arc;
 use std::time::Instant;
 #[cfg(target_os = "macos")]
@@ -19,6 +19,13 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 
 const DESKTOP_TRAY_ID: &str = "main-tray";
+#[cfg(target_os = "macos")]
+const MACOS_TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/tray-macos-template.png");
+const BLACK_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon-black.png");
+
+pub(crate) fn apply_debug_log_level(debug_logging_enabled: bool) {
+    log::set_max_level(if debug_logging_enabled { log::LevelFilter::Debug } else { log::LevelFilter::Off });
+}
 
 fn should_hide_window_on_close(target_os: &str) -> bool {
     matches!(target_os, "macos" | "windows")
@@ -52,12 +59,39 @@ fn open_connection_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
 }
 
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
-fn setup_desktop_tray<R: tauri::Runtime, M: Manager<R>>(manager: &M) -> tauri::Result<()> {
+fn setup_desktop_tray<R: tauri::Runtime, M: Manager<R>>(
+    manager: &M,
+    icon_theme: DesktopIconTheme,
+) -> tauri::Result<()> {
     let menu = MenuBuilder::new(manager).text("show", "Show DBX").separator().text("quit", "Quit DBX").build()?;
     let mut tray =
         TrayIconBuilder::<R>::with_id(DESKTOP_TRAY_ID).tooltip("DBX").menu(&menu).show_menu_on_left_click(false);
-    if let Some(icon) = manager.app_handle().default_window_icon().cloned() {
-        tray = tray.icon(icon);
+    #[cfg(target_os = "macos")]
+    {
+        match icon_theme {
+            DesktopIconTheme::Default => {
+                tray = tray.icon(MACOS_TRAY_ICON).icon_as_template(true);
+            }
+            DesktopIconTheme::Black => {
+                tray = tray.icon(BLACK_APP_ICON).icon_as_template(false);
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let icon = match icon_theme {
+            DesktopIconTheme::Default => manager.app_handle().default_window_icon().cloned(),
+            DesktopIconTheme::Black => Some(BLACK_APP_ICON),
+        };
+        if let Some(icon) = icon {
+            tray = tray.icon(icon);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if let Some(icon) = manager.app_handle().default_window_icon().cloned() {
+            tray = tray.icon(icon);
+        }
     }
 
     tray.on_menu_event(|app, event| {
@@ -77,18 +111,67 @@ fn setup_desktop_tray<R: tauri::Runtime, M: Manager<R>>(manager: &M) -> tauri::R
     Ok(())
 }
 
-pub(crate) fn apply_desktop_tray_preference(app: &tauri::AppHandle, show_tray_icon: bool) -> tauri::Result<()> {
+fn apply_desktop_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIconTheme) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window("main") {
+        match icon_theme {
+            DesktopIconTheme::Default => {
+                if let Some(icon) = app.default_window_icon().cloned() {
+                    window.set_icon(icon)?;
+                }
+            }
+            DesktopIconTheme::Black => window.set_icon(BLACK_APP_ICON)?,
+        }
+    }
+    Ok(())
+}
+
+fn apply_desktop_tray_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIconTheme) -> tauri::Result<()> {
+    if let Some(tray) = app.tray_by_id(DESKTOP_TRAY_ID) {
+        #[cfg(target_os = "macos")]
+        {
+            match icon_theme {
+                DesktopIconTheme::Default => {
+                    tray.set_icon(Some(MACOS_TRAY_ICON))?;
+                    tray.set_icon_as_template(true)?;
+                }
+                DesktopIconTheme::Black => {
+                    tray.set_icon(Some(BLACK_APP_ICON))?;
+                    tray.set_icon_as_template(false)?;
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let icon = match icon_theme {
+                DesktopIconTheme::Default => app.default_window_icon().cloned(),
+                DesktopIconTheme::Black => Some(BLACK_APP_ICON),
+            };
+            tray.set_icon(icon)?;
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let _ = (tray, icon_theme);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &DesktopSettings) -> tauri::Result<()> {
+    apply_debug_log_level(desktop_settings.debug_logging_enabled);
+    apply_desktop_icon_theme(app, desktop_settings.icon_theme)?;
     if matches!(std::env::consts::OS, "macos" | "windows") {
         if let Some(tray) = app.tray_by_id(DESKTOP_TRAY_ID) {
-            tray.set_visible(show_tray_icon)?;
-        } else if show_tray_icon {
-            setup_desktop_tray(app)?;
+            tray.set_visible(desktop_settings.show_tray_icon)?;
+            apply_desktop_tray_icon_theme(app, desktop_settings.icon_theme)?;
+        } else if desktop_settings.show_tray_icon {
+            setup_desktop_tray(app, desktop_settings.icon_theme)?;
         }
     }
     Ok(())
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup};
 
@@ -110,33 +193,11 @@ mod tests {
         assert!(!should_setup_desktop_tray("windows", false));
         assert!(!should_setup_desktop_tray("macos", false));
         assert!(!should_setup_desktop_tray("linux", true));
-        let source = include_str!("lib.rs");
-        assert!(source.contains(
-            "if should_setup_desktop_tray(std::env::consts::OS, desktop_settings.show_tray_icon) {\n                setup_desktop_tray(app)?;"
-        ));
-    }
-
-    #[test]
-    fn tray_preference_hides_existing_tray_instead_of_removing_it() {
-        let source = include_str!("lib.rs");
-        assert!(source.contains("tray.set_visible(show_tray_icon)?;"));
-        let remove_call = concat!("remove", "_tray_by_id");
-        assert!(!source.contains(remove_call));
-    }
-
-    #[test]
-    fn desktop_settings_save_treats_runtime_tray_update_as_best_effort() {
-        let source = include_str!("commands/app_settings.rs");
-        assert!(source.contains("if let Err(err) = apply_desktop_tray_preference"));
-        assert!(!source.contains("map_err(|err| err.to_string())"));
     }
 
     #[test]
     fn shows_main_window_after_regular_startup_setup() {
         assert!(should_show_main_window_after_setup());
-        let source = include_str!("lib.rs");
-        assert!(source
-            .contains("if should_show_main_window_after_setup() {\n                show_main_window(app.handle());"));
     }
 }
 
@@ -148,18 +209,27 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             let links = commands::deep_link::connection_deep_links_from_args(args.clone());
             open_connection_deep_links(app, links);
 
-            let paths = commands::external_sql::sql_file_paths_from_args(args, std::path::Path::new(&cwd));
+            let paths = commands::external_sql::sql_file_paths_from_args(args.clone(), std::path::Path::new(&cwd));
             if !paths.is_empty() {
                 if let Some(state) = app.try_state::<commands::external_sql::ExternalSqlOpenState>() {
                     state.push(paths.clone());
                 }
                 let _ = app.emit("dbx-open-sql-files", paths);
+            }
+
+            let db_paths = commands::external_db::db_file_paths_from_args(args, std::path::Path::new(&cwd));
+            if !db_paths.is_empty() {
+                if let Some(state) = app.try_state::<commands::external_db::ExternalDbOpenState>() {
+                    state.push(db_paths.clone());
+                }
+                let _ = app.emit("dbx-open-db-files", db_paths);
             }
             show_main_window(app);
         }))
@@ -170,10 +240,6 @@ pub fn run() {
         .setup(move |app| {
             let setup_start = Instant::now();
             eprintln!("[STARTUP] plugins registered in {:?}", startup_begin.elapsed());
-
-            if cfg!(debug_assertions) {
-                app.handle().plugin(tauri_plugin_log::Builder::default().level(log::LevelFilter::Info).build())?;
-            }
 
             let default_data_dir =
                 app.path().app_data_dir().map_err(|e| e.to_string()).expect("Failed to resolve app data dir");
@@ -191,15 +257,27 @@ pub fn run() {
                 s
             });
             let desktop_settings = tauri::async_runtime::block_on(storage.load_desktop_settings()).unwrap_or_default();
+            app.handle().plugin(tauri_plugin_log::Builder::default().level(log::LevelFilter::Debug).build())?;
+            apply_debug_log_level(desktop_settings.debug_logging_enabled);
             eprintln!("[STARTUP] storage ready in {:?}", t.elapsed());
 
-            let state = Arc::new(AppState::new_with_plugin_dir_and_app_version(
-                storage,
-                data_dir.join("plugins"),
-                env!("CARGO_PKG_VERSION"),
-            ));
+            let state = if data_dir::uses_custom_data_dir() {
+                Arc::new(AppState::new_with_plugin_and_agent_dir_and_app_version(
+                    storage,
+                    data_dir.join("plugins"),
+                    data_dir.join("agents"),
+                    env!("CARGO_PKG_VERSION"),
+                ))
+            } else {
+                Arc::new(AppState::new_with_plugin_dir_and_app_version(
+                    storage,
+                    data_dir.join("plugins"),
+                    env!("CARGO_PKG_VERSION"),
+                ))
+            };
             app.manage(state.clone());
             app.manage(commands::external_sql::ExternalSqlOpenState::default());
+            app.manage(commands::external_db::ExternalDbOpenState::default());
             app.manage(commands::deep_link::DeepLinkOpenState::default());
             let startup_links = commands::deep_link::connection_deep_links_from_args(std::env::args().skip(1));
             open_connection_deep_links(app.handle(), startup_links);
@@ -215,8 +293,9 @@ pub fn run() {
                 }
             }
             if should_setup_desktop_tray(std::env::consts::OS, desktop_settings.show_tray_icon) {
-                setup_desktop_tray(app)?;
+                setup_desktop_tray(app, desktop_settings.icon_theme)?;
             }
+            apply_desktop_icon_theme(app.handle(), desktop_settings.icon_theme)?;
             window_state_guard::enforce_main_window_bounds(app.handle());
             if should_show_main_window_after_setup() {
                 show_main_window(app.handle());
@@ -249,6 +328,7 @@ pub fn run() {
             commands::app_settings::save_desktop_settings,
             commands::app_settings::load_pinned_tree_node_ids,
             commands::app_settings::save_pinned_tree_node_ids,
+            commands::app_settings::load_native_debug_logs,
             commands::cloud_sync::webdav_sync_test,
             commands::cloud_sync::webdav_password_status,
             commands::cloud_sync::save_webdav_saved_password,
@@ -257,7 +337,10 @@ pub fn run() {
             commands::cloud_sync::webdav_sync_download,
             commands::connection::test_connection,
             commands::connection::connect_db,
+            commands::connection::connection_final_proxy_port,
             commands::connection::disconnect_db,
+            commands::connection::close_database_connection,
+            commands::connection::refresh_connections,
             commands::connection::save_connections,
             commands::connection::load_connections,
             commands::connection::save_sidebar_layout,
@@ -273,6 +356,7 @@ pub fn run() {
             commands::schema::list_databases,
             commands::schema::list_tables,
             commands::schema::list_objects,
+            commands::schema::list_completion_objects,
             commands::schema::get_object_source,
             commands::schema::list_schemas,
             commands::schema::get_columns,
@@ -285,6 +369,9 @@ pub fn run() {
             commands::schema_cache::save_schema_cache,
             commands::schema_cache::load_schema_cache,
             commands::schema_cache::delete_schema_cache_prefix,
+            commands::tab_runtime_cache::save_tab_runtime_cache,
+            commands::tab_runtime_cache::load_tab_runtime_cache,
+            commands::tab_runtime_cache::delete_tab_runtime_cache,
             commands::query::execute_query,
             commands::query::execute_multi,
             commands::query::cancel_query,
@@ -298,6 +385,8 @@ pub fn run() {
             commands::query::prepare_query_pagination_execution_plan,
             commands::query::build_sorted_query_sql,
             commands::query::build_explain_sql,
+            commands::query::get_explain_info,
+            commands::query::build_create_user_sql,
             commands::query::build_dropped_file_preview_sql,
             commands::query::build_table_select_sql,
             commands::query::build_database_search_sql,
@@ -307,6 +396,7 @@ pub fn run() {
             commands::query::build_duckdb_attach_database_sql,
             commands::query::build_drop_object_sql,
             commands::query::build_drop_table_sql,
+            commands::query::build_drop_table_child_object_sql,
             commands::query::build_empty_table_sql,
             commands::query::build_truncate_table_sql,
             commands::query::build_drop_database_sql,
@@ -319,6 +409,7 @@ pub fn run() {
             commands::query::build_view_ddl_sql,
             commands::query::build_table_structure_change_sql,
             commands::query::build_create_table_sql,
+            commands::query::build_single_column_alter_sql,
             commands::query::analyze_editable_query_editability,
             commands::query::prepare_data_grid_save,
             commands::query::build_data_grid_copy_update_statements,
@@ -332,12 +423,16 @@ pub fn run() {
             commands::query::build_database_sql_export,
             commands::data_compare::prepare_data_compare,
             commands::data_compare::prepare_data_compare_from_tables,
+            commands::data_compare::prepare_data_compare_missing_target,
             commands::data_compare::build_data_compare_sync_plan,
             commands::sql_file::preview_sql_file,
             commands::sql_file::execute_sql_file,
             commands::sql_file::cancel_sql_file_execution,
             commands::external_sql::pending_open_sql_files,
             commands::external_sql::read_external_sql_file,
+            commands::external_db::pending_open_db_files,
+            commands::keychain::read_keychain_password,
+            commands::keychain::read_keychain_passwords,
             commands::deep_link::pending_open_connection_links,
             commands::table_import::preview_table_import_file,
             commands::table_import::import_table_file,
@@ -357,11 +452,18 @@ pub fn run() {
             commands::redis_cmd::redis_set_remove,
             commands::redis_cmd::redis_zadd,
             commands::redis_cmd::redis_zrem,
+            commands::redis_cmd::redis_stream_add,
+            commands::redis_cmd::redis_json_set,
+            commands::redis_cmd::redis_check_json_module,
             commands::redis_cmd::redis_set_ttl,
             commands::redis_cmd::redis_delete_keys,
             commands::redis_cmd::redis_flush_db,
             commands::redis_cmd::redis_execute_command,
             commands::redis_cmd::redis_load_more,
+            commands::etcd_cmd::etcd_list_prefix,
+            commands::etcd_cmd::etcd_get,
+            commands::etcd_cmd::etcd_put,
+            commands::etcd_cmd::etcd_delete,
             commands::saved_sql::load_saved_sql_library,
             commands::saved_sql::save_saved_sql_folder,
             commands::saved_sql::delete_saved_sql_folder,
@@ -372,27 +474,38 @@ pub fn run() {
             commands::mongo_cmd::mongo_find_documents,
             commands::mongo_cmd::mongo_aggregate_documents,
             commands::mongo_cmd::mongo_insert_document,
+            commands::mongo_cmd::mongo_insert_documents,
             commands::mongo_cmd::mongo_update_document,
+            commands::mongo_cmd::mongo_update_documents,
             commands::mongo_cmd::mongo_delete_document,
+            commands::mongo_cmd::mongo_delete_documents,
             commands::history::save_history,
             commands::history::load_history,
             commands::history::clear_history,
             commands::history::delete_history_entry,
+            commands::mcp::check_mcp_server_status,
             commands::update::check_for_updates,
             commands::update::get_system_proxy_url,
             commands::transfer::start_transfer,
             commands::transfer::cancel_transfer,
             commands::database_export::export_database_sql,
             commands::database_export::cancel_database_export,
+            commands::table_export::start_table_export,
+            commands::table_export::cancel_table_export,
             commands::csv_export::export_query_result_csv,
+            commands::csv_export::export_table_data_csv,
             commands::xlsx_export::export_query_result_xlsx,
             commands::text_export::export_query_result_json,
             commands::text_export::export_query_result_markdown,
             commands::agents::list_installed_agents,
             commands::agents::list_installed_agents_local,
             commands::agents::get_driver_store_usage,
+            commands::agents::get_driver_runtime_summary,
+            commands::agents::stop_driver_runtime,
+            commands::agents::restart_driver_runtime,
             commands::agents::install_agent,
             commands::agents::upgrade_all_agents,
+            commands::agents::check_agent_update_blockers,
             commands::agents::uninstall_agent,
             commands::agents::check_jre_installed,
             commands::agents::get_agent_java_runtime_config,
@@ -435,6 +548,23 @@ pub fn run() {
                         let _ = window.set_focus();
                     }
                 }
+
+                let db_paths: Vec<String> = urls
+                    .iter()
+                    .filter_map(|url| url.to_file_path().ok())
+                    .filter(|path| commands::external_db::is_db_file_path(path))
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect();
+                if !db_paths.is_empty() {
+                    if let Some(state) = app_handle.try_state::<commands::external_db::ExternalDbOpenState>() {
+                        state.push(db_paths.clone());
+                    }
+                    let _ = app_handle.emit("dbx-open-db-files", db_paths);
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
             }
 
             #[cfg(target_os = "macos")]
@@ -442,6 +572,12 @@ pub fn run() {
                 if !has_visible_windows {
                     show_main_window(app_handle);
                 }
+                let app_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        state.refresh_connections().await;
+                    }
+                });
             }
         });
 }

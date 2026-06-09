@@ -1,14 +1,14 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import { useI18n } from "vue-i18n";
 import {
   DatabaseZap,
   FilePlus2,
   Loader2,
-  Globe,
+  Languages,
   Moon,
   Sun,
   SunMoon,
-  Check,
   History,
   Bot,
   ArrowLeftRight,
@@ -18,27 +18,18 @@ import {
   Settings,
   CloudDownload,
   Package,
-} from "lucide-vue-next";
+} from "@lucide/vue";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import LightDropdown from "@/components/ui/LightDropdown.vue";
 import WindowControls from "@/components/layout/WindowControls.vue";
+import ExportProgressPopover from "@/components/export/ExportProgressPopover.vue";
 import { shouldReserveMacTrafficLightInset, useWindowControls } from "@/composables/useWindowControls";
 import { currentLocale, setLocale, type Locale } from "@/i18n";
 import type { AppThemeMode } from "@/lib/appTheme";
+import { LOCALE_OPTIONS } from "@/lib/localeOptions";
 
-const localeOptions: { value: Locale; flag: string; label: string }[] = [
-  { value: "en", flag: "🇺🇸", label: "English" },
-  { value: "es", flag: "🇪🇸", label: "Español" },
-  { value: "zh-CN", flag: "🇨🇳", label: "简体中文" },
-];
-
-defineProps<{
+const props = defineProps<{
   isDark: boolean;
   themeMode: AppThemeMode;
   showAiPanel: boolean;
@@ -70,6 +61,23 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const { isMac, isDesktop, showControls, isMaximized, isFullscreen, minimize, toggleMaximize, close } =
   useWindowControls();
+
+const themeItems = computed(() => [
+  { value: "light", label: t("toolbar.themeLight"), icon: Sun },
+  { value: "dark", label: t("toolbar.themeDark"), icon: Moon },
+  { value: "system", label: t("toolbar.themeSystem"), icon: SunMoon },
+]);
+const localeItems = computed(() =>
+  LOCALE_OPTIONS.map((option) => ({
+    value: option.value,
+    label: option.label,
+    leadingText: option.flag,
+  })),
+);
+const themeTriggerIcon = computed(() => {
+  if (props.themeMode === "system") return SunMoon;
+  return props.isDark ? Moon : Sun;
+});
 
 function onToolbarDblClick(e: MouseEvent) {
   if (isDesktop) return;
@@ -154,11 +162,11 @@ function onToolbarDblClick(e: MouseEvent) {
       @click="emit('open-driver-store')"
     >
       <Package class="h-3.5 w-3.5" />
-      驱动管理
+      {{ t("toolbar.driverManager") }}
       <span
         v-if="agentDriverUpdateCount > 0"
         class="ml-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-medium leading-none text-white"
-        aria-label="可更新驱动数量"
+        :aria-label="t('toolbar.updatableDriverCount')"
       >
         {{ agentDriverUpdateCount > 99 ? "99+" : agentDriverUpdateCount }}
       </span>
@@ -185,6 +193,8 @@ function onToolbarDblClick(e: MouseEvent) {
       </TooltipTrigger>
       <TooltipContent>{{ t("updates.check") }}</TooltipContent>
     </Tooltip>
+
+    <ExportProgressPopover />
 
     <Tooltip>
       <TooltipTrigger as-child>
@@ -219,44 +229,20 @@ function onToolbarDblClick(e: MouseEvent) {
     <Tooltip>
       <TooltipTrigger as-child>
         <span class="inline-flex">
-          <DropdownMenu>
-            <DropdownMenuTrigger as-child>
-              <Button variant="ghost" size="icon" class="h-8 w-8" :aria-label="t('toolbar.theme')">
-                <SunMoon v-if="themeMode === 'system'" class="h-4 w-4" />
-                <Moon v-else-if="isDark" class="h-4 w-4" />
-                <Sun v-else class="h-4 w-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem
-                class="gap-2"
-                :class="{ 'bg-accent': themeMode === 'light' }"
-                @select="emit('set-theme-mode', 'light')"
-              >
-                <Sun class="h-4 w-4" />
-                {{ t("toolbar.themeLight") }}
-                <Check v-if="themeMode === 'light'" class="ml-auto h-4 w-4" />
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                class="gap-2"
-                :class="{ 'bg-accent': themeMode === 'dark' }"
-                @select="emit('set-theme-mode', 'dark')"
-              >
-                <Moon class="h-4 w-4" />
-                {{ t("toolbar.themeDark") }}
-                <Check v-if="themeMode === 'dark'" class="ml-auto h-4 w-4" />
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                class="gap-2"
-                :class="{ 'bg-accent': themeMode === 'system' }"
-                @select="emit('set-theme-mode', 'system')"
-              >
-                <SunMoon class="h-4 w-4" />
-                {{ t("toolbar.themeSystem") }}
-                <Check v-if="themeMode === 'system'" class="ml-auto h-4 w-4" />
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <LightDropdown
+            :model-value="themeMode"
+            :items="themeItems"
+            :aria-label="t('toolbar.theme')"
+            :trigger-icon="themeTriggerIcon"
+            trigger-class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-accent hover:text-accent-foreground"
+            trigger-icon-class="h-4 w-4"
+            item-icon-class="h-4 w-4"
+            :show-trigger-label="false"
+            :show-chevron="false"
+            check-position="right"
+            align="end"
+            @update:model-value="(value) => emit('set-theme-mode', value as AppThemeMode)"
+          />
         </span>
       </TooltipTrigger>
       <TooltipContent>{{ t("toolbar.theme") }}</TooltipContent>
@@ -265,25 +251,19 @@ function onToolbarDblClick(e: MouseEvent) {
     <Tooltip>
       <TooltipTrigger as-child>
         <span class="inline-flex">
-          <DropdownMenu>
-            <DropdownMenuTrigger as-child>
-              <Button variant="ghost" size="icon" class="h-8 w-8" :aria-label="t('common.language')">
-                <Globe class="h-4 w-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem
-                v-for="option in localeOptions"
-                :key="option.value"
-                class="gap-2"
-                :class="{ 'bg-accent': currentLocale() === option.value }"
-                @click="setLocale(option.value)"
-              >
-                <span class="text-base leading-none">{{ option.flag }}</span>
-                <span>{{ option.label }}</span>
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <LightDropdown
+            :model-value="currentLocale()"
+            :items="localeItems"
+            :aria-label="t('common.language')"
+            :trigger-icon="Languages"
+            trigger-class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-accent hover:text-accent-foreground"
+            trigger-icon-class="h-4 w-4"
+            :show-trigger-label="false"
+            :show-chevron="false"
+            check-position="none"
+            align="end"
+            @update:model-value="(value) => setLocale(value as Locale)"
+          />
         </span>
       </TooltipTrigger>
       <TooltipContent>{{ t("common.language") }}</TooltipContent>

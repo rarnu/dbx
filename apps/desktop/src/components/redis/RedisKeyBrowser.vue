@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, onMounted, onUnmounted, watch } from "vue";
+import { computed, nextTick, ref, onMounted, onUnmounted, onActivated, onDeactivated, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import {
   Search,
@@ -13,7 +13,8 @@ import {
   Plus,
   KeyRound,
   TerminalSquare,
-} from "lucide-vue-next";
+  Asterisk,
+} from "@lucide/vue";
 import { RecycleScroller } from "vue-virtual-scroller";
 import "vue-virtual-scroller/dist/vue-virtual-scroller.css";
 import { Splitpanes, Pane } from "splitpanes";
@@ -24,6 +25,7 @@ import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Switch } from "@/components/ui/switch";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import RedisValueViewer from "./RedisValueViewer.vue";
 import * as api from "@/lib/api";
@@ -35,6 +37,7 @@ import {
   collectExpandedGroupIds,
   collectRedisGroupKeyRaws,
   flattenVisibleRedisKeyTree,
+  mergeKeysIntoRedisKeyTree,
   type RedisKeyTreeNode,
 } from "@/lib/redisKeyTree";
 import { classifyRedisCommandSafety } from "@/lib/redisCommandSafety";
@@ -42,14 +45,24 @@ import { isRedisClearScreenCommand, nextRedisCommandDb, redisKeyTextToRaw } from
 import { formatRedisCommandResult, formatRedisStringValue } from "@/lib/redisValuePresentation";
 import { isCancelSearchShortcut } from "@/lib/keyboardShortcuts";
 import { useEditorFontFamilyStyle } from "@/composables/useEditorFontFamilyStyle";
+import { useToast } from "@/composables/useToast";
+import { redisKeySearchPattern } from "@/lib/redisKeyPattern";
 
 const { t } = useI18n();
+const { toast } = useToast();
 const connectionStore = useConnectionStore();
 const settingsStore = useSettingsStore();
 const editorFontFamilyStyle = useEditorFontFamilyStyle();
 
 type RedisSearchMode = "key" | "value";
-type RedisCreateKeyType = "string" | "hash" | "list" | "set" | "zset";
+type RedisCreateKeyType = "string" | "hash" | "list" | "set" | "zset" | "stream" | "json";
+
+interface CreateKeyEntry {
+  id: number;
+  value: string;
+  field?: string;
+  score?: string;
+}
 type RedisSidePanel = "detail" | "command";
 type RedisCommandHistoryEntry = {
   id: number;
@@ -68,10 +81,12 @@ const flatKeys = ref<RedisKeyInfo[]>([]);
 const treeKeys = ref<RedisKeyTreeNode[]>([]);
 const loading = ref(false);
 const loadingMore = ref(false);
+const isFetchingAll = ref(false);
 const rootRef = ref<HTMLElement>();
 const commandTerminalRef = ref<HTMLElement>();
 const searchPattern = ref("");
 const searchMode = ref<RedisSearchMode>("key");
+const fuzzyKeySearch = ref(false);
 const selectedKeyRaw = ref<string | null>(null);
 const hasMore = ref(false);
 const scanCursor = ref(0);
@@ -94,19 +109,42 @@ const createKeyValue = ref("");
 const createKeyField = ref("");
 const createKeyScore = ref("0");
 const createKeyError = ref("");
+const createKeyTtl = ref("");
+const createKeyEntries = ref<CreateKeyEntry[]>([]);
+const createKeyRawMode = ref(false);
+const createKeyEntryId = ref("*");
+const jsonModuleAvailable = ref<boolean | null>(null);
+const checkingJsonModule = ref(false);
+let nextEntryId = 0;
 let searchRequestId = 0;
+let redisBrowserIsActive = true;
+let redisDbFlushedListenerRegistered = false;
 
 const valueQuery = computed(() => searchPattern.value.trim());
-const effectivePattern = computed(() => (searchMode.value === "key" ? searchPattern.value.trim() || "*" : "*"));
+const effectivePattern = computed(() =>
+  searchMode.value === "key" ? redisKeySearchPattern(searchPattern.value, fuzzyKeySearch.value) : "*",
+);
 const isSearchMode = computed(() =>
   searchMode.value === "key" ? effectivePattern.value !== "*" : valueQuery.value !== "",
 );
 const searchPlaceholder = computed(() =>
-  searchMode.value === "key" ? t("redis.pattern") : t("redis.valueSearchPlaceholder"),
+  searchMode.value === "key"
+    ? fuzzyKeySearch.value
+      ? t("redis.fuzzyPattern")
+      : t("redis.pattern")
+    : t("redis.valueSearchPlaceholder"),
 );
 const loadingEmptyText = computed(() =>
   searchMode.value === "value" && valueQuery.value ? t("redis.searchingValues") : t("redis.loadingKeys"),
 );
+const lastTotalKeys = ref(0);
+const fetchAllProgressText = computed(() => {
+  if (!isFetchingAll.value) return "";
+  if (lastTotalKeys.value > 0) {
+    return t("redis.fetchAllProgress", { loaded: flatKeys.value.length, total: lastTotalKeys.value });
+  }
+  return t("redis.fetchAllProgressUnknown", { loaded: flatKeys.value.length });
+});
 const selectedKey = computed(() => flatKeys.value.find((key) => key.key_raw === selectedKeyRaw.value) ?? null);
 const dangerDetails = computed(() => {
   if (!pendingDanger.value) return "";
@@ -129,6 +167,8 @@ const createKeyTypeOptions = computed<{ value: RedisCreateKeyType; label: string
   { value: "list", label: "List" },
   { value: "set", label: "Set" },
   { value: "zset", label: "Sorted Set" },
+  { value: "stream", label: "Stream" },
+  { value: "json", label: "JSON" },
 ]);
 const visibleRows = computed(() =>
   flattenVisibleRedisKeyTree(treeKeys.value, expandedGroupIds.value).map((row) => ({
@@ -163,6 +203,22 @@ function rebuildTree(expandAll = false) {
   }
 }
 
+function mergeTree(newKeys: RedisKeyInfo[]) {
+  if (newKeys.length === 0) return;
+  treeKeys.value = mergeKeysIntoRedisKeyTree(treeKeys.value, newKeys, props.db);
+
+  const availableExpanded = collectExpandedGroupIds(treeKeys.value);
+  const nextExpanded = new Set<string>();
+  for (const id of expandedGroupIds.value) {
+    if (availableExpanded.has(id)) nextExpanded.add(id);
+  }
+  expandedGroupIds.value = nextExpanded;
+
+  if (selectedKeyRaw.value && !flatKeys.value.some((key) => key.key_raw === selectedKeyRaw.value)) {
+    selectedKeyRaw.value = null;
+  }
+}
+
 async function fetchScanPage(): Promise<RedisScanResult> {
   const pageSize = settingsStore.editorSettings.redisScanPageSize;
   return searchMode.value === "value"
@@ -172,10 +228,18 @@ async function fetchScanPage(): Promise<RedisScanResult> {
 
 function appendScanResult(result: RedisScanResult) {
   const existingKeys = new Set(flatKeys.value.map((key) => key.key_raw));
-  flatKeys.value = [...flatKeys.value, ...result.keys.filter((key) => !existingKeys.has(key.key_raw))];
+  const newKeys = result.keys.filter((key) => !existingKeys.has(key.key_raw));
+  flatKeys.value = [...flatKeys.value, ...newKeys];
   scanCursor.value = result.cursor;
   hasMore.value = result.cursor !== 0;
-  rebuildTree(isSearchMode.value);
+  lastTotalKeys.value = result.total_keys;
+
+  if (treeKeys.value.length === 0) {
+    rebuildTree(isSearchMode.value);
+  } else {
+    mergeTree(newKeys);
+  }
+
   connectionStore.updateRedisDbKeyStats(props.connectionId, props.db, {
     loaded: isSearchMode.value ? undefined : flatKeys.value.length,
     total: result.total_keys,
@@ -216,7 +280,9 @@ async function fillInitialKeyBatch(requestId: number) {
 }
 
 async function loadKeys() {
+  if (!redisBrowserIsActive) return;
   const requestId = ++searchRequestId;
+  isFetchingAll.value = false;
   loading.value = true;
   flatKeys.value = [];
   treeKeys.value = [];
@@ -253,6 +319,26 @@ async function loadMore() {
   } finally {
     loadingMore.value = false;
   }
+}
+
+async function fetchAll() {
+  if (!hasMore.value || isFetchingAll.value) return;
+  const requestId = searchRequestId;
+  isFetchingAll.value = true;
+  try {
+    while (requestId === searchRequestId && isFetchingAll.value && hasMore.value) {
+      const applied = await scanNextPage(requestId);
+      if (!applied) break;
+    }
+  } finally {
+    if (requestId === searchRequestId) {
+      isFetchingAll.value = false;
+    }
+  }
+}
+
+function stopFetchAll() {
+  isFetchingAll.value = false;
 }
 
 function toggleGroup(groupId: string) {
@@ -376,6 +462,24 @@ async function openCommandPanel() {
   getCommandInput()?.focus();
 }
 
+function makeEntry(): CreateKeyEntry {
+  return { id: nextEntryId++, value: "", field: "", score: "0" };
+}
+
+function resetEntries() {
+  createKeyEntries.value = [makeEntry()];
+}
+
+function addEntry() {
+  createKeyEntries.value.push(makeEntry());
+}
+
+function removeEntry(idx: number) {
+  if (createKeyEntries.value.length > 1) {
+    createKeyEntries.value.splice(idx, 1);
+  }
+}
+
 function resetCreateKeyForm() {
   createKeyName.value = "";
   createKeyType.value = "string";
@@ -383,6 +487,41 @@ function resetCreateKeyForm() {
   createKeyField.value = "";
   createKeyScore.value = "0";
   createKeyError.value = "";
+  createKeyTtl.value = "";
+  createKeyRawMode.value = false;
+  createKeyEntryId.value = "*";
+  jsonModuleAvailable.value = null;
+  checkingJsonModule.value = false;
+  resetEntries();
+}
+
+function onCreateKeyTypeChange(type: any) {
+  createKeyType.value = (type || "string") as RedisCreateKeyType;
+  createKeyRawMode.value = false;
+  jsonModuleAvailable.value = null;
+  checkingJsonModule.value = false;
+  resetEntries();
+  if (createKeyType.value === "json") {
+    createKeyError.value = "";
+    checkingJsonModule.value = true;
+    api
+      .redisCheckJsonModule(props.connectionId, props.db)
+      .then((ok) => {
+        jsonModuleAvailable.value = ok;
+        if (!ok) {
+          createKeyError.value = t("redis.jsonModuleNotAvailable");
+        }
+      })
+      .catch(() => {
+        jsonModuleAvailable.value = false;
+        createKeyError.value = t("redis.jsonModuleNotAvailable");
+      })
+      .finally(() => {
+        checkingJsonModule.value = false;
+      });
+  } else {
+    createKeyError.value = "";
+  }
 }
 
 function openCreateKeyDialog() {
@@ -426,15 +565,7 @@ async function createRedisKey() {
   const keyName = createKeyName.value.trim();
   if (!keyName) {
     createKeyError.value = t("redis.createKeyNameRequired");
-    return;
-  }
-  if (createKeyType.value === "hash" && !createKeyField.value.trim()) {
-    createKeyError.value = t("redis.createFieldRequired");
-    return;
-  }
-  const score = Number.parseFloat(createKeyScore.value || "0");
-  if (createKeyType.value === "zset" && Number.isNaN(score)) {
-    createKeyError.value = t("redis.createScoreInvalid");
+    toast(t("redis.createKeyNameRequired"), 3000);
     return;
   }
 
@@ -442,17 +573,67 @@ async function createRedisKey() {
   createKeyError.value = "";
   try {
     const keyRaw = redisKeyTextToRaw(keyName);
-    if (createKeyType.value === "string") {
-      await api.redisSetString(props.connectionId, props.db, keyRaw, createKeyValue.value);
-    } else if (createKeyType.value === "hash") {
-      await api.redisHashSet(props.connectionId, props.db, keyRaw, createKeyField.value, createKeyValue.value);
-    } else if (createKeyType.value === "list") {
-      await api.redisListPush(props.connectionId, props.db, keyRaw, createKeyValue.value);
-    } else if (createKeyType.value === "set") {
-      await api.redisSetAdd(props.connectionId, props.db, keyRaw, createKeyValue.value);
-    } else if (createKeyType.value === "zset") {
-      await api.redisZadd(props.connectionId, props.db, keyRaw, createKeyValue.value, score);
+    const ttl = createKeyTtl.value ? Number.parseInt(createKeyTtl.value) || undefined : undefined;
+
+    if (createKeyType.value === "string" || createKeyType.value === "json" || createKeyRawMode.value) {
+      // Raw text/JSON mode — single value
+      if (createKeyType.value === "string") {
+        await api.redisSetString(props.connectionId, props.db, keyRaw, createKeyValue.value, ttl);
+      } else if (createKeyType.value === "json") {
+        await api.redisJsonSet(props.connectionId, props.db, keyRaw, createKeyValue.value, ttl);
+      } else if (createKeyType.value === "hash") {
+        await api.redisHashSet(props.connectionId, props.db, keyRaw, createKeyField.value, createKeyValue.value, ttl);
+      } else if (createKeyType.value === "list") {
+        await api.redisListPush(props.connectionId, props.db, keyRaw, createKeyValue.value, ttl);
+      } else if (createKeyType.value === "set") {
+        await api.redisSetAdd(props.connectionId, props.db, keyRaw, createKeyValue.value, ttl);
+      } else if (createKeyType.value === "zset") {
+        const score = Number.parseFloat(createKeyScore.value || "0");
+        await api.redisZadd(props.connectionId, props.db, keyRaw, createKeyValue.value, score, ttl);
+      }
+    } else {
+      // Structured entries mode — insert each entry, then set TTL once
+      if (createKeyType.value === "hash") {
+        for (const entry of createKeyEntries.value) {
+          if (entry.field && entry.field.trim()) {
+            await api.redisHashSet(props.connectionId, props.db, keyRaw, entry.field, entry.value);
+          }
+        }
+      } else if (createKeyType.value === "list") {
+        for (const entry of createKeyEntries.value) {
+          if (entry.value) {
+            await api.redisListPush(props.connectionId, props.db, keyRaw, entry.value);
+          }
+        }
+      } else if (createKeyType.value === "set") {
+        for (const entry of createKeyEntries.value) {
+          if (entry.value) {
+            await api.redisSetAdd(props.connectionId, props.db, keyRaw, entry.value);
+          }
+        }
+      } else if (createKeyType.value === "zset") {
+        for (const entry of createKeyEntries.value) {
+          if (entry.value) {
+            const s = Number.parseFloat(entry.score || "0");
+            if (!Number.isNaN(s)) {
+              await api.redisZadd(props.connectionId, props.db, keyRaw, entry.value, s);
+            }
+          }
+        }
+      } else if (createKeyType.value === "stream") {
+        const fields: [string, string][] = createKeyEntries.value
+          .filter((e) => e.field && e.field.trim())
+          .map((e) => [e.field!.trim(), e.value]);
+        if (fields.length > 0) {
+          const entryId = createKeyEntryId.value.trim() || "*";
+          await api.redisStreamAdd(props.connectionId, props.db, keyRaw, entryId, fields, ttl);
+        }
+      }
+      if (ttl) {
+        await api.redisSetTtl(props.connectionId, props.db, keyRaw, ttl);
+      }
     }
+
     const created = await api.redisGetValue(props.connectionId, props.db, keyRaw);
     upsertCreatedKey(created);
     showCreateKeyDialog.value = false;
@@ -547,6 +728,11 @@ function setSearchMode(mode: RedisSearchMode) {
   void loadKeys();
 }
 
+function toggleFuzzyKeySearch() {
+  fuzzyKeySearch.value = !fuzzyKeySearch.value;
+  if (searchMode.value === "key") void loadKeys();
+}
+
 function getSearchInput(): HTMLInputElement | null {
   return rootRef.value?.querySelector<HTMLInputElement>("[data-redis-search-input]") ?? null;
 }
@@ -574,22 +760,50 @@ function onSearchKeydown(event: KeyboardEvent) {
   void loadKeys();
 }
 
-onUnmounted(() => {
-  searchRequestId++;
-  if (searchTimer) clearTimeout(searchTimer);
-  window.removeEventListener("dbx-redis-db-flushed", onRedisDbFlushed);
-});
-
 function onRedisDbFlushed(event: Event) {
   const detail = (event as CustomEvent<{ connectionId: string; db: number }>).detail;
   if (!detail || detail.connectionId !== props.connectionId || detail.db !== props.db) return;
   resetLoadedKeys();
 }
 
-onMounted(() => {
+function registerRedisDbFlushedListener() {
+  if (redisDbFlushedListenerRegistered) return;
   window.addEventListener("dbx-redis-db-flushed", onRedisDbFlushed);
+  redisDbFlushedListenerRegistered = true;
+}
+
+function unregisterRedisDbFlushedListener() {
+  if (!redisDbFlushedListenerRegistered) return;
+  window.removeEventListener("dbx-redis-db-flushed", onRedisDbFlushed);
+  redisDbFlushedListenerRegistered = false;
+}
+
+function pauseRedisBrowserBackgroundWork() {
+  redisBrowserIsActive = false;
+  searchRequestId++;
+  isFetchingAll.value = false;
+  loading.value = false;
+  loadingMore.value = false;
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = null;
+  unregisterRedisDbFlushedListener();
+}
+
+function resumeRedisBrowserBackgroundWork() {
+  redisBrowserIsActive = true;
+  registerRedisDbFlushedListener();
+}
+
+onMounted(() => {
+  resumeRedisBrowserBackgroundWork();
   void loadKeys();
 });
+
+onActivated(resumeRedisBrowserBackgroundWork);
+
+onDeactivated(pauseRedisBrowserBackgroundWork);
+
+onUnmounted(pauseRedisBrowserBackgroundWork);
 
 watch(
   () => props.db,
@@ -644,6 +858,19 @@ defineExpose({ focusSearch });
               @input="onSearchInput"
               @keydown="onSearchKeydown"
             />
+            <Button
+              v-if="searchMode === 'key'"
+              variant="ghost"
+              size="sm"
+              class="h-6 shrink-0 px-2 text-xs"
+              :class="fuzzyKeySearch ? 'bg-accent text-accent-foreground' : 'text-muted-foreground'"
+              :title="t('redis.fuzzyMatchTitle')"
+              :aria-pressed="fuzzyKeySearch"
+              @click="toggleFuzzyKeySearch"
+            >
+              <Asterisk class="h-3 w-3 mr-1" />
+              {{ t("redis.fuzzyMatch") }}
+            </Button>
             <Button variant="ghost" size="icon" class="h-6 w-6 shrink-0" @click="loadKeys">
               <Loader2 v-if="loading" class="h-3 w-3 animate-spin" />
               <RefreshCw v-else class="h-3 w-3" />
@@ -756,16 +983,33 @@ defineExpose({ focusSearch });
               </div>
             </template>
           </RecycleScroller>
-          <div v-if="hasMore" class="shrink-0 border-t px-2 py-1.5 flex items-center justify-center">
+          <div v-if="hasMore && !isFetchingAll" class="shrink-0 border-t px-2 py-1.5 flex items-center gap-1.5">
             <Button
               variant="outline"
               size="sm"
-              class="h-7 text-xs w-full"
+              class="h-7 text-xs flex-1"
               :disabled="loadingMore || loading"
               @click="loadMore"
             >
               <Loader2 v-if="loadingMore" class="w-3 h-3 mr-1.5 animate-spin" />
               {{ t("redis.loadMoreKeys") }}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              class="h-7 text-xs flex-1"
+              :disabled="loading || !hasMore"
+              @click="fetchAll"
+            >
+              {{ t("redis.fetchAllKeys") }}
+            </Button>
+          </div>
+          <div v-if="isFetchingAll" class="shrink-0 border-t px-2 py-1.5 space-y-1">
+            <div class="text-xs text-muted-foreground text-center">
+              {{ fetchAllProgressText }}
+            </div>
+            <Button variant="destructive" size="sm" class="h-7 text-xs w-full" @click="stopFetchAll">
+              {{ t("redis.stopFetchAll") }}
             </Button>
           </div>
         </div>
@@ -774,7 +1018,7 @@ defineExpose({ focusSearch });
       <!-- Workspace (right) -->
       <Pane :size="64" :min-size="36">
         <div class="h-full min-w-0 bg-background flex flex-col overflow-hidden">
-          <Tabs v-model="activeSidePanel" class="h-full min-h-0 gap-0">
+          <Tabs v-model="activeSidePanel" :unmount-on-hide="false" class="h-full min-h-0 gap-0">
             <div class="h-9 shrink-0 border-b bg-background px-3 flex items-center">
               <TabsList class="h-7 gap-1 p-0.5">
                 <TabsTrigger value="detail" class="h-6 flex-none gap-1.5 rounded-md px-2 text-xs">
@@ -810,7 +1054,7 @@ defineExpose({ focusSearch });
 
             <TabsContent value="command" class="m-0 min-h-0 flex-1 flex flex-col">
               <div
-                class="dbx-editor-font-family relative flex min-h-0 flex-1 flex-col bg-[#090c10] text-[13px] leading-5 text-slate-100"
+                class="dbx-editor-font-family relative flex min-h-0 flex-1 flex-col bg-[#171b21] text-[13px] leading-5 text-slate-200"
                 @click="getCommandInput()?.focus()"
               >
                 <div ref="commandTerminalRef" class="min-h-0 flex-1 overflow-auto px-4 pb-3 pt-4">
@@ -821,7 +1065,7 @@ defineExpose({ focusSearch });
                   <div v-for="entry in commandHistory" :key="entry.id" class="mb-2">
                     <div class="flex min-w-0 items-start gap-2 whitespace-pre-wrap break-words">
                       <span class="shrink-0 text-[#d7ba7d]">{{ entry.prompt }}</span>
-                      <span class="min-w-0 text-slate-100">{{ entry.command }}</span>
+                      <span class="min-w-0 text-slate-200">{{ entry.command }}</span>
                     </div>
                     <pre
                       v-if="entry.output"
@@ -833,14 +1077,14 @@ defineExpose({ focusSearch });
                 </div>
 
                 <form
-                  class="flex shrink-0 items-center gap-2 border-t border-white/10 bg-[#090c10] px-4 py-2"
+                  class="flex shrink-0 items-center gap-2 border-t border-white/10 bg-[#171b21] px-4 py-2"
                   @submit.prevent="executeCommand"
                 >
                   <span class="shrink-0 text-[#d7ba7d]">{{ commandPrompt }}</span>
                   <input
                     v-model="commandText"
                     data-redis-command-input
-                    class="dbx-editor-font-family min-w-0 flex-1 border-0 bg-transparent p-0 text-[13px] text-slate-100 caret-[#d7ba7d] outline-none placeholder:text-slate-600"
+                    class="dbx-editor-font-family min-w-0 flex-1 border-0 bg-transparent p-0 text-[13px] text-slate-200 caret-[#d7ba7d] outline-none placeholder:text-slate-500"
                     :disabled="commandRunning"
                     autocomplete="off"
                     autocapitalize="off"
@@ -883,10 +1127,7 @@ defineExpose({ focusSearch });
 
           <label class="grid gap-1.5 text-xs font-medium">
             <span>{{ t("redis.createKeyType") }}</span>
-            <Select
-              :model-value="createKeyType"
-              @update:model-value="(value: any) => (createKeyType = value as RedisCreateKeyType)"
-            >
+            <Select :model-value="createKeyType" @update:model-value="onCreateKeyTypeChange">
               <SelectTrigger class="h-8 text-xs">
                 <SelectValue />
               </SelectTrigger>
@@ -898,7 +1139,7 @@ defineExpose({ focusSearch });
             </Select>
           </label>
 
-          <label v-if="createKeyType === 'hash'" class="grid gap-1.5 text-xs font-medium">
+          <label v-if="createKeyType === 'hash' && createKeyRawMode" class="grid gap-1.5 text-xs font-medium">
             <span>{{ t("redis.createField") }}</span>
             <Input
               v-model="createKeyField"
@@ -908,7 +1149,7 @@ defineExpose({ focusSearch });
             />
           </label>
 
-          <label v-if="createKeyType === 'zset'" class="grid gap-1.5 text-xs font-medium">
+          <label v-if="createKeyType === 'zset' && createKeyRawMode" class="grid gap-1.5 text-xs font-medium">
             <span>{{ t("redis.createScore") }}</span>
             <Input
               v-model="createKeyScore"
@@ -918,7 +1159,101 @@ defineExpose({ focusSearch });
             />
           </label>
 
+          <!-- TTL input -- always visible -->
           <label class="grid gap-1.5 text-xs font-medium">
+            <span>{{ t("redis.createKeyTtl") }}</span>
+            <Input
+              v-model="createKeyTtl"
+              class="dbx-editor-font-family h-8 text-xs"
+              type="number"
+              min="0"
+              :placeholder="t('redis.createKeyTtlPlaceholder')"
+              @keydown.enter="createRedisKey"
+            />
+          </label>
+
+          <!-- Raw mode toggle (non-string, non-stream, non-json types) -->
+          <div
+            v-if="createKeyType !== 'string' && createKeyType !== 'stream' && createKeyType !== 'json'"
+            class="flex items-center justify-end gap-1.5"
+          >
+            <label class="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <span>{{ t("redis.createKeyRawMode") }}</span>
+              <Switch size="sm" v-model="createKeyRawMode" />
+            </label>
+          </div>
+
+          <!-- Structured entries (non-string, non-json, non-raw mode) -->
+          <template v-if="createKeyType !== 'string' && createKeyType !== 'json' && !createKeyRawMode">
+            <!-- Stream entry ID -->
+            <label v-if="createKeyType === 'stream'" class="grid gap-1.5 text-xs font-medium">
+              <span>{{ t("redis.createKeyEntryId") }}</span>
+              <Input v-model="createKeyEntryId" class="dbx-editor-font-family h-8 text-xs font-mono" placeholder="*" />
+            </label>
+
+            <div class="grid gap-2">
+              <div class="flex items-center justify-between">
+                <span class="text-xs font-medium">{{ t("redis.createKeyEntries") }}</span>
+                <Button variant="outline" size="sm" class="h-6 gap-1 text-xs" @click="addEntry">
+                  <Plus class="h-3 w-3" />
+                  {{ t("redis.createKeyAddEntry") }}
+                </Button>
+              </div>
+              <div v-for="(entry, idx) in createKeyEntries" :key="entry.id" class="flex items-start gap-2">
+                <!-- Hash / Stream: field + value -->
+                <template v-if="createKeyType === 'hash' || createKeyType === 'stream'">
+                  <Input
+                    v-model="entry.field"
+                    class="dbx-editor-font-family h-8 w-2/5 text-xs"
+                    :placeholder="t('redis.createFieldPlaceholder')"
+                  />
+                  <Input
+                    v-model="entry.value"
+                    class="dbx-editor-font-family h-8 flex-1 text-xs"
+                    :placeholder="t('redis.createValuePlaceholder')"
+                  />
+                </template>
+                <!-- ZSet: score + member -->
+                <template v-else-if="createKeyType === 'zset'">
+                  <Input
+                    v-model="entry.score"
+                    class="dbx-editor-font-family h-8 w-20 text-xs"
+                    type="number"
+                    step="any"
+                    placeholder="0"
+                  />
+                  <Input
+                    v-model="entry.value"
+                    class="dbx-editor-font-family h-8 flex-1 text-xs"
+                    :placeholder="t('redis.createMember')"
+                  />
+                </template>
+                <!-- List / Set: single value -->
+                <template v-else>
+                  <Input
+                    v-model="entry.value"
+                    class="dbx-editor-font-family h-8 flex-1 text-xs"
+                    :placeholder="t('redis.createValuePlaceholder')"
+                  />
+                </template>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  class="h-8 w-8 shrink-0 p-0 text-muted-foreground hover:text-destructive"
+                  :disabled="createKeyEntries.length <= 1"
+                  @click="removeEntry(idx)"
+                >
+                  <Trash2 class="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            </div>
+          </template>
+
+          <!-- Raw value textarea (string, json, or raw mode for other types) -->
+          <label
+            v-if="createKeyType === 'string' || createKeyType === 'json' || createKeyRawMode"
+            class="grid gap-1.5 text-xs font-medium"
+          >
             <span>{{
               t(createKeyType === "set" || createKeyType === "zset" ? "redis.createMember" : "redis.createValue")
             }}</span>
@@ -937,7 +1272,10 @@ defineExpose({ focusSearch });
           <Button variant="ghost" :disabled="creatingKey" @click="showCreateKeyDialog = false">
             {{ t("dangerDialog.cancel") }}
           </Button>
-          <Button :disabled="creatingKey" @click="createRedisKey">
+          <Button
+            :disabled="creatingKey || checkingJsonModule || (createKeyType === 'json' && jsonModuleAvailable !== true)"
+            @click="createRedisKey"
+          >
             <Loader2 v-if="creatingKey" class="h-4 w-4 animate-spin" />
             <Plus v-else class="h-4 w-4" />
             {{ t("redis.createKeySubmit") }}

@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import test from "node:test";
+import { test } from "vitest";
 import { buildAiAgentPlan } from "../../apps/desktop/src/lib/aiAgentPlan.ts";
 import type { AiAction, AiAssistantMode } from "../../apps/desktop/src/lib/ai.ts";
 import type { ConnectionConfig } from "../../apps/desktop/src/types/database.ts";
@@ -63,6 +63,30 @@ test("agent mode auto-executes read SQL when the user asks to query", () => {
   ]);
   assert.equal(plan.executableSql, "SELECT count(*) FROM users");
   assert.equal(plan.handoffSql, "SELECT count(*) FROM users");
+});
+
+test("agent mode auto-executes table inventory metadata SQL for natural Chinese questions", () => {
+  const sql = "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public' ORDER BY tablename;";
+  const plan = buildAiAgentPlan(
+    planInput({
+      instruction: "当前有哪些表",
+      assistantContent: `SQL\n\n\n\n\`\`\`sql\n${sql}\n\`\`\``,
+    }),
+  );
+
+  assert.deepEqual(plan.steps, [
+    { kind: "generate_sql", status: "done", sql },
+    {
+      kind: "risk_check",
+      status: "done",
+      action: "auto_execute",
+      environment: "non_production",
+      category: "read",
+      reasons: [],
+    },
+    { kind: "execute_sql", status: "pending", sql },
+  ]);
+  assert.equal(plan.handoffSql, sql);
 });
 
 test("agent mode skips execution when the user explicitly asks not to run", () => {

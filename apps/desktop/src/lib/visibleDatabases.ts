@@ -8,6 +8,7 @@ const SYSTEM_DATABASE_RULES: Partial<Record<DatabaseType, ReadonlySet<string>>> 
   gbase: new Set(["information_schema", "mysql", "performance_schema", "sys"]),
   postgres: new Set(["template0", "template1"]),
   gaussdb: new Set(["template0", "template1"]),
+  kwdb: new Set(["template0", "template1"]),
   opengauss: new Set(["template0", "template1"]),
   kingbase: new Set(["template0", "template1"]),
   highgo: new Set(["template0", "template1"]),
@@ -67,6 +68,10 @@ export function visibleDatabaseFilterIsEnabled(visibleDatabases: string[] | unde
   return Array.isArray(visibleDatabases);
 }
 
+export function canSaveVisibleDatabaseSelection(selectedNames: string[]): boolean {
+  return selectedNames.length > 0;
+}
+
 export function filterVisibleDatabaseNames(databaseNames: string[], visibleDatabases: string[] | undefined): string[] {
   if (!visibleDatabaseFilterIsEnabled(visibleDatabases)) return databaseNames;
   const visible = new Set(visibleDatabases);
@@ -90,11 +95,14 @@ export function isSystemDatabaseName(databaseType: DatabaseType | undefined, dat
 
 export function filterDatabaseNamesForConnection(
   databaseNames: string[],
-  connection: Pick<ConnectionConfig, "db_type" | "visible_databases"> | undefined,
+  connection: Pick<ConnectionConfig, "db_type" | "driver_profile" | "visible_databases"> | undefined,
 ): string[] {
   const visibleDatabases = connection?.visible_databases;
   if (visibleDatabaseFilterIsEnabled(visibleDatabases)) {
     return filterVisibleDatabaseNames(databaseNames, visibleDatabases);
+  }
+  if (connection?.db_type === "gbase" && connection.driver_profile === "gbase8s") {
+    return databaseNames;
   }
   return databaseNames.filter((name) => !isSystemDatabaseName(connection?.db_type, name));
 }

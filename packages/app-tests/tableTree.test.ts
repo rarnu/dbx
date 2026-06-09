@@ -1,213 +1,272 @@
+import { test } from "vitest";
 import assert from "node:assert/strict";
-import test from "node:test";
-import { readFileSync } from "node:fs";
 import {
   buildGroupedObjectTreeNodes,
+  buildObjectGroupPlaceholderNodes,
+  buildSimpleObjectTreeNodes,
   buildTableTreeNodes,
-  expandCachedObjectBrowserNodes,
-  objectGroupRefreshParentId,
+  mergeTableInfosIntoObjects,
 } from "../../apps/desktop/src/lib/tableTree.ts";
-import type { ObjectInfo, TableInfo } from "../../apps/desktop/src/types/database.ts";
+import type { ObjectInfo, TableInfo, TreeNode } from "../../apps/desktop/src/types/database.ts";
 
-const treeItemSource = readFileSync("apps/desktop/src/components/sidebar/TreeItem.vue", "utf8");
-const connectionStoreSource = readFileSync("apps/desktop/src/stores/connectionStore.ts", "utf8");
-
-function table(name: string, tableType: "TABLE" | "VIEW" = "TABLE"): TableInfo {
-  return { name, table_type: tableType };
-}
-
-function obj(name: string, objectType = "TABLE", schema = "public"): ObjectInfo {
+function table(name: string, parent?: string): TableInfo {
   return {
     name,
-    object_type: objectType,
-    schema,
+    table_type: "BASE TABLE",
+    comment: null,
+    parent_schema: parent ? "public" : null,
+    parent_name: parent ?? null,
   };
 }
 
-test("keeps every table as a sidebar node instead of truncating to object browser", () => {
-  const tables: TableInfo[] = Array.from({ length: 16 }, (_, index) => table(`table_${index + 1}`));
-
-  const nodes = buildTableTreeNodes({
-    nodeId: "conn:db",
-    connectionId: "conn",
-    database: "db",
-    tables,
-  });
-
-  assert.equal(nodes.length, 16);
-  assert.equal(nodes.at(-1)?.label, "table_16");
-  assert.equal(
-    nodes.some((node) => node.type === "object-browser"),
-    false,
-  );
-});
-
-test("preserves table and view node types", () => {
-  const nodes = buildTableTreeNodes({
-    nodeId: "conn:db:public",
-    connectionId: "conn",
-    database: "db",
+function object(name: string, parent?: string): ObjectInfo {
+  return {
+    name,
+    object_type: "TABLE",
     schema: "public",
-    tables: [table("users"), table("user_view", "VIEW")],
-  });
+    comment: null,
+    created_at: null,
+    updated_at: null,
+    parent_schema: parent ? "public" : null,
+    parent_name: parent ?? null,
+  };
+}
 
-  assert.deepEqual(
-    nodes.map((node) => [node.label, node.type, node.schema]),
-    [
-      ["users", "table", "public"],
-      ["user_view", "view", "public"],
-    ],
-  );
-});
+function partitionGroup(node: TreeNode): TreeNode | undefined {
+  return node.children?.find((child) => child.type === "group-partitions");
+}
 
-test("normalizes padded table names from database drivers", () => {
+test("buildTableTreeNodes nests multi-level table partitions", () => {
   const nodes = buildTableTreeNodes({
-    nodeId: "conn:db:public",
-    connectionId: "conn",
-    database: "db",
-    schema: "public",
-    tables: [table(" users  "), table("\norders\t"), table("   ")],
-  });
-
-  assert.deepEqual(
-    nodes.map((node) => [node.id, node.label]),
-    [
-      ["conn:db:public:users", "users"],
-      ["conn:db:public:orders", "orders"],
-    ],
-  );
-});
-
-test("object tree groups count unique objects when metadata returns duplicates", () => {
-  const nodes = buildGroupedObjectTreeNodes({
     nodeId: "conn:app:public",
     connectionId: "conn",
     database: "app",
     schema: "public",
-    objects: [
-      obj("orders"),
-      obj("orders"),
-      obj("customers"),
-      obj("active_orders", "VIEW"),
-      obj("active_orders", "VIEW"),
-    ],
+    tables: [table("events"), table("events_2026", "events"), table("events_2026_05", "events_2026"), table("users")],
   });
 
-  const tableGroup = nodes.find((node) => node.type === "group-tables");
-  assert.equal(tableGroup?.objectCount, 2);
   assert.deepEqual(
-    tableGroup?.children?.map((child) => child.label),
-    ["orders", "customers"],
+    nodes.map((node) => node.label),
+    ["events", "users"],
+  );
+  assert.equal(nodes[0].id, "conn:app:public:events");
+
+  const events = nodes[0];
+  const firstLevel = partitionGroup(events);
+  assert.equal(firstLevel?.label, "tree.partitions");
+  assert.deepEqual(
+    firstLevel?.children?.map((node) => node.label),
+    ["events_2026"],
   );
 
-  const viewGroup = nodes.find((node) => node.type === "group-views");
-  assert.equal(viewGroup?.objectCount, 1);
+  const secondLevel = partitionGroup(firstLevel!.children![0]);
   assert.deepEqual(
-    viewGroup?.children?.map((child) => child.label),
-    ["active_orders"],
+    secondLevel?.children?.map((node) => node.label),
+    ["events_2026_05"],
   );
 });
 
-test("object tree table nodes keep the schema returned by metadata", () => {
-  const nodes = buildGroupedObjectTreeNodes({
+test("buildTableTreeNodes keeps partitions visible when their parent is not loaded", () => {
+  const nodes = buildTableTreeNodes({
+    nodeId: "conn:app:public",
+    connectionId: "conn",
+    database: "app",
+    schema: "public",
+    tables: [table("events_2026", "events")],
+  });
+
+  assert.deepEqual(
+    nodes.map((node) => node.label),
+    ["events_2026"],
+  );
+});
+
+test("buildTableTreeNodes keeps sidebar tables in natural name order", () => {
+  const nodes = buildTableTreeNodes({
+    nodeId: "conn:app:public",
+    connectionId: "conn",
+    database: "app",
+    schema: "public",
+    tables: [table("chat_staff"), table("chat_staff_his"), table("staff"), table("staff_his")],
+  });
+
+  assert.deepEqual(
+    nodes.map((node) => node.label),
+    ["chat_staff", "chat_staff_his", "staff", "staff_his"],
+  );
+});
+
+test("buildTableTreeNodes does not relocate prefixed business tables by suffix", () => {
+  const nodes = buildTableTreeNodes({
     nodeId: "conn:app",
     connectionId: "conn",
     database: "app",
-    schema: "app",
-    objects: [obj("orders", "TABLE", "sales")],
+    tables: [table("CurrentStock"), table("YonSuite_CurrentStock"), table("YonSuite_LocationStock")],
   });
 
-  const tableNode = nodes.find((node) => node.type === "group-tables")?.children?.[0];
-
-  assert.equal(tableNode?.schema, "sales");
+  assert.deepEqual(
+    nodes.map((node) => node.label),
+    ["CurrentStock", "YonSuite_CurrentStock", "YonSuite_LocationStock"],
+  );
 });
 
-test("expands cached object-browser nodes back into regular table nodes", () => {
-  const nodes = expandCachedObjectBrowserNodes([
-    {
-      id: "conn:db:table_1",
-      label: "table_1",
-      type: "table",
-      connectionId: "conn",
-      database: "db",
-      isExpanded: false,
-      children: [],
-    },
-    {
-      id: "conn:db:__object_browser",
-      label: "tree.objectBrowser",
-      type: "object-browser",
-      connectionId: "conn",
-      database: "db",
-      hiddenChildren: [
-        {
-          id: "conn:db:table_16",
-          label: "table_16",
-          type: "table",
-          connectionId: "conn",
-          database: "db",
-          isExpanded: false,
-          children: [],
-        },
-      ],
-    },
-  ]);
+test("buildGroupedObjectTreeNodes nests partitions inside the tables group", () => {
+  const groups = buildGroupedObjectTreeNodes({
+    nodeId: "conn:app:public",
+    connectionId: "conn",
+    database: "app",
+    schema: "public",
+    objects: [object("events"), object("events_2026", "events"), object("events_2026_05", "events_2026")],
+  });
 
+  const tableGroup = groups.find((node) => node.type === "group-tables");
+  assert.equal(tableGroup?.objectCount, 3);
   assert.deepEqual(
-    nodes.map((node) => [node.label, node.type]),
+    tableGroup?.children?.map((node) => node.label),
+    ["events"],
+  );
+  assert.equal(tableGroup?.children?.[0]?.id, "conn:app:public:__tables:public:events");
+  assert.deepEqual(
+    partitionGroup(tableGroup!.children![0])?.children?.map((node) => node.label),
+    ["events_2026"],
+  );
+});
+
+test("buildGroupedObjectTreeNodes applies natural name sorting inside object groups", () => {
+  const groups = buildGroupedObjectTreeNodes({
+    nodeId: "conn:app:public",
+    connectionId: "conn",
+    database: "app",
+    schema: "public",
+    objects: [object("chat_staff"), object("chat_staff_his"), object("staff"), object("staff_his")],
+  });
+
+  const tableGroup = groups.find((node) => node.type === "group-tables");
+  assert.deepEqual(
+    tableGroup?.children?.map((node) => node.label),
+    ["chat_staff", "chat_staff_his", "staff", "staff_his"],
+  );
+});
+
+test("buildGroupedObjectTreeNodes groups Oracle packages and package bodies", () => {
+  const groups = buildGroupedObjectTreeNodes({
+    nodeId: "conn:app:HR",
+    connectionId: "conn",
+    database: "app",
+    schema: "HR",
+    objects: [
+      { name: "PAYROLL", object_type: "PACKAGE", schema: "HR" },
+      { name: "PAYROLL", object_type: "PACKAGE_BODY", schema: "HR" },
+    ],
+  });
+
+  const packageGroup = groups.find((node) => node.type === "group-packages");
+  assert.equal(packageGroup?.label, "tree.packages");
+  assert.deepEqual(
+    packageGroup?.children?.map((node) => ({ label: node.label, type: node.type, id: node.id })),
     [
-      ["table_1", "table"],
-      ["table_16", "table"],
+      { label: "PAYROLL", type: "package", id: "conn:app:HR:__packages:HR:PAYROLL:PACKAGE" },
+      { label: "PAYROLL", type: "package-body", id: "conn:app:HR:__packages:HR:PAYROLL:PACKAGE_BODY" },
     ],
   );
 });
 
-test("resolves grouped object refreshes to the parent schema node", () => {
-  assert.equal(
-    objectGroupRefreshParentId({
-      id: "conn:db:public:__tables",
-      label: "tree.tables",
-      type: "group-tables",
-      connectionId: "conn",
-      database: "db",
-      schema: "public",
-    }),
-    "conn:db:public",
+test("buildObjectGroupPlaceholderNodes creates capability-driven lazy sidebar groups", () => {
+  const groups = buildObjectGroupPlaceholderNodes({
+    nodeId: "conn:app:HR",
+    connectionId: "conn",
+    database: "app",
+    schema: "HR",
+    objectTypes: ["TABLE", "VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE"],
+  });
+
+  assert.deepEqual(
+    groups.map((node) => ({ label: node.label, type: node.type, count: node.objectCount, children: node.children })),
+    [
+      { label: "tree.tables", type: "group-tables", count: undefined, children: [] },
+      { label: "tree.views", type: "group-views", count: undefined, children: [] },
+      { label: "tree.procedures", type: "group-procedures", count: undefined, children: [] },
+      { label: "tree.functions", type: "group-functions", count: undefined, children: [] },
+      { label: "tree.sequences", type: "group-sequences", count: undefined, children: [] },
+    ],
   );
 });
 
-test("table expander loads groups by the actual tree node id", () => {
-  assert.match(
-    treeItemSource,
-    /loadTableGroups\(node\.connectionId,\s*node\.database,\s*node\.label,\s*node\.schema,\s*node\.id\)/,
+test("buildSimpleObjectTreeNodes keeps routines, sequences, and packages visible in flat sidebar mode", () => {
+  const nodes = buildSimpleObjectTreeNodes({
+    nodeId: "conn:app:HR",
+    connectionId: "conn",
+    database: "app",
+    schema: "HR",
+    objects: [
+      { name: "ORDERS", object_type: "TABLE", schema: "HR" },
+      { name: "ACTIVE_ORDERS", object_type: "VIEW", schema: "HR" },
+      { name: "REFRESH_STATS", object_type: "PROCEDURE", schema: "HR" },
+      { name: "TOTAL_DUE", object_type: "FUNCTION", schema: "HR" },
+      { name: "ORDER_ID_SEQ", object_type: "SEQUENCE", schema: "HR" },
+      { name: "PAYROLL", object_type: "PACKAGE", schema: "HR" },
+      { name: "PAYROLL", object_type: "PACKAGE_BODY", schema: "HR" },
+    ],
+  });
+
+  assert.deepEqual(
+    nodes.map((node) => ({ label: node.label, type: node.type })),
+    [
+      { label: "ORDERS", type: "table" },
+      { label: "ACTIVE_ORDERS", type: "view" },
+      { label: "ORDER_ID_SEQ", type: "sequence" },
+      { label: "PAYROLL", type: "package" },
+      { label: "PAYROLL", type: "package-body" },
+      { label: "REFRESH_STATS", type: "procedure" },
+      { label: "TOTAL_DUE", type: "function" },
+    ],
   );
 });
 
-test("view metadata groups only expose columns", () => {
-  assert.match(
-    connectionStoreSource,
-    /if \(node\.type === "table"\) \{[\s\S]*type: "group-indexes"[\s\S]*type: "group-fkeys"[\s\S]*type: "group-triggers"/,
+test("mergeTableInfosIntoObjects restores views missing from object metadata", () => {
+  const merged = mergeTableInfosIntoObjects(
+    [object("orders")],
+    [
+      table("orders"),
+      {
+        name: "active_orders",
+        table_type: "VIEW",
+        comment: "current orders",
+        parent_schema: null,
+        parent_name: null,
+      },
+    ],
+    "public",
+  );
+
+  assert.deepEqual(
+    merged.map((item) => ({ name: item.name, type: item.object_type, schema: item.schema, comment: item.comment })),
+    [
+      { name: "orders", type: "TABLE", schema: "public", comment: null },
+      { name: "active_orders", type: "VIEW", schema: "public", comment: "current orders" },
+    ],
   );
 });
 
-test("table metadata group expanders load by their actual tree node ids", () => {
-  for (const [type, loader] of [
-    ["group-columns", "loadColumns"],
-    ["group-indexes", "loadIndexes"],
-    ["group-fkeys", "loadForeignKeys"],
-    ["group-triggers", "loadTriggers"],
-  ]) {
-    assert.match(
-      treeItemSource,
-      new RegExp(
-        `node\\.type === "${type}"[\\s\\S]*connectionStore\\.${loader}\\(node\\.connectionId,\\s*node\\.database,\\s*node\\.tableName,\\s*node\\.schema,\\s*node\\.id\\)`,
-      ),
-    );
-    assert.match(
-      connectionStoreSource,
-      new RegExp(
-        `node\\.type === "${type}"[\\s\\S]*await ${loader}\\(node\\.connectionId,\\s*node\\.database,\\s*node\\.tableName,\\s*node\\.schema,\\s*node\\.id\\)`,
-      ),
-    );
-  }
+test("mergeTableInfosIntoObjects dedupes MySQL tables when object metadata carries database as schema", () => {
+  const merged = mergeTableInfosIntoObjects(
+    [
+      {
+        name: "orders",
+        object_type: "TABLE",
+        schema: "app",
+        comment: null,
+        created_at: null,
+        updated_at: null,
+        parent_schema: null,
+        parent_name: null,
+      },
+    ],
+    [table("orders")],
+  );
+
+  assert.deepEqual(
+    merged.map((item) => ({ name: item.name, type: item.object_type, schema: item.schema })),
+    [{ name: "orders", type: "TABLE", schema: "app" }],
+  );
 });

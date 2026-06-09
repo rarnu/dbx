@@ -22,6 +22,7 @@ pub async fn mongo_list_collections(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn mongo_find_documents(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
@@ -77,6 +78,17 @@ pub async fn mongo_insert_document(
 }
 
 #[tauri::command]
+pub async fn mongo_insert_documents(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    collection: String,
+    docs_json: String,
+) -> Result<u64, String> {
+    dbx_core::mongo_ops::mongo_insert_documents_core(&state, &connection_id, &database, &collection, &docs_json).await
+}
+
+#[tauri::command]
 pub async fn mongo_update_document(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
@@ -90,6 +102,28 @@ pub async fn mongo_update_document(
 }
 
 #[tauri::command]
+pub async fn mongo_update_documents(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    collection: String,
+    filter_json: String,
+    update_json: String,
+    many: bool,
+) -> Result<u64, String> {
+    dbx_core::mongo_ops::mongo_update_documents_core(
+        &state,
+        &connection_id,
+        &database,
+        &collection,
+        &filter_json,
+        &update_json,
+        many,
+    )
+    .await
+}
+
+#[tauri::command]
 pub async fn mongo_delete_document(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
@@ -98,4 +132,17 @@ pub async fn mongo_delete_document(
     id: String,
 ) -> Result<u64, String> {
     dbx_core::mongo_ops::mongo_delete_document_core(&state, &connection_id, &database, &collection, &id).await
+}
+
+#[tauri::command]
+pub async fn mongo_delete_documents(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    collection: String,
+    filter_json: String,
+    many: bool,
+) -> Result<u64, String> {
+    dbx_core::mongo_ops::mongo_delete_documents_core(&state, &connection_id, &database, &collection, &filter_json, many)
+        .await
 }

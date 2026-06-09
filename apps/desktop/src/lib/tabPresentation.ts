@@ -1,7 +1,8 @@
-import { useI18n } from "vue-i18n";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
-import type { QueryTab } from "@/types/database";
+import type { QueryResult, QueryTab } from "@/types/database";
+
+type Translate = (key: string, params?: Record<string, unknown>) => string;
 
 export function connectionDisplayName(connectionId: string): string {
   const connectionStore = useConnectionStore();
@@ -13,8 +14,7 @@ export function connectionColor(connectionId: string): string {
   return connectionStore.getConfig(connectionId)?.color || "";
 }
 
-export function databaseDisplayNameForTab(connectionId: string, database: string): string {
-  const { t } = useI18n();
+export function databaseDisplayNameForTab(connectionId: string, database: string, t: Translate): string {
   const connectionStore = useConnectionStore();
   const connection = connectionStore.getConfig(connectionId);
   if (connection?.db_type === "redis" && database !== "") return `db${database}`;
@@ -27,8 +27,13 @@ export function isPreviewTab(tab: QueryTab): boolean {
   return !!config?.name.startsWith("[Preview]");
 }
 
-export function tabDisplayTitle(tab: QueryTab): string {
-  const database = databaseDisplayNameForTab(tab.connectionId, tab.database);
+function queryTitle(tab: QueryTab): string | undefined {
+  if (tab.customTitle || tab.savedSqlId || tab.objectSource) return tab.title.trim() || undefined;
+  return undefined;
+}
+
+export function tabDisplayTitle(tab: QueryTab, t: Translate): string {
+  const database = databaseDisplayNameForTab(tab.connectionId, tab.database, t);
   const settingsStore = useSettingsStore();
   const compact = settingsStore.editorSettings.compactTabTitle;
   if (isPreviewTab(tab)) return tab.title;
@@ -41,6 +46,8 @@ export function tabDisplayTitle(tab: QueryTab): string {
     return `${tab.tableMeta.tableName}${suffix}`;
   }
   if (tab.mode === "query") {
+    const title = queryTitle(tab);
+    if (title) return title;
     if (compact) return connectionDisplayName(tab.connectionId);
     return `${connectionDisplayName(tab.connectionId)}@${database}`;
   }
@@ -52,22 +59,32 @@ export function tabDisplayTitle(tab: QueryTab): string {
     if (compact) return connectionDisplayName(tab.connectionId);
     return `${connectionDisplayName(tab.connectionId)}@${database}`;
   }
+  if (tab.mode === "etcd") {
+    if (compact) return connectionDisplayName(tab.connectionId);
+    return `${connectionDisplayName(tab.connectionId)}@keys`;
+  }
   if (tab.mode === "objects") {
     const schema = tab.objectBrowser?.schema;
     if (compact) return schema || tab.title;
     return schema ? `${schema}@${database}` : `${tab.title}@${database}`;
   }
+  if (tab.mode === "users") {
+    if (compact) return t("tabs.users");
+    return `${t("tabs.users")}@${connectionDisplayName(tab.connectionId)}`;
+  }
   return tab.title;
 }
 
-export function tabTooltipLines(tab: QueryTab): { label: string; value: string }[] {
-  const { t } = useI18n();
+export function tabTooltipLines(tab: QueryTab, t: Translate): { label: string; value: string }[] {
   const connName = connectionDisplayName(tab.connectionId);
-  const database = databaseDisplayNameForTab(tab.connectionId, tab.database);
+  const database = databaseDisplayNameForTab(tab.connectionId, tab.database, t);
   const lines: { label: string; value: string }[] = [
     { label: t("tabs.tooltipConnection"), value: connName },
     { label: t("tabs.tooltipDatabase"), value: database },
   ];
+  if (tab.mode === "query" && queryTitle(tab)) {
+    lines.unshift({ label: t("tabs.tooltipTitle"), value: tab.title });
+  }
   if (tab.mode === "data" && tab.tableMeta?.tableName) {
     lines.push({ label: t("tabs.tooltipTable"), value: tab.tableMeta.tableName });
   }
@@ -80,12 +97,48 @@ export function tabTooltipLines(tab: QueryTab): { label: string; value: string }
   return lines;
 }
 
-export function tabModeLabel(tab: QueryTab): string {
-  const { t } = useI18n();
+export function tabularResultItems(
+  results: QueryResult[] | undefined,
+): { result: QueryResult; index: number; n: number }[] {
+  if (!results) return [];
+  return results
+    .map((result, index) => ({ result, index }))
+    .filter((item) => item.result.columns.length > 0)
+    .map((item, ordinal) => ({ ...item, n: ordinal + 1 }));
+}
+
+export interface ExecutionSummaryItem {
+  result: QueryResult;
+  index: number;
+  returnedColumns: number;
+  returnedRows: number;
+  affectedRows: number;
+  executionTimeMs: number;
+  hasTabularResult: boolean;
+  isError: boolean;
+}
+
+export function executionSummaryItems(tab: Pick<QueryTab, "result" | "results">): ExecutionSummaryItem[] {
+  const results = tab.results?.length ? tab.results : tab.result ? [tab.result] : [];
+  return results.map((result, index) => ({
+    result,
+    index,
+    returnedColumns: result.columns.length,
+    returnedRows: result.rows.length,
+    affectedRows: result.affected_rows,
+    executionTimeMs: result.execution_time_ms,
+    hasTabularResult: result.columns.length > 0,
+    isError: result.columns.includes("Error"),
+  }));
+}
+
+export function tabModeLabel(tab: QueryTab, t: Translate): string {
   if (tab.mode === "data") return t("tabs.table");
   if (tab.mode === "query") return t("tabs.sql");
   if (tab.mode === "mongo") return t("tabs.mongo");
   if (tab.mode === "redis") return t("tabs.redis");
+  if (tab.mode === "etcd") return t("tabs.etcd");
   if (tab.mode === "objects") return t("tabs.objects");
+  if (tab.mode === "users") return t("tabs.users");
   return tab.mode;
 }

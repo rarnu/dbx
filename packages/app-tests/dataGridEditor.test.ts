@@ -1,12 +1,11 @@
 import { strict as assert } from "node:assert";
-import test from "node:test";
+import { test } from "vitest";
 import { computed, nextTick, ref } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { useDataGridEditor } from "../../apps/desktop/src/composables/useDataGridEditor.ts";
+import type { CellValue } from "../../apps/desktop/src/lib/cellValue.ts";
 import type { DataGridSaveStatementOptions } from "../../apps/desktop/src/lib/dataGridSql.ts";
 import type { ColumnInfo } from "../../apps/desktop/src/types/database.ts";
-
-type CellValue = string | number | boolean | null;
 
 function installBrowserTestGlobals() {
   globalThis.document = { querySelector: () => null } as unknown as Document;
@@ -82,8 +81,21 @@ function formatGridSqlLiteral(value: CellValue, databaseType?: string): string {
   if (value === null) return "NULL";
   if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
   if (typeof value === "number") return String(value);
+  if (Array.isArray(value) && databaseType === "postgres") {
+    return `'${formatPgArrayLiteral(value)}'`;
+  }
   const escaped = `'${String(value).replace(/\\/g, "\\\\").replace(/'/g, "''")}'`;
   return databaseType === "sqlserver" ? `N${escaped}` : escaped;
+}
+
+function formatPgArrayLiteral(value: CellValue[]): string {
+  return `{${value
+    .map((item) => {
+      if (Array.isArray(item)) return formatPgArrayLiteral(item);
+      if (item === null) return "NULL";
+      return `"${String(item).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    })
+    .join(",")}}`;
 }
 
 function column(name: string, isPrimaryKey = false, extra: string | null = null): ColumnInfo {
@@ -96,6 +108,49 @@ function column(name: string, isPrimaryKey = false, extra: string | null = null)
     extra,
   };
 }
+
+test("row data helper reuses unchanged rows and clones dirty rows only", () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const row = ["AFW", 1995, 35271.907090628745] as CellValue[];
+  const result = computed(() => ({
+    columns: ["code", "year", "score"],
+    rows: [row],
+  }));
+  const editor = useDataGridEditor({
+    result,
+    editable: computed(() => true),
+    databaseType: computed(() => "postgres"),
+    connectionId: computed(() => undefined),
+    database: computed(() => undefined),
+    tableMeta: computed(() => ({
+      tableName: "metrics",
+      columns: [column("code", true), column("year", true), column("score")],
+      primaryKeys: ["code", "year"],
+    })),
+    onExecuteSql: computed(() => undefined),
+    sql: computed(() => undefined),
+    searchText: ref(""),
+    whereFilterInput: ref(""),
+    orderByInput: ref(""),
+    currentWhereInput: computed(() => undefined),
+    rowStatusFilter: ref("all"),
+    getRowItem: () => undefined,
+    pageSize: ref(100),
+    currentPage: ref(1),
+    emit: () => {},
+  });
+
+  assert.equal(editor.rowDataWithChanges(row, 0), row);
+
+  editor.dirtyRows.value.set(0, new Map([[2, 10]]));
+  const dirtyRow = editor.rowDataWithChanges(row, 0);
+
+  assert.notEqual(dirtyRow, row);
+  assert.deepEqual(dirtyRow, ["AFW", 1995, 10]);
+  assert.deepEqual(row, ["AFW", 1995, 35271.907090628745]);
+});
 
 test("cloning a row copies non-generated primary key values without executing save", async () => {
   setActivePinia(createPinia());
@@ -128,6 +183,7 @@ test("cloning a row copies non-generated primary key values without executing sa
     searchText: ref(""),
     whereFilterInput: ref(""),
     orderByInput: ref(""),
+    currentWhereInput: computed(() => undefined),
     rowStatusFilter,
     pageSize: ref(100),
     currentPage: ref(1),
@@ -204,6 +260,7 @@ test("cloning a row clears auto-generated key columns", async () => {
     searchText: ref(""),
     whereFilterInput: ref(""),
     orderByInput: ref(""),
+    currentWhereInput: computed(() => undefined),
     rowStatusFilter,
     pageSize: ref(100),
     currentPage: ref(1),
@@ -257,6 +314,7 @@ test("saving deleted rows reloads current table data", async () => {
     searchText: ref("ada"),
     whereFilterInput: ref("name ILIKE '%a%'"),
     orderByInput: ref("id DESC"),
+    currentWhereInput: computed(() => "name ILIKE '%a%'"),
     rowStatusFilter,
     pageSize: ref(50),
     currentPage: ref(3),
@@ -315,6 +373,7 @@ test("saving inserted rows reloads current table data", async () => {
     searchText: ref("linus"),
     whereFilterInput: ref("name ILIKE '%l%'"),
     orderByInput: ref("id DESC"),
+    currentWhereInput: computed(() => "name ILIKE '%l%'"),
     rowStatusFilter,
     pageSize: ref(50),
     currentPage: ref(2),
@@ -362,6 +421,7 @@ test("saving edited rows without deletes does not reload table data", async () =
     searchText: ref(""),
     whereFilterInput: ref(""),
     orderByInput: ref(""),
+    currentWhereInput: computed(() => undefined),
     rowStatusFilter,
     pageSize: ref(50),
     currentPage: ref(1),
@@ -418,6 +478,7 @@ test("saving manually typed JSON from a MySQL grid normalizes smart quotes", asy
     searchText: ref(""),
     whereFilterInput: ref(""),
     orderByInput: ref(""),
+    currentWhereInput: computed(() => undefined),
     rowStatusFilter,
     pageSize: ref(50),
     currentPage: ref(1),
@@ -442,4 +503,147 @@ test("saving manually typed JSON from a MySQL grid normalizes smart quotes", asy
   assert.deepEqual(executedSql, [
     `UPDATE "settings" SET "payload" = '{"2:3":"3:4","3:2":"4:3","21:9":"16:9"}' WHERE "id" = 1;`,
   ]);
+});
+
+test("saving manually typed JSON arrays from a Postgres array column uses array values", async () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const result = computed(() => ({
+    columns: ["id", "tags"],
+    rows: [[1, "{legacy}"] as CellValue[]],
+  }));
+  const rowStatusFilter = ref<"all" | "changed" | "edited" | "new" | "deleted">("all");
+  const executedSql: string[] = [];
+
+  const editor = useDataGridEditor({
+    result,
+    editable: computed(() => true),
+    databaseType: computed(() => "postgres"),
+    connectionId: computed(() => undefined),
+    database: computed(() => undefined),
+    tableMeta: computed(() => ({
+      tableName: "articles",
+      columns: [column("id", true), { ...column("tags"), data_type: "_text" }],
+      primaryKeys: ["id"],
+    })),
+    onExecuteSql: computed(() => async (sql: string) => {
+      executedSql.push(sql);
+    }),
+    customSave: computed(() => undefined),
+    sql: computed(() => "SELECT id, tags FROM articles"),
+    searchText: ref(""),
+    whereFilterInput: ref(""),
+    orderByInput: ref(""),
+    currentWhereInput: computed(() => undefined),
+    rowStatusFilter,
+    pageSize: ref(50),
+    currentPage: ref(1),
+    getRowItem: (rowId) => {
+      if (rowId !== 0) return undefined;
+      return {
+        id: 0,
+        sourceIndex: 0,
+        data: result.value.rows[0],
+        isNew: false,
+        isDeleted: false,
+        isDirtyCol: [false, false],
+        status: "clean",
+      };
+    },
+    emit: () => {},
+  });
+
+  editor.applyCellValue(0, 1, `["draft","发布"]`);
+  await editor.saveChanges();
+
+  assert.deepEqual(executedSql, [`UPDATE "articles" SET "tags" = '{"draft","发布"}' WHERE "id" = 1;`]);
+});
+
+test("failed table data save records a failed history entry", async () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const permissionError = "Statement 1 failed: Server error: ERROR 42000 (1142): UPDATE command denied to user";
+  const savedHistoryEntries: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/prepare-data-grid-save") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      const options = body.options as DataGridSaveStatementOptions;
+      return new Response(
+        JSON.stringify({
+          statements: mockPreparedSaveStatements(options),
+          rollbackStatements: [`UPDATE "pp_questions" SET "title" = 'Old title' WHERE "id" = 1;`],
+          executionSchema: options.tableMeta.schema,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/execute-in-transaction") {
+      return new Response(permissionError, { status: 500 });
+    }
+    if (url === "/api/history/save") {
+      savedHistoryEntries.push(JSON.parse(String(init?.body ?? "{}")).entry);
+      return new Response("null", { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(`unexpected request: ${url}`, { status: 500 });
+  }) as typeof fetch;
+
+  const result = computed(() => ({
+    columns: ["id", "title"],
+    rows: [[1, "Old title"] as CellValue[]],
+  }));
+  const rowStatusFilter = ref<"all" | "changed" | "edited" | "new" | "deleted">("all");
+  const editor = useDataGridEditor({
+    result,
+    editable: computed(() => true),
+    databaseType: computed(() => "mysql"),
+    connectionId: computed(() => "conn-1"),
+    database: computed(() => "app_db"),
+    tableMeta: computed(() => ({
+      tableName: "pp_questions",
+      columns: [column("id", true), column("title")],
+      primaryKeys: ["id"],
+    })),
+    onExecuteSql: computed(() => undefined),
+    customSave: computed(() => undefined),
+    sql: computed(() => "SELECT id, title FROM pp_questions"),
+    searchText: ref(""),
+    whereFilterInput: ref(""),
+    currentWhereInput: computed(() => undefined),
+    orderByInput: ref(""),
+    rowStatusFilter,
+    pageSize: ref(50),
+    currentPage: ref(1),
+    getRowItem: (rowId) => {
+      if (rowId !== 0) return undefined;
+      return {
+        id: 0,
+        sourceIndex: 0,
+        data: result.value.rows[0],
+        isNew: false,
+        isDeleted: false,
+        isDirtyCol: [false, false],
+        status: "clean",
+      };
+    },
+    emit: () => {},
+  });
+
+  editor.applyCellValue(0, 1, "New title");
+  await editor.saveChanges();
+
+  assert.equal(editor.saveError.value, permissionError);
+  assert.equal(editor.dirtyRows.value.size, 1);
+  assert.equal(savedHistoryEntries.length, 1);
+  const historyEntry = savedHistoryEntries[0];
+  assert.equal(historyEntry.success, false);
+  assert.equal(historyEntry.error, permissionError);
+  assert.equal(historyEntry.activity_kind, "data_change");
+  assert.equal(historyEntry.operation, "UPDATE");
+  assert.equal(historyEntry.target, "pp_questions");
+  assert.equal(historyEntry.rollback_sql, undefined);
+  assert.equal(historyEntry.affected_rows, undefined);
+  assert.equal(historyEntry.sql, `UPDATE "pp_questions" SET "title" = 'New title' WHERE "id" = 1;`);
 });

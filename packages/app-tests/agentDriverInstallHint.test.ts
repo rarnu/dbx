@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { test } from "vitest";
 import { showAgentDriverInstallHint } from "../../apps/desktop/src/lib/agentDriverInstallHint.ts";
 
 test("hides the agent driver install hint when the selected driver is installed", () => {
@@ -28,6 +28,7 @@ test("uses the selected Oracle driver profile for install hints", () => {
       "oracle",
       [
         { db_type: "oracle", installed: false },
+        { db_type: "oracle-legacy", installed: false },
         { db_type: "oracle-10g", installed: true },
       ],
       "oracle-10g",
@@ -39,11 +40,49 @@ test("uses the selected Oracle driver profile for install hints", () => {
       "oracle",
       [
         { db_type: "oracle", installed: true },
+        { db_type: "oracle-legacy", installed: false },
         { db_type: "oracle-10g", installed: false },
       ],
       "oracle",
     ),
     false,
   );
+  assert.equal(
+    showAgentDriverInstallHint(
+      "oracle",
+      [
+        { db_type: "oracle", installed: true },
+        { db_type: "oracle-legacy", installed: true },
+        { db_type: "oracle-10g", installed: false },
+      ],
+      "oracle-legacy",
+    ),
+    false,
+  );
   assert.equal(showAgentDriverInstallHint("oracle", [{ db_type: "oracle", installed: false }], "oracle"), true);
+});
+
+test("uses selected non-Oracle agent driver profiles for install hints", () => {
+  assert.equal(
+    showAgentDriverInstallHint(
+      "gbase",
+      [
+        { db_type: "gbase", installed: true },
+        { db_type: "gbase8s", installed: false },
+      ],
+      "gbase8s",
+    ),
+    true,
+  );
+  assert.equal(
+    showAgentDriverInstallHint(
+      "gbase",
+      [
+        { db_type: "gbase", installed: false },
+        { db_type: "gbase8s", installed: true },
+      ],
+      "gbase8s",
+    ),
+    false,
+  );
 });

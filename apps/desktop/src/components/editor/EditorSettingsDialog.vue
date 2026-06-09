@@ -3,18 +3,24 @@ import { ref, watch, shallowRef, computed, onMounted } from "vue";
 import type { EditorView as EditorViewType } from "@codemirror/view";
 import { useI18n } from "vue-i18n";
 import {
+  AlertTriangle,
+  CheckCircle2,
   CircleHelp,
   Cloud,
+  Copy,
   Download,
   ExternalLink,
   Loader2,
+  PackageSearch,
   Pencil,
   RefreshCw,
+  RotateCcw,
   Settings,
+  Terminal,
   Trash2,
   Upload,
   X,
-} from "lucide-vue-next";
+} from "@lucide/vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -25,6 +31,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   useSettingsStore,
@@ -36,13 +43,21 @@ import {
   type AiProvider,
   type AiApiStyle,
   type EditorTheme,
+  type DesktopIconTheme,
+  type DisconnectTabHandlingMode,
+  type CustomThemeColors,
+  type CustomTheme,
 } from "@/stores/settingsStore";
 import { loadEditorTheme, editorFontTheme } from "@/lib/editorThemes";
+import ThemeCustomizerDialog from "./ThemeCustomizerDialog.vue";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { useTheme } from "@/composables/useTheme";
+import { copyToClipboard } from "@/lib/clipboard";
+import { clearDebugLogs as clearStoredDebugLogs, downloadDebugLogs, getDebugLogBundleText } from "@/lib/debugLog";
 import {
   aiListModels,
   aiTestConnection,
+  checkMcpServerStatus,
   forgetWebdavSavedPassword,
   listSystemFonts,
   saveWebdavSavedPassword,
@@ -51,23 +66,28 @@ import {
   webdavSyncTest,
   webdavSyncUpload,
   type AiModelInfo,
+  type McpServerStatus,
   type WebDavConfig,
 } from "@/lib/api";
 import { eventToShortcut } from "@/lib/keyboardShortcuts";
 import {
   SHORTCUT_DEFINITIONS,
   findShortcutConflict,
-  formatShortcut,
   normalizeShortcutSettings,
   type ShortcutActionId,
 } from "@/lib/shortcutRegistry";
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebarTableNameDisplay";
+import { normalizeSqlFormatterSettings, type SqlFormatterSettings } from "@/lib/sqlFormatterConfig";
 import type { SqlSnippet } from "@/types/database";
 import { uuid } from "@/lib/utils";
 import { DEFAULT_SQL_SNIPPETS } from "@/lib/sqlCompletion";
 import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
+import AppLogo from "@/components/icons/AppLogo.vue";
+import SqlFormatterSettingsPanel from "./SqlFormatterSettingsPanel.vue";
 import type { AppThemeAppearance } from "@/lib/appTheme";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { currentLocale, setLocale, type Locale } from "@/i18n";
+import { LOCALE_OPTIONS } from "@/lib/localeOptions";
 
 const { t } = useI18n();
 const settingsStore = useSettingsStore();
@@ -89,25 +109,58 @@ const editFontFamily = ref(settingsStore.editorSettings.fontFamily);
 const editFontSize = ref(settingsStore.editorSettings.fontSize);
 const editUiScale = ref(settingsStore.editorSettings.uiScale);
 const editTheme = ref(settingsStore.editorSettings.theme);
+const editCustomThemes = ref<CustomTheme[]>([...settingsStore.editorSettings.customThemes]);
+const editActiveCustomThemeId = ref(settingsStore.editorSettings.activeCustomThemeId);
+const showThemeCustomizer = ref(false);
 const editExecuteMode = ref(settingsStore.editorSettings.executeMode);
 const editWordWrap = ref(settingsStore.editorSettings.wordWrap);
+const editConfirmDangerousSqlExecution = ref(settingsStore.editorSettings.confirmDangerousSqlExecution);
 const editAppLayout = ref(settingsStore.editorSettings.appLayout);
 const editShowTrayIcon = ref(settingsStore.desktopSettings.show_tray_icon);
+const editIconTheme = ref<DesktopIconTheme>(settingsStore.desktopSettings.icon_theme);
+const editDebugLoggingEnabled = ref(settingsStore.desktopSettings.debug_logging_enabled);
+const debugLogCopied = ref(false);
+const debugLogDownloaded = ref(false);
 const editShowColumnCommentsInHeader = ref(settingsStore.editorSettings.showColumnCommentsInHeader);
+const editShowColumnTypesInHeader = ref(settingsStore.editorSettings.showColumnTypesInHeader);
 const editCompactColumnHeaderActions = ref(settingsStore.editorSettings.compactColumnHeaderActions);
 const editRedisScanPageSize = ref(settingsStore.editorSettings.redisScanPageSize);
 const editShortcuts = ref(normalizeShortcutSettings(settingsStore.editorSettings.shortcuts));
+const editSqlFormatter = ref<SqlFormatterSettings>(
+  normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter),
+);
+const sqlFormatterConfigValid = ref(true);
+const editingShortcutId = ref<ShortcutActionId | null>(null);
 const editSidebarActivation = ref(settingsStore.editorSettings.sidebarActivation);
 const editSidebarObjectDisplay = ref(settingsStore.editorSettings.sidebarObjectDisplay);
 const sidebarObjectDisplayHelp = ref<"grouped" | "simple" | null>(null);
 const editAutoSelectActiveSidebarNode = ref(settingsStore.editorSettings.autoSelectActiveSidebarNode);
+const editDisconnectTabHandlingMode = ref<DisconnectTabHandlingMode>(
+  settingsStore.editorSettings.disconnectTabHandlingMode,
+);
+const editReuseDataTab = ref(settingsStore.editorSettings.reuseDataTab);
+const editUpdateNotificationsEnabled = ref(settingsStore.editorSettings.updateNotificationsEnabled);
 const editSidebarHiddenTablePrefixes = ref(settingsStore.editorSettings.sidebarHiddenTablePrefixes.join("\n"));
 const editSidebarHideTableComments = ref(settingsStore.editorSettings.sidebarHideTableComments);
+const editSidebarAllowHorizontalScroll = ref(settingsStore.editorSettings.sidebarAllowHorizontalScroll);
+const editExportBatchSize = ref(settingsStore.editorSettings.exportBatchSize);
 const redisScanPageSizeOptions = [200, 1000, 5000, 10000];
 const systemFonts = ref<string[]>([]);
 const systemFontsLoading = ref(false);
 const systemFontsLoaded = ref(false);
 const uiScaleOptions = [0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
+const disconnectTabHandlingModeDescriptionKey = computed(() => {
+  switch (editDisconnectTabHandlingMode.value) {
+    case "close-tabs":
+      return "disconnectTabHandlingModeCloseTabsDescription";
+    case "keep-tabs-clear-results":
+      return "disconnectTabHandlingModeKeepTabsClearResultsDescription";
+    case "keep-tabs-keep-results":
+      return "disconnectTabHandlingModeKeepTabsKeepResultsDescription";
+  }
+
+  return "disconnectTabHandlingModeCloseTabsDescription";
+});
 
 // --- Snippet state ---
 const editSnippets = ref<SqlSnippet[]>(settingsStore.editorSettings.snippets.map((s) => ({ ...s })));
@@ -224,19 +277,32 @@ watch(
       editFontSize.value = settingsStore.editorSettings.fontSize;
       editUiScale.value = settingsStore.editorSettings.uiScale;
       editTheme.value = settingsStore.editorSettings.theme;
+      editCustomThemes.value = [...settingsStore.editorSettings.customThemes];
+      editActiveCustomThemeId.value = settingsStore.editorSettings.activeCustomThemeId;
       editExecuteMode.value = settingsStore.editorSettings.executeMode;
       editWordWrap.value = settingsStore.editorSettings.wordWrap;
+      editConfirmDangerousSqlExecution.value = settingsStore.editorSettings.confirmDangerousSqlExecution;
       editAppLayout.value = settingsStore.editorSettings.appLayout;
       editShowTrayIcon.value = settingsStore.desktopSettings.show_tray_icon;
+      editIconTheme.value = settingsStore.desktopSettings.icon_theme;
+      editDebugLoggingEnabled.value = settingsStore.desktopSettings.debug_logging_enabled;
       editShowColumnCommentsInHeader.value = settingsStore.editorSettings.showColumnCommentsInHeader;
+      editShowColumnTypesInHeader.value = settingsStore.editorSettings.showColumnTypesInHeader;
       editCompactColumnHeaderActions.value = settingsStore.editorSettings.compactColumnHeaderActions;
       editRedisScanPageSize.value = settingsStore.editorSettings.redisScanPageSize;
       editShortcuts.value = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
+      editSqlFormatter.value = normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter);
+      sqlFormatterConfigValid.value = true;
       editSidebarActivation.value = settingsStore.editorSettings.sidebarActivation;
       editSidebarObjectDisplay.value = settingsStore.editorSettings.sidebarObjectDisplay;
       editAutoSelectActiveSidebarNode.value = settingsStore.editorSettings.autoSelectActiveSidebarNode;
+      editDisconnectTabHandlingMode.value = settingsStore.editorSettings.disconnectTabHandlingMode;
+      editReuseDataTab.value = settingsStore.editorSettings.reuseDataTab;
+      editUpdateNotificationsEnabled.value = settingsStore.editorSettings.updateNotificationsEnabled;
       editSidebarHiddenTablePrefixes.value = settingsStore.editorSettings.sidebarHiddenTablePrefixes.join("\n");
       editSidebarHideTableComments.value = settingsStore.editorSettings.sidebarHideTableComments;
+      editSidebarAllowHorizontalScroll.value = settingsStore.editorSettings.sidebarAllowHorizontalScroll;
+      editExportBatchSize.value = settingsStore.editorSettings.exportBatchSize;
       editSnippets.value = settingsStore.editorSettings.snippets.map((s) => ({ ...s }));
       void loadSystemFontOptions();
     }
@@ -255,6 +321,10 @@ const shortcutsChanged = computed(
   () => JSON.stringify(editShortcuts.value) !== JSON.stringify(settingsStore.editorSettings.shortcuts),
 );
 const hasBlockingShortcutConflicts = computed(() => shortcutsChanged.value && hasShortcutConflicts.value);
+const hasBlockingFormatterConfig = computed(
+  () => activeSettingsTab.value === "formatter" && !sqlFormatterConfigValid.value,
+);
+const hasApplyBlocker = computed(() => hasBlockingShortcutConflicts.value || hasBlockingFormatterConfig.value);
 
 function hasChanges(): boolean {
   return (
@@ -262,18 +332,31 @@ function hasChanges(): boolean {
     editFontSize.value !== settingsStore.editorSettings.fontSize ||
     editUiScale.value !== settingsStore.editorSettings.uiScale ||
     editTheme.value !== settingsStore.editorSettings.theme ||
+    JSON.stringify(editCustomThemes.value) !== JSON.stringify(settingsStore.editorSettings.customThemes) ||
+    editActiveCustomThemeId.value !== settingsStore.editorSettings.activeCustomThemeId ||
     editExecuteMode.value !== settingsStore.editorSettings.executeMode ||
     editWordWrap.value !== settingsStore.editorSettings.wordWrap ||
+    editConfirmDangerousSqlExecution.value !== settingsStore.editorSettings.confirmDangerousSqlExecution ||
     editAppLayout.value !== settingsStore.editorSettings.appLayout ||
     editShowTrayIcon.value !== settingsStore.desktopSettings.show_tray_icon ||
+    editIconTheme.value !== settingsStore.desktopSettings.icon_theme ||
+    editDebugLoggingEnabled.value !== settingsStore.desktopSettings.debug_logging_enabled ||
     editShowColumnCommentsInHeader.value !== settingsStore.editorSettings.showColumnCommentsInHeader ||
+    editShowColumnTypesInHeader.value !== settingsStore.editorSettings.showColumnTypesInHeader ||
     editCompactColumnHeaderActions.value !== settingsStore.editorSettings.compactColumnHeaderActions ||
     editRedisScanPageSize.value !== settingsStore.editorSettings.redisScanPageSize ||
     JSON.stringify(editShortcuts.value) !== JSON.stringify(settingsStore.editorSettings.shortcuts) ||
+    JSON.stringify(editSqlFormatter.value) !==
+      JSON.stringify(normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter)) ||
     editSidebarActivation.value !== settingsStore.editorSettings.sidebarActivation ||
     editSidebarObjectDisplay.value !== settingsStore.editorSettings.sidebarObjectDisplay ||
     editAutoSelectActiveSidebarNode.value !== settingsStore.editorSettings.autoSelectActiveSidebarNode ||
+    editDisconnectTabHandlingMode.value !== settingsStore.editorSettings.disconnectTabHandlingMode ||
+    editReuseDataTab.value !== settingsStore.editorSettings.reuseDataTab ||
+    editUpdateNotificationsEnabled.value !== settingsStore.editorSettings.updateNotificationsEnabled ||
     editSidebarHideTableComments.value !== settingsStore.editorSettings.sidebarHideTableComments ||
+    editSidebarAllowHorizontalScroll.value !== settingsStore.editorSettings.sidebarAllowHorizontalScroll ||
+    editExportBatchSize.value !== settingsStore.editorSettings.exportBatchSize ||
     JSON.stringify(normalizeSidebarHiddenTablePrefixes(editSidebarHiddenTablePrefixes.value)) !==
       JSON.stringify(settingsStore.editorSettings.sidebarHiddenTablePrefixes) ||
     JSON.stringify(editSnippets.value) !== JSON.stringify(settingsStore.editorSettings.snippets)
@@ -281,7 +364,7 @@ function hasChanges(): boolean {
 }
 
 async function persistSettings() {
-  if (hasBlockingShortcutConflicts.value) return;
+  if (hasApplyBlocker.value) return;
   const sidebarObjectDisplayChanged =
     editSidebarObjectDisplay.value !== settingsStore.editorSettings.sidebarObjectDisplay;
   settingsStore.updateEditorSettings({
@@ -289,22 +372,34 @@ async function persistSettings() {
     fontSize: editFontSize.value,
     uiScale: editUiScale.value,
     theme: editTheme.value,
+    customThemes: editCustomThemes.value,
+    activeCustomThemeId: editActiveCustomThemeId.value,
     executeMode: editExecuteMode.value,
     wordWrap: editWordWrap.value,
+    confirmDangerousSqlExecution: editConfirmDangerousSqlExecution.value,
     appLayout: editAppLayout.value,
     showColumnCommentsInHeader: editShowColumnCommentsInHeader.value,
+    showColumnTypesInHeader: editShowColumnTypesInHeader.value,
     compactColumnHeaderActions: editCompactColumnHeaderActions.value,
     redisScanPageSize: editRedisScanPageSize.value,
     shortcuts: editShortcuts.value,
+    sqlFormatter: normalizeSqlFormatterSettings(editSqlFormatter.value),
     sidebarActivation: editSidebarActivation.value,
     sidebarObjectDisplay: editSidebarObjectDisplay.value,
     autoSelectActiveSidebarNode: editAutoSelectActiveSidebarNode.value,
+    disconnectTabHandlingMode: editDisconnectTabHandlingMode.value,
+    reuseDataTab: editReuseDataTab.value,
+    updateNotificationsEnabled: editUpdateNotificationsEnabled.value,
     sidebarHideTableComments: editSidebarHideTableComments.value,
+    sidebarAllowHorizontalScroll: editSidebarAllowHorizontalScroll.value,
     sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(editSidebarHiddenTablePrefixes.value),
+    exportBatchSize: editExportBatchSize.value,
     snippets: editSnippets.value,
   });
   await settingsStore.updateDesktopSettings({
     show_tray_icon: editShowTrayIcon.value,
+    icon_theme: editIconTheme.value,
+    debug_logging_enabled: editDebugLoggingEnabled.value,
   });
   if (sidebarObjectDisplayChanged) {
     await connectionStore.refreshAllTree();
@@ -325,19 +420,32 @@ function resetDefaults() {
   editFontSize.value = DEFAULT_EDITOR_SETTINGS.fontSize;
   editUiScale.value = DEFAULT_EDITOR_SETTINGS.uiScale;
   editTheme.value = DEFAULT_EDITOR_SETTINGS.theme;
+  editCustomThemes.value = [...DEFAULT_EDITOR_SETTINGS.customThemes];
+  editActiveCustomThemeId.value = DEFAULT_EDITOR_SETTINGS.activeCustomThemeId;
   editExecuteMode.value = DEFAULT_EDITOR_SETTINGS.executeMode;
   editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
+  editConfirmDangerousSqlExecution.value = DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution;
   editAppLayout.value = DEFAULT_EDITOR_SETTINGS.appLayout;
   editShowTrayIcon.value = DEFAULT_DESKTOP_SETTINGS.show_tray_icon;
+  editIconTheme.value = DEFAULT_DESKTOP_SETTINGS.icon_theme;
+  editDebugLoggingEnabled.value = DEFAULT_DESKTOP_SETTINGS.debug_logging_enabled;
   editShowColumnCommentsInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader;
+  editShowColumnTypesInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader;
   editCompactColumnHeaderActions.value = DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions;
   editRedisScanPageSize.value = DEFAULT_EDITOR_SETTINGS.redisScanPageSize;
   editShortcuts.value = normalizeShortcutSettings(DEFAULT_EDITOR_SETTINGS.shortcuts);
+  editSqlFormatter.value = normalizeSqlFormatterSettings(DEFAULT_EDITOR_SETTINGS.sqlFormatter);
+  sqlFormatterConfigValid.value = true;
   editSidebarActivation.value = DEFAULT_EDITOR_SETTINGS.sidebarActivation;
   editSidebarObjectDisplay.value = DEFAULT_EDITOR_SETTINGS.sidebarObjectDisplay;
   editAutoSelectActiveSidebarNode.value = DEFAULT_EDITOR_SETTINGS.autoSelectActiveSidebarNode;
+  editDisconnectTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
+  editReuseDataTab.value = DEFAULT_EDITOR_SETTINGS.reuseDataTab;
+  editUpdateNotificationsEnabled.value = DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled;
   editSidebarHideTableComments.value = DEFAULT_EDITOR_SETTINGS.sidebarHideTableComments;
+  editSidebarAllowHorizontalScroll.value = DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll;
   editSidebarHiddenTablePrefixes.value = DEFAULT_EDITOR_SETTINGS.sidebarHiddenTablePrefixes.join("\n");
+  editExportBatchSize.value = DEFAULT_EDITOR_SETTINGS.exportBatchSize;
   editSnippets.value = DEFAULT_SQL_SNIPPETS.map((s) => ({ ...s }));
 }
 
@@ -349,8 +457,53 @@ function onFontFamilyChange(v: any) {
   if (typeof v === "string") editFontFamily.value = v;
 }
 
+const themeSelectValue = computed(() => {
+  if (editTheme.value === "custom") {
+    return `custom:${editActiveCustomThemeId.value}`;
+  }
+  return editTheme.value;
+});
+
+const themeSelectOptions = computed(() => [
+  ...EDITOR_THEMES.filter((theme) => theme.value !== "custom").map((theme) => ({
+    value: theme.value,
+    label: theme.value === "app" ? t("settings.followAppTheme") : theme.label,
+    dark: theme.dark,
+    isCustom: false,
+  })),
+  ...editCustomThemes.value.map((theme) => ({
+    value: `custom:${theme.id}`,
+    label: theme.name,
+    dark: true,
+    isCustom: true,
+  })),
+]);
+
 function onThemeChange(v: any) {
-  if (typeof v === "string") editTheme.value = v as typeof DEFAULT_EDITOR_SETTINGS.theme;
+  if (typeof v !== "string") return;
+  if (v.startsWith("custom:")) {
+    editTheme.value = "custom";
+    editActiveCustomThemeId.value = v.slice(7);
+  } else {
+    editTheme.value = v as typeof DEFAULT_EDITOR_SETTINGS.theme;
+  }
+}
+
+function handleThemeSave(updatedThemes: CustomTheme[], activeId: string) {
+  editCustomThemes.value = updatedThemes;
+  editActiveCustomThemeId.value = activeId;
+  editTheme.value = "custom";
+  showThemeCustomizer.value = false;
+}
+
+function onDisconnectTabHandlingModeChange(v: any) {
+  if (v === "close-tabs" || v === "keep-tabs-clear-results" || v === "keep-tabs-keep-results") {
+    editDisconnectTabHandlingMode.value = v;
+  }
+}
+
+function onLocaleChange(v: any) {
+  if (typeof v === "string") void setLocale(v as Locale);
 }
 
 function onRedisScanPageSizeChange(v: any) {
@@ -360,6 +513,10 @@ function onRedisScanPageSizeChange(v: any) {
 
 function setSidebarObjectDisplay(value: "grouped" | "simple") {
   editSidebarObjectDisplay.value = value;
+}
+
+function setIconTheme(value: DesktopIconTheme) {
+  editIconTheme.value = value;
 }
 
 function onShortcutChange(actionId: ShortcutActionId, value: any) {
@@ -372,9 +529,56 @@ function onShortcutChange(actionId: ShortcutActionId, value: any) {
 function onShortcutKeydown(actionId: ShortcutActionId, event: KeyboardEvent) {
   event.preventDefault();
   event.stopPropagation();
+  if (editingShortcutId.value !== actionId) return;
+  if (event.key === "Escape") {
+    editingShortcutId.value = null;
+    return;
+  }
   const shortcut = eventToShortcut(event);
   if (!shortcut) return;
   onShortcutChange(actionId, shortcut);
+  editingShortcutId.value = null;
+}
+
+function formatShortcutPill(shortcut: string): string {
+  const isMac = globalThis.navigator?.platform?.toLowerCase().includes("mac") ?? false;
+  return shortcut
+    .split("+")
+    .filter(Boolean)
+    .map((part) => {
+      if (part === "Mod") return isMac ? "⌘" : "Ctrl";
+      if (part === "Meta") return isMac ? "⌘" : "Meta";
+      if (part === "Shift") return isMac ? "⇧" : "Shift";
+      if (part === "Alt") return isMac ? "⌥" : "Alt";
+      if (part === "Control" || part === "Ctrl") return isMac ? "⌃" : "Ctrl";
+      if (part === "Enter") return "↵";
+      if (part === "Backspace") return "⌫";
+      if (part === "Delete") return isMac ? "⌦" : "Del";
+      if (part === "Escape") return "Esc";
+      if (part === "ArrowUp") return "↑";
+      if (part === "ArrowDown") return "↓";
+      if (part === "ArrowLeft") return "←";
+      if (part === "ArrowRight") return "→";
+      if (part === " ") return "Space";
+      return part.length === 1 ? part.toUpperCase() : part;
+    })
+    .join(isMac ? " " : " + ");
+}
+
+const shortcutPressShortcutLabel = computed(() => t("settings.shortcutPressShortcut"));
+const shortcutPressShortcutInputWidth = computed(() => `${shortcutPressShortcutLabel.value.length + 2}em`);
+
+function focusShortcutInput(actionId: ShortcutActionId) {
+  editingShortcutId.value = actionId;
+  const input = document.querySelector<HTMLInputElement>(`[data-shortcut-input="${actionId}"]`);
+  requestAnimationFrame(() => {
+    input?.focus();
+    input?.select();
+  });
+}
+
+function cancelShortcutEdit() {
+  editingShortcutId.value = null;
 }
 
 function resetShortcut(actionId: ShortcutActionId) {
@@ -396,31 +600,39 @@ const isWeb = !isTauriRuntime();
 const displayedAppVersion = computed(() => (props.appVersion ? `v${props.appVersion}` : ""));
 type SettingsCategory =
   | "editor"
+  | "formatter"
   | "appearance"
   | "navigation"
+  | "data"
   | "redis"
   | "shortcuts"
   | "snippets"
   | "sync"
   | "ai"
+  | "mcp"
   | "security"
   | "about";
 const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[]>(() => [
   { value: "editor", label: t("settings.editorTab") },
+  { value: "formatter", label: t("settings.sqlFormatterTab") },
   { value: "appearance", label: t("settings.appearanceTab") },
   { value: "navigation", label: t("settings.navigationTab") },
+  { value: "data", label: t("settings.dataTab") },
   { value: "redis", label: t("settings.redisTab") },
   { value: "shortcuts", label: t("settings.shortcutsTab") },
   { value: "snippets", label: t("settings.snippetsTab") },
   ...(isWeb ? [] : [{ value: "sync" as const, label: t("settings.syncTab") }]),
   { value: "ai", label: t("settings.aiTab") },
+  ...(isWeb ? [] : [{ value: "mcp" as const, label: t("settings.mcpTab") }]),
   ...(isWeb ? [{ value: "security" as const, label: t("settings.securityTab") }] : []),
   { value: "about", label: t("settings.aboutTab") },
 ]);
 const settingsTabsWithApplyFooter = new Set<SettingsCategory>([
   "editor",
+  "formatter",
   "appearance",
   "navigation",
+  "data",
   "redis",
   "shortcuts",
   "snippets",
@@ -445,6 +657,126 @@ function openExternalUrl(url: string) {
   } else {
     window.open(url, "_blank", "noopener,noreferrer");
   }
+}
+
+async function copyDebugLogs() {
+  await copyToClipboard(await getDebugLogBundleText());
+  debugLogCopied.value = true;
+  window.setTimeout(() => {
+    debugLogCopied.value = false;
+  }, 1500);
+}
+
+function clearDebugLogs() {
+  clearStoredDebugLogs();
+  debugLogCopied.value = false;
+  debugLogDownloaded.value = false;
+}
+
+async function exportDebugLogs() {
+  const saved = await downloadDebugLogs();
+  if (!saved) return;
+  debugLogDownloaded.value = true;
+  window.setTimeout(() => {
+    debugLogDownloaded.value = false;
+  }, 1500);
+}
+
+// ---------- MCP Server ----------
+const mcpStatus = ref<McpServerStatus | null>(null);
+const mcpStatusLoading = ref(false);
+const mcpStatusError = ref("");
+const mcpCopied = ref<"" | "install" | "claude-config" | "codex-config">("");
+const mcpConfigTab = ref<"claude" | "codex">("claude");
+const mcpReadonlyMode = ref(false);
+const mcpAllowDangerous = ref(false);
+
+const mcpEnvEntries = computed(() => {
+  const entries: Array<[string, string]> = [];
+  if (mcpReadonlyMode.value) {
+    entries.push(["DBX_MCP_ALLOW_WRITES", "0"]);
+  }
+  if (!mcpReadonlyMode.value && mcpAllowDangerous.value) {
+    entries.push(["DBX_MCP_ALLOW_DANGEROUS_SQL", "1"]);
+  }
+  return entries;
+});
+
+const mcpClaudeRecommendedConfig = computed(() => {
+  const config: Record<string, unknown> = {
+    mcpServers: {
+      dbx: {
+        command: "dbx-mcp-server",
+      } as Record<string, unknown>,
+    },
+  };
+  if (mcpEnvEntries.value.length > 0) {
+    const env = Object.fromEntries(mcpEnvEntries.value);
+    ((config.mcpServers as Record<string, any>).dbx as Record<string, unknown>).env = env;
+  }
+  return JSON.stringify(config, null, 2);
+});
+
+const mcpCodexRecommendedConfig = computed(() => {
+  const lines = ["[mcp_servers.dbx]", 'command = "dbx-mcp-server"'];
+  if (mcpEnvEntries.value.length > 0) {
+    lines.push("");
+    lines.push("[mcp_servers.dbx.env]");
+    for (const [key, value] of mcpEnvEntries.value) {
+      lines.push(`${key} = "${value}"`);
+    }
+  }
+  return lines.join("\n");
+});
+
+const mcpStatusTone = computed<"ok" | "warning" | "muted">(() => {
+  if (!mcpStatus.value) return "muted";
+  if (!mcpStatus.value.installed || mcpStatus.value.update_available || mcpStatus.value.error) return "warning";
+  return "ok";
+});
+
+const mcpStatusLabel = computed(() => {
+  if (mcpStatusLoading.value) return t("settings.mcpChecking");
+  if (mcpStatusError.value) return t("settings.mcpStatusError");
+  if (!mcpStatus.value) return t("settings.mcpStatusUnknown");
+  if (!mcpStatus.value.installed) return t("settings.mcpNotInstalled");
+  if (mcpStatus.value.update_available) return t("settings.mcpUpdateAvailable");
+  return t("settings.mcpReady");
+});
+
+const mcpCommand = computed(() => {
+  if (!mcpStatus.value) return "npm install -g @dbx-app/mcp-server@latest --registry=https://registry.npmjs.org";
+  return mcpStatus.value.installed ? mcpStatus.value.update_command : mcpStatus.value.install_command;
+});
+
+watch(mcpReadonlyMode, (value) => {
+  if (value) mcpAllowDangerous.value = false;
+});
+
+async function refreshMcpStatus() {
+  if (mcpStatusLoading.value) return;
+  mcpStatusLoading.value = true;
+  mcpStatusError.value = "";
+  try {
+    mcpStatus.value = await checkMcpServerStatus();
+  } catch (e: any) {
+    mcpStatusError.value = e?.message || String(e);
+  } finally {
+    mcpStatusLoading.value = false;
+  }
+}
+
+async function copyMcpText(kind: "install" | "claude-config" | "codex-config", value: string) {
+  mcpCopied.value = kind;
+  try {
+    await copyToClipboard(value);
+  } catch {
+    mcpCopied.value = "";
+    return;
+  }
+  window.setTimeout(() => {
+    if (mcpCopied.value === kind) mcpCopied.value = "";
+  }, 1500);
 }
 
 // ---------- WebDAV Sync ----------
@@ -591,9 +923,12 @@ watch(
       await settingsStore.initAiConfig();
       await settingsStore.initDesktopSettings();
       editShowTrayIcon.value = settingsStore.desktopSettings.show_tray_icon;
+      editIconTheme.value = settingsStore.desktopSettings.icon_theme;
+      editDebugLoggingEnabled.value = settingsStore.desktopSettings.debug_logging_enabled;
       webdavPassword.value = "";
       await refreshWebDavPasswordStatus();
       syncAiEditState();
+      if (!isWeb && activeSettingsTab.value === "mcp") void refreshMcpStatus();
     }
   },
   { immediate: true },
@@ -604,6 +939,10 @@ watch([webdavEndpoint, webdavUsername], () => {
 });
 watch(webdavRememberPassword, (val) => {
   localStorage.setItem("dbx-webdav-remember-password", String(val));
+});
+
+watch(activeSettingsTab, (tab) => {
+  if (tab === "mcp" && !mcpStatus.value && !mcpStatusLoading.value) void refreshMcpStatus();
 });
 
 onMounted(() => {
@@ -858,16 +1197,24 @@ async function aiTestConn() {
 const previewRef = ref<HTMLDivElement>();
 const previewView = shallowRef<EditorViewType | null>(null);
 
+function getPreviewCustomThemeColors(): CustomThemeColors | undefined {
+  if (editTheme.value !== "custom") return undefined;
+  const activeTheme = editCustomThemes.value.find((t) => t.id === editActiveCustomThemeId.value);
+  return activeTheme?.colors;
+}
+
 const previewSettings = computed<{
   fontFamily: string;
   fontSize: number;
   theme: EditorTheme;
   appAppearance: AppThemeAppearance;
+  customColors?: CustomThemeColors;
 }>(() => ({
   fontFamily: editFontFamily.value,
   fontSize: editFontSize.value,
   theme: editTheme.value,
   appAppearance: isDark.value ? "dark" : "light",
+  customColors: getPreviewCustomThemeColors(),
 }));
 
 const previewSql = `SELECT u.id, u.name
@@ -879,11 +1226,11 @@ let themeComp: import("@codemirror/state").Compartment | null = null;
 let editorViewModule: typeof import("@codemirror/view") | null = null;
 
 watch(
-  previewSettings,
-  async (ss) => {
+  [previewSettings, editCustomThemes, editActiveCustomThemeId],
+  async ([ss]) => {
     if (!previewView.value || !fontThemeComp || !themeComp || !editorViewModule) return;
 
-    const themeExt = await loadEditorTheme(ss.theme, ss.appAppearance);
+    const themeExt = await loadEditorTheme(ss.theme, ss.appAppearance, ss.customColors);
     previewView.value.dispatch({
       effects: [
         themeComp.reconfigure(themeExt),
@@ -924,7 +1271,7 @@ watch(previewRef, async (el) => {
   themeComp = new Compartment();
 
   const ss = previewSettings.value;
-  const themeExt = await loadEditorTheme(ss.theme, ss.appAppearance);
+  const themeExt = await loadEditorTheme(ss.theme, ss.appAppearance, ss.customColors);
 
   const state = EditorState.create({
     doc: previewSql,
@@ -964,9 +1311,9 @@ watch(
         </DialogTitle>
       </DialogHeader>
 
-      <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden sm:min-h-[520px] sm:flex-row">
+      <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden sm:flex-row">
         <nav
-          class="settingsCategoryNav flex shrink-0 gap-1 overflow-x-auto border-b pb-3 sm:w-40 sm:flex-col sm:overflow-visible sm:border-b-0 sm:border-r sm:pb-0 sm:pr-3"
+          class="settingsCategoryNav flex min-h-0 shrink-0 gap-1 overflow-x-auto border-b pb-3 sm:w-40 sm:flex-col sm:overflow-x-hidden sm:overflow-y-auto sm:border-b-0 sm:border-r sm:pb-0 sm:pr-3"
         >
           <button
             v-for="category in settingsCategoryNav"
@@ -982,9 +1329,9 @@ watch(
         <div class="min-w-0 flex-1 overflow-hidden px-1 flex flex-col">
           <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-1 pr-2">
             <section v-if="activeSettingsTab === 'editor'" class="flex flex-col gap-5 py-2">
-              <div class="grid gap-4 md:grid-cols-[minmax(0,1fr)_220px]">
+              <div class="grid gap-4 md:grid-cols-[1fr_auto]">
                 <!-- Font Family -->
-                <div class="space-y-2">
+                <div class="space-y-2 min-w-0">
                   <Label>{{ t("settings.fontFamily") }}</Label>
                   <SearchableSelect
                     :model-value="editFontFamily"
@@ -1018,29 +1365,40 @@ watch(
                   </SearchableSelect>
                 </div>
 
-                <!-- Theme -->
-                <div class="space-y-2">
-                  <Label>{{ t("settings.theme") }}</Label>
-                  <Select :model-value="editTheme" @update:model-value="onThemeChange">
-                    <SelectTrigger>
-                      <SelectValue :placeholder="t('settings.selectTheme')" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem v-for="theme in EDITOR_THEMES" :key="theme.value" :value="theme.value">
-                        <div class="flex items-center gap-2">
-                          <span
-                            class="h-3 w-3 rounded-full border"
-                            :class="
-                              theme.dark
-                                ? 'bg-foreground border-foreground/20'
-                                : 'bg-muted-foreground/30 border-muted-foreground/40'
-                            "
-                          />
-                          {{ theme.value === "app" ? t("settings.followAppTheme") : theme.label }}
-                        </div>
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
+                <!-- Theme + Custom Theme Button -->
+                <div class="flex gap-2 items-end">
+                  <div class="space-y-2">
+                    <Label>{{ t("settings.theme") }}</Label>
+                    <Select :model-value="themeSelectValue" @update:model-value="onThemeChange">
+                      <SelectTrigger class="min-w-[80px] max-w-[200px]">
+                        <SelectValue :placeholder="t('settings.selectTheme')" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem v-for="theme in themeSelectOptions" :key="theme.value" :value="theme.value">
+                          <div class="flex items-center gap-2">
+                            <span
+                              class="h-3 w-3 rounded-full border"
+                              :class="
+                                theme.dark
+                                  ? 'bg-foreground border-foreground/20'
+                                  : 'bg-muted-foreground/30 border-muted-foreground/40'
+                              "
+                            />
+                            {{ theme.label }}
+                          </div>
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <Button
+                    v-if="editTheme === 'custom'"
+                    variant="outline"
+                    class="h-9 w-auto px-4"
+                    @click="showThemeCustomizer = true"
+                  >
+                    <Settings class="mr-2 h-4 w-4" />
+                    {{ t("settings.customThemeConfigure") }}
+                  </Button>
                 </div>
               </div>
 
@@ -1091,6 +1449,16 @@ watch(
                 </div>
               </div>
 
+              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="space-y-1">
+                  <Label for="editor-confirm-dangerous-sql">{{ t("settings.confirmDangerousSqlExecution") }}</Label>
+                  <p class="text-xs text-muted-foreground">
+                    {{ t("settings.confirmDangerousSqlExecutionDescription") }}
+                  </p>
+                </div>
+                <Switch id="editor-confirm-dangerous-sql" v-model="editConfirmDangerousSqlExecution" class="mt-0.5" />
+              </div>
+
               <Separator />
 
               <!-- Live Preview -->
@@ -1109,7 +1477,37 @@ watch(
               </div>
             </section>
 
+            <section v-else-if="activeSettingsTab === 'formatter'" class="flex flex-col gap-5 py-2">
+              <SqlFormatterSettingsPanel
+                v-model="editSqlFormatter"
+                @validity-change="(value: boolean) => (sqlFormatterConfigValid = value)"
+              />
+            </section>
+
             <section v-else-if="activeSettingsTab === 'appearance'" class="flex flex-col gap-5 py-2">
+              <div class="space-y-2">
+                <Label>{{ t("settings.languageTitle") }}</Label>
+                <Select :model-value="currentLocale()" @update:model-value="onLocaleChange">
+                  <SelectTrigger class="min-w-36">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem v-for="locale in LOCALE_OPTIONS" :key="locale.value" :value="locale.value">
+                      <div class="flex items-center gap-2">
+                        <span
+                          class="inline-flex h-5 w-6 shrink-0 items-center justify-center text-sm font-medium leading-none"
+                        >
+                          {{ locale.flag }}
+                        </span>
+                        <span>{{ locale.label }}</span>
+                      </div>
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <Separator />
+
               <div class="space-y-2">
                 <Label>{{ t("settings.uiScale") }}</Label>
                 <Select
@@ -1164,6 +1562,43 @@ watch(
                   </Button>
                 </div>
               </div>
+
+              <div v-if="!isWeb" class="space-y-2">
+                <Label>{{ t("settings.iconTheme") }}</Label>
+                <div class="grid grid-cols-2 gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    class="h-auto justify-start border p-3"
+                    :class="editIconTheme === 'default' ? 'border-blue-300 ring-2 ring-blue-300/50' : ''"
+                    @click="setIconTheme('default')"
+                  >
+                    <div class="flex items-center gap-3 text-left">
+                      <img src="/logo.png" alt="DBX" class="h-8 w-8 rounded-md" />
+                      <div>
+                        <div class="text-sm font-medium">{{ t("settings.iconThemeDefault") }}</div>
+                        <div class="text-xs text-muted-foreground">{{ t("settings.iconThemeDefaultDescription") }}</div>
+                      </div>
+                    </div>
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    class="h-auto justify-start border p-3"
+                    :class="editIconTheme === 'black' ? 'border-blue-300 ring-2 ring-blue-300/50' : ''"
+                    @click="setIconTheme('black')"
+                  >
+                    <div class="flex items-center gap-3 text-left">
+                      <img src="/logo-black.png" alt="DBX" class="h-8 w-8 dark:invert" />
+                      <div>
+                        <div class="text-sm font-medium">{{ t("settings.iconThemeBlack") }}</div>
+                        <div class="text-xs text-muted-foreground">{{ t("settings.iconThemeBlackDescription") }}</div>
+                      </div>
+                    </div>
+                  </Button>
+                </div>
+              </div>
+
               <div
                 v-if="!isWeb"
                 class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2"
@@ -1173,6 +1608,39 @@ watch(
                   <p class="text-xs text-muted-foreground">{{ t("settings.showTrayIconDescription") }}</p>
                 </div>
                 <Switch id="show-tray-icon" v-model="editShowTrayIcon" />
+              </div>
+
+              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="space-y-1">
+                  <Label for="update-notifications-enabled">{{ t("settings.updateNotificationsEnabled") }}</Label>
+                  <p class="text-xs text-muted-foreground">
+                    {{ t("settings.updateNotificationsEnabledDescription") }}
+                  </p>
+                </div>
+                <Switch id="update-notifications-enabled" v-model="editUpdateNotificationsEnabled" />
+              </div>
+
+              <div v-if="!isWeb" class="flex flex-col gap-3 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="flex items-center justify-between gap-4">
+                  <div class="space-y-1">
+                    <Label for="debug-logging-enabled">{{ t("settings.debugLoggingEnabled") }}</Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.debugLoggingEnabledDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="debug-logging-enabled" v-model="editDebugLoggingEnabled" />
+                </div>
+                <div class="flex justify-end gap-2">
+                  <Button type="button" variant="outline" size="sm" @click="clearDebugLogs">
+                    {{ t("settings.debugLogsClear") }}
+                  </Button>
+                  <Button type="button" variant="outline" size="sm" @click="copyDebugLogs">
+                    {{ debugLogCopied ? t("settings.debugLogsCopied") : t("settings.debugLogsCopy") }}
+                  </Button>
+                  <Button type="button" variant="outline" size="sm" @click="exportDebugLogs">
+                    {{ debugLogDownloaded ? t("settings.debugLogsDownloaded") : t("settings.debugLogsDownload") }}
+                  </Button>
+                </div>
               </div>
 
               <Separator />
@@ -1189,6 +1657,17 @@ watch(
                     </p>
                   </div>
                   <Switch id="show-column-comments-in-header" v-model="editShowColumnCommentsInHeader" />
+                </div>
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="show-column-types-in-header">
+                      {{ t("settings.showColumnTypesInHeader") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.showColumnTypesInHeaderDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="show-column-types-in-header" v-model="editShowColumnTypesInHeader" />
                 </div>
                 <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
@@ -1237,6 +1716,20 @@ watch(
                     </div>
                   </Button>
                 </div>
+              </div>
+              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="flex items-center gap-2">
+                  <Label for="reuse-data-tab">{{ t("settings.reuseDataTab") }}</Label>
+                  <Tooltip>
+                    <TooltipTrigger as-child>
+                      <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
+                    </TooltipTrigger>
+                    <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
+                      {{ t("settings.reuseDataTabDescription") }}
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+                <Switch id="reuse-data-tab" v-model="editReuseDataTab" />
               </div>
               <div class="space-y-2">
                 <Label>{{ t("settings.sidebarObjectDisplay") }}</Label>
@@ -1325,6 +1818,39 @@ watch(
                 </div>
                 <Switch id="auto-select-active-sidebar-node" v-model="editAutoSelectActiveSidebarNode" />
               </div>
+              <div class="space-y-2 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="flex items-center gap-2">
+                  <Label for="disconnect-tab-handling-mode">{{ t("settings.disconnectTabHandlingMode") }}</Label>
+                  <Tooltip>
+                    <TooltipTrigger as-child>
+                      <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
+                    </TooltipTrigger>
+                    <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
+                      {{ t("settings.disconnectTabHandlingModeDescription") }}
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+                <Select
+                  :model-value="editDisconnectTabHandlingMode"
+                  @update:model-value="onDisconnectTabHandlingModeChange"
+                >
+                  <SelectTrigger id="disconnect-tab-handling-mode" class="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="close-tabs">{{ t("settings.disconnectTabHandlingModeCloseTabs") }}</SelectItem>
+                    <SelectItem value="keep-tabs-clear-results">
+                      {{ t("settings.disconnectTabHandlingModeKeepTabsClearResults") }}
+                    </SelectItem>
+                    <SelectItem value="keep-tabs-keep-results">
+                      {{ t("settings.disconnectTabHandlingModeKeepTabsKeepResults") }}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p class="text-xs text-muted-foreground">
+                  {{ t(`settings.${disconnectTabHandlingModeDescriptionKey}`) }}
+                </p>
+              </div>
               <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="sidebar-hide-table-comments">{{ t("settings.sidebarHideTableComments") }}</Label>
@@ -1339,6 +1865,22 @@ watch(
                 </div>
                 <Switch id="sidebar-hide-table-comments" v-model="editSidebarHideTableComments" />
               </div>
+              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="flex items-center gap-2">
+                  <Label for="sidebar-allow-horizontal-scroll">
+                    {{ t("settings.sidebarAllowHorizontalScroll") }}
+                  </Label>
+                  <Tooltip>
+                    <TooltipTrigger as-child>
+                      <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
+                    </TooltipTrigger>
+                    <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
+                      {{ t("settings.sidebarAllowHorizontalScrollDescription") }}
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+                <Switch id="sidebar-allow-horizontal-scroll" v-model="editSidebarAllowHorizontalScroll" />
+              </div>
               <div class="space-y-2">
                 <Label for="sidebar-hidden-table-prefixes">{{ t("settings.sidebarHiddenTablePrefixes") }}</Label>
                 <textarea
@@ -1350,6 +1892,35 @@ watch(
                 <p class="text-xs text-muted-foreground">
                   {{ t("settings.sidebarHiddenTablePrefixesDescription") }}
                 </p>
+              </div>
+            </section>
+
+            <!-- Data Tab -->
+            <section v-else-if="activeSettingsTab === 'data'" class="flex flex-col gap-5 py-2">
+              <div class="space-y-3">
+                <div class="text-sm font-medium text-muted-foreground">{{ t("settings.exportSection") }}</div>
+                <div class="space-y-2">
+                  <Label>{{ t("settings.exportBatchSize") }}</Label>
+                  <div class="flex items-center gap-3">
+                    <Input
+                      type="number"
+                      list="export-batch-sizes"
+                      min="100"
+                      max="100000"
+                      step="100"
+                      v-model.number="editExportBatchSize"
+                      class="h-9 w-28 [&::-webkit-inner-spin-button]:appearance-none"
+                    />
+                    <datalist id="export-batch-sizes">
+                      <option value="500" />
+                      <option value="1000" />
+                      <option value="2000" />
+                      <option value="5000" />
+                      <option value="10000" />
+                    </datalist>
+                    <span class="text-xs text-muted-foreground">{{ t("settings.exportBatchSizeDescription") }}</span>
+                  </div>
+                </div>
               </div>
             </section>
 
@@ -1371,40 +1942,80 @@ watch(
             </section>
 
             <section v-else-if="activeSettingsTab === 'shortcuts'" class="flex flex-col gap-2 py-2">
-              <div class="overflow-hidden rounded-md border bg-background">
+              <div class="overflow-hidden rounded-md border border-border/70 bg-background">
                 <div
                   v-for="definition in SHORTCUT_DEFINITIONS"
                   :key="definition.id"
-                  class="-mt-px grid gap-2 border-t border-border px-3 py-2 sm:first:mt-0 sm:first:border-t-0 sm:grid-cols-[minmax(0,1fr)_208px] sm:items-center"
+                  class="group -mt-px grid gap-2 border-t border-border/70 px-3 py-2 transition-colors first:mt-0 first:border-t-0 hover:bg-muted/40 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
                 >
                   <div class="min-w-0">
                     <div class="flex min-w-0 items-center gap-2">
                       <Label class="min-w-0 truncate leading-none">{{ t(definition.labelKey) }}</Label>
-                      <Badge variant="outline" class="h-5 shrink-0 rounded-md px-1.5 text-[11px] text-muted-foreground">
+                      <Badge
+                        variant="outline"
+                        class="h-5 shrink-0 rounded-md border-border/60 px-1.5 text-[11px] font-normal text-muted-foreground"
+                      >
                         {{
                           t(`settings.shortcutScope${definition.scope[0].toUpperCase()}${definition.scope.slice(1)}`)
                         }}
                       </Badge>
                     </div>
                   </div>
-                  <div class="space-y-1">
-                    <div class="flex gap-2">
-                      <Input
-                        :model-value="formatShortcut(editShortcuts[definition.id])"
+                  <div class="min-w-0 space-y-1">
+                    <div class="flex items-center justify-end gap-1.5">
+                      <input
+                        :data-shortcut-input="definition.id"
+                        :value="
+                          editingShortcutId === definition.id ? '' : formatShortcutPill(editShortcuts[definition.id])
+                        "
+                        :style="{
+                          width:
+                            editingShortcutId === definition.id
+                              ? shortcutPressShortcutInputWidth
+                              : `${Math.max(4, formatShortcutPill(editShortcuts[definition.id]).length + 3)}ch`,
+                        }"
                         readonly
                         :aria-invalid="shortcutConflicts.includes(definition.id)"
                         :placeholder="t('settings.shortcutPressShortcut')"
-                        class="h-9 font-mono"
+                        class="h-7 w-auto min-w-12 max-w-32 shrink-0 cursor-default rounded-full border border-transparent bg-muted px-2.5 text-center font-mono text-[13px] font-semibold text-foreground/75 shadow-inner outline-none selection:bg-transparent placeholder:text-muted-foreground aria-invalid:border-destructive/70 aria-invalid:text-destructive aria-invalid:ring-destructive/20"
+                        :class="
+                          editingShortcutId === definition.id
+                            ? 'max-w-44 cursor-text border-border/80 bg-background text-left text-foreground shadow-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/35'
+                            : ''
+                        "
                         @keydown="(event: KeyboardEvent) => onShortcutKeydown(definition.id, event)"
                       />
                       <Button
+                        v-if="editingShortcutId !== definition.id"
                         type="button"
-                        variant="outline"
+                        variant="ghost"
+                        size="icon"
+                        class="h-7 w-7 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+                        :aria-label="t('settings.shortcutPressShortcut')"
+                        @click="focusShortcutInput(definition.id)"
+                      >
+                        <Pencil class="h-4 w-4" />
+                      </Button>
+                      <Button
+                        v-else
+                        type="button"
+                        variant="ghost"
                         size="sm"
-                        class="h-9 shrink-0 px-3"
+                        class="h-7 shrink-0 px-2 text-sm font-medium text-muted-foreground hover:text-foreground"
+                        @click="cancelShortcutEdit"
+                      >
+                        {{ t("settings.cancel") }}
+                      </Button>
+                      <Button
+                        v-if="editingShortcutId !== definition.id"
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        class="h-7 w-7 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+                        :aria-label="t('settings.reset')"
                         @click="resetShortcut(definition.id)"
                       >
-                        {{ t("settings.reset") }}
+                        <RotateCcw class="h-4 w-4" />
                       </Button>
                     </div>
                     <p v-if="shortcutConflicts.includes(definition.id)" class="text-xs text-destructive">
@@ -1504,7 +2115,7 @@ watch(
                       id="webdav-password"
                       v-model="webdavPassword"
                       type="password"
-                      :placeholder="webdavHasSavedPassword ? '••••••••' : '输入密码'"
+                      :placeholder="webdavHasSavedPassword ? '••••••••' : t('settings.syncPasswordPlaceholder')"
                       :disabled="webdavHasSavedPassword"
                       autocomplete="current-password"
                     />
@@ -1513,7 +2124,7 @@ watch(
                       variant="ghost"
                       size="icon-xs"
                       class="absolute right-1 top-1/2 -translate-y-1/2"
-                      title="清除已保存的密码"
+                      :title="t('settings.syncClearSavedPassword')"
                       @click="
                         webdavRememberPassword = false;
                         forgetWebdavSavedPassword(currentWebDavAccountConfig());
@@ -1574,8 +2185,6 @@ watch(
 
             <!-- AI Settings Tab -->
             <section v-else-if="activeSettingsTab === 'ai'" class="flex flex-col gap-5 py-2">
-              <p class="text-xs text-muted-foreground">{{ t("ai.settingsHint") }}</p>
-
               <div class="space-y-3">
                 <div class="grid grid-cols-3 items-center gap-3">
                   <Label class="text-right text-xs">{{ t("ai.provider") }}</Label>
@@ -1750,6 +2359,185 @@ watch(
               </div>
             </section>
 
+            <section v-else-if="activeSettingsTab === 'mcp' && !isWeb" class="flex flex-col gap-5 py-2">
+              <div class="rounded-md border bg-muted/20 p-4">
+                <div class="flex items-start justify-between gap-4">
+                  <div class="min-w-0 space-y-2">
+                    <div class="flex items-center gap-2">
+                      <PackageSearch class="h-4 w-4 text-muted-foreground" />
+                      <Label class="text-base">{{ t("settings.mcpTitle") }}</Label>
+                      <Tooltip>
+                        <TooltipTrigger as-child>
+                          <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
+                        </TooltipTrigger>
+                        <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
+                          {{ t("settings.mcpDescription") }}
+                        </TooltipContent>
+                      </Tooltip>
+                    </div>
+                  </div>
+                  <Badge
+                    variant="outline"
+                    class="shrink-0 rounded-md"
+                    :class="
+                      mcpStatusTone === 'ok'
+                        ? 'border-green-500/40 text-green-600 dark:text-green-400'
+                        : mcpStatusTone === 'warning'
+                          ? 'border-amber-500/40 text-amber-600 dark:text-amber-400'
+                          : 'text-muted-foreground'
+                    "
+                  >
+                    <Loader2 v-if="mcpStatusLoading" class="mr-1 h-3 w-3 animate-spin" />
+                    <CheckCircle2 v-else-if="mcpStatusTone === 'ok'" class="mr-1 h-3 w-3" />
+                    <AlertTriangle v-else-if="mcpStatusTone === 'warning'" class="mr-1 h-3 w-3" />
+                    {{ mcpStatusLabel }}
+                  </Badge>
+                </div>
+              </div>
+
+              <div class="grid gap-3 sm:grid-cols-2">
+                <div class="rounded-md border p-3">
+                  <div class="text-xs font-medium uppercase text-muted-foreground">{{ t("settings.mcpCurrent") }}</div>
+                  <div class="mt-2 font-mono text-sm">
+                    {{ mcpStatus?.current_version ? `v${mcpStatus.current_version}` : t("settings.mcpVersionMissing") }}
+                  </div>
+                </div>
+                <div class="rounded-md border p-3">
+                  <div class="text-xs font-medium uppercase text-muted-foreground">{{ t("settings.mcpLatest") }}</div>
+                  <div class="mt-2 font-mono text-sm">
+                    {{ mcpStatus?.latest_version ? `v${mcpStatus.latest_version}` : t("settings.mcpVersionUnknown") }}
+                  </div>
+                </div>
+                <div class="rounded-md border p-3">
+                  <div class="text-xs font-medium uppercase text-muted-foreground">Node.js</div>
+                  <div class="mt-2 font-mono text-sm">
+                    {{ mcpStatus?.node_version || t("settings.mcpVersionUnknown") }}
+                  </div>
+                </div>
+                <div class="rounded-md border p-3">
+                  <div class="text-xs font-medium uppercase text-muted-foreground">npm</div>
+                  <div class="mt-2 font-mono text-sm">
+                    {{ mcpStatus?.npm_available ? t("settings.mcpAvailable") : t("settings.mcpUnavailable") }}
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="mcpStatus?.bin_path" class="space-y-2">
+                <Label>{{ t("settings.mcpBinPath") }}</Label>
+                <div class="rounded-md border bg-muted/20 px-3 py-2 font-mono text-xs text-muted-foreground">
+                  {{ mcpStatus.bin_path }}
+                </div>
+              </div>
+
+              <div class="space-y-2">
+                <Label>{{
+                  mcpStatus?.installed ? t("settings.mcpUpdateCommand") : t("settings.mcpInstallCommand")
+                }}</Label>
+                <div class="flex min-w-0 items-center gap-2">
+                  <div
+                    class="min-w-0 flex-1 overflow-x-auto rounded-md border bg-background px-3 py-2 font-mono text-xs whitespace-nowrap"
+                  >
+                    {{ mcpCommand }}
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    :title="t('common.copy')"
+                    @click="copyMcpText('install', mcpCommand)"
+                  >
+                    <CheckCircle2 v-if="mcpCopied === 'install'" class="h-4 w-4 text-green-500" />
+                    <Copy v-else class="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+
+              <div class="space-y-2">
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="mcp-readonly-mode">{{ t("settings.mcpReadonlyMode") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.mcpReadonlyModeDescription") }}</p>
+                  </div>
+                  <Switch id="mcp-readonly-mode" v-model="mcpReadonlyMode" />
+                </div>
+              </div>
+
+              <div class="space-y-2">
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="mcp-allow-dangerous">{{ t("settings.mcpAllowDangerous") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.mcpAllowDangerousDescription") }}</p>
+                  </div>
+                  <Switch id="mcp-allow-dangerous" v-model="mcpAllowDangerous" :disabled="mcpReadonlyMode" />
+                </div>
+              </div>
+
+              <div class="space-y-2">
+                <Label>{{ t("settings.mcpConfig") }}</Label>
+                <Tabs v-model="mcpConfigTab" class="space-y-3">
+                  <TabsList>
+                    <TabsTrigger value="claude">Claude Code</TabsTrigger>
+                    <TabsTrigger value="codex">Codex</TabsTrigger>
+                  </TabsList>
+
+                  <TabsContent value="claude" class="m-0">
+                    <div class="relative rounded-md border bg-background p-3">
+                      <pre
+                        class="overflow-x-auto whitespace-pre text-xs leading-relaxed"
+                      ><code>{{ mcpClaudeRecommendedConfig }}</code></pre>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        class="absolute right-2 top-2 h-7 w-7"
+                        :title="t('common.copy')"
+                        @click="copyMcpText('claude-config', mcpClaudeRecommendedConfig)"
+                      >
+                        <CheckCircle2 v-if="mcpCopied === 'claude-config'" class="h-3.5 w-3.5 text-green-500" />
+                        <Copy v-else class="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="codex" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpCodexConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre
+                          class="overflow-x-auto whitespace-pre text-xs leading-relaxed"
+                        ><code>{{ mcpCodexRecommendedConfig }}</code></pre>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="icon"
+                          class="absolute right-2 top-2 h-7 w-7"
+                          :title="t('common.copy')"
+                          @click="copyMcpText('codex-config', mcpCodexRecommendedConfig)"
+                        >
+                          <CheckCircle2 v-if="mcpCopied === 'codex-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </TabsContent>
+                </Tabs>
+              </div>
+
+              <div
+                v-if="mcpStatus?.error || mcpStatusError"
+                class="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+              >
+                {{ mcpStatusError || mcpStatus?.error }}
+              </div>
+
+              <div class="flex items-center gap-2 text-xs text-muted-foreground">
+                <Terminal class="h-3.5 w-3.5" />
+                <span>{{ t("settings.mcpDetectionTiming") }} {{ t("settings.mcpNpmBoundary") }}</span>
+              </div>
+            </section>
+
             <section v-else-if="activeSettingsTab === 'security' && isWeb" class="flex flex-col gap-5 py-2">
               <div class="space-y-3">
                 <Label class="text-base">{{ t("auth.changePassword") }}</Label>
@@ -1843,6 +2631,27 @@ watch(
                 <button
                   type="button"
                   class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  @click="openExternalUrl('https://docs.qq.com/doc/DVVhMY0h1ekJqc0tz')"
+                >
+                  <div class="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                    {{ t("settings.community") }}
+                  </div>
+                  <div class="mt-3 flex items-center gap-2 text-sm font-medium">
+                    <span class="flex h-7 w-7 items-center justify-center rounded-md bg-[#07C160] text-white">
+                      <svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <path
+                          d="M9.5 4C5.36 4 2 6.69 2 10c0 1.89 1.08 3.56 2.78 4.66l-.7 2.1 2.46-1.23c.87.27 1.8.42 2.78.42.24 0 .48-.01.71-.03A5.93 5.93 0 0 1 10 14c0-3.31 3.13-6 7-6 .34 0 .67.03 1 .07C17.27 5.56 13.72 4 9.5 4Zm-3 4.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2Zm5 0a1 1 0 1 1 0-2 1 1 0 0 1 0 2ZM22 14c0-2.76-2.69-5-6-5s-6 2.24-6 5 2.69 5 6 5c.73 0 1.43-.11 2.09-.3l1.72.86-.49-1.46C20.94 17.07 22 15.64 22 14Zm-7.5-.5a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5Zm4 0a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5Z"
+                        />
+                      </svg>
+                    </span>
+                    {{ t("settings.wechatGroup") }}
+                    <ExternalLink class="ml-auto h-3.5 w-3.5 text-muted-foreground" />
+                  </div>
+                  <div class="mt-1 text-sm text-primary">{{ t("settings.wechatGroupInvite") }}</div>
+                </button>
+                <button
+                  type="button"
+                  class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   @click="openExternalUrl('https://github.com/t8y2/dbx')"
                 >
                   <div class="text-xs font-medium uppercase tracking-wider text-muted-foreground">
@@ -1868,7 +2677,7 @@ watch(
                     {{ t("settings.project") }}
                   </div>
                   <div class="mt-3 flex items-center gap-2 text-sm font-medium">
-                    <img src="/logo.png" alt="DBX" class="h-7 w-7 rounded-md" />
+                    <AppLogo class="h-7 w-7" />
                     {{ t("settings.officialDocs") }}
                     <ExternalLink class="ml-auto h-3.5 w-3.5 text-muted-foreground" />
                   </div>
@@ -1889,10 +2698,10 @@ watch(
             <Button variant="outline" @click="emit('update:open', false)">
               {{ t("common.close") }}
             </Button>
-            <Button :disabled="!hasChanges() || hasBlockingShortcutConflicts" @click="applySettings">
+            <Button :disabled="!hasChanges() || hasApplyBlocker" @click="applySettings">
               {{ t("settings.apply") }}
             </Button>
-            <Button :disabled="!hasChanges() || hasBlockingShortcutConflicts" @click="applySettingsAndClose">
+            <Button :disabled="!hasChanges() || hasApplyBlocker" @click="applySettingsAndClose">
               {{ t("settings.applyAndClose") }}
             </Button>
           </DialogFooter>
@@ -1963,6 +2772,25 @@ watch(
           </DialogFooter>
 
           <DialogFooter
+            v-else-if="activeSettingsTab === 'mcp' && !isWeb"
+            class="mx-0 mb-0 shrink-0 rounded-none border-t border-border/60 bg-transparent px-0 pb-0 pt-3"
+          >
+            <Button variant="outline" @click="emit('update:open', false)">
+              {{ t("common.close") }}
+            </Button>
+            <div class="flex-1" />
+            <Button variant="outline" :disabled="mcpStatusLoading" @click="refreshMcpStatus">
+              <Loader2 v-if="mcpStatusLoading" class="mr-1 h-3 w-3 animate-spin" />
+              <RefreshCw v-else class="mr-1 h-3 w-3" />
+              {{ t("settings.mcpRefresh") }}
+            </Button>
+            <Button variant="outline" @click="openExternalUrl('https://dbxio.com/cn/docs/mcp')">
+              <ExternalLink class="mr-1 h-3 w-3" />
+              {{ t("settings.mcpGuide") }}
+            </Button>
+          </DialogFooter>
+
+          <DialogFooter
             v-else-if="activeSettingsTab === 'security' && isWeb"
             class="mx-0 mb-0 shrink-0 rounded-none border-t border-border/60 bg-transparent px-0 pb-0 pt-3"
           >
@@ -1988,6 +2816,14 @@ watch(
         </div>
       </div>
     </DialogContent>
+
+    <!-- Theme Customizer Dialog -->
+    <ThemeCustomizerDialog
+      v-model:open="showThemeCustomizer"
+      :themes="editCustomThemes"
+      :active-theme-id="editActiveCustomThemeId"
+      @save="handleThemeSave"
+    />
 
     <!-- Snippet Add/Edit Dialog -->
     <Dialog :open="snippetDialogOpen" @update:open="snippetDialogOpen = $event">

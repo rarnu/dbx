@@ -3,18 +3,55 @@ use crate::db::agent_driver::mongo_document_id_params;
 use crate::db::elasticsearch_driver;
 use crate::db::mongo_driver::{self, MongoDocumentResult};
 
+fn sort_names(mut names: Vec<String>) -> Vec<String> {
+    names.sort_by(|left, right| {
+        let left_lower = left.to_lowercase();
+        let right_lower = right.to_lowercase();
+        left_lower.cmp(&right_lower).then_with(|| left.cmp(right))
+    });
+    names
+}
+
 pub async fn mongo_list_databases_core(state: &AppState, connection_id: &str) -> Result<Vec<String>, String> {
+    let fallback_database = configured_mongo_database(state, connection_id).await;
     let connections = state.connections.read().await;
     match connections.get(connection_id).ok_or("Not found")? {
-        PoolKind::MongoDb(client) => mongo_driver::list_databases(client).await,
+        PoolKind::MongoDb(client) => match mongo_driver::list_databases(client).await {
+            Ok(databases) => Ok(sort_names(databases)),
+            Err(error) if mongo_list_databases_unauthorized(&error) => {
+                fallback_mongo_database(&error, fallback_database)
+            }
+            Err(error) => Err(error),
+        },
         PoolKind::Elasticsearch(_) => Ok(vec!["default".to_string()]),
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
-            let result: Vec<serde_json::Value> = client.mongo_list_databases().await?;
-            Ok(result.iter().filter_map(|v| v.get("name")?.as_str().map(String::from)).collect())
+            match client.mongo_list_databases::<Vec<serde_json::Value>>().await {
+                Ok(result) => {
+                    Ok(sort_names(result.iter().filter_map(|v| v.get("name")?.as_str().map(String::from)).collect()))
+                }
+                Err(error) if mongo_list_databases_unauthorized(&error) => {
+                    fallback_mongo_database(&error, fallback_database)
+                }
+                Err(error) => Err(error),
+            }
         }
         _ => Err("Not a MongoDB/Elasticsearch connection".to_string()),
     }
+}
+
+async fn configured_mongo_database(state: &AppState, connection_id: &str) -> Option<String> {
+    let configs = state.configs.read().await;
+    configs.get(connection_id).and_then(|config| config.effective_database().map(str::to_string))
+}
+
+fn fallback_mongo_database(error: &str, fallback_database: Option<String>) -> Result<Vec<String>, String> {
+    fallback_database.map(|database| vec![database]).ok_or_else(|| error.to_string())
+}
+
+fn mongo_list_databases_unauthorized(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("not authorized") && lower.contains("listdatabases")
 }
 
 pub async fn mongo_list_collections_core(
@@ -24,16 +61,17 @@ pub async fn mongo_list_collections_core(
 ) -> Result<Vec<String>, String> {
     let connections = state.connections.read().await;
     match connections.get(connection_id).ok_or("Not found")? {
-        PoolKind::MongoDb(client) => mongo_driver::list_collections(client, database).await,
-        PoolKind::Elasticsearch(client) => elasticsearch_driver::list_indices(client).await,
+        PoolKind::MongoDb(client) => mongo_driver::list_collections(client, database).await.map(sort_names),
+        PoolKind::Elasticsearch(client) => elasticsearch_driver::list_indices(client).await.map(sort_names),
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
-            client.mongo_list_collections(database).await
+            client.mongo_list_collections(database).await.map(sort_names)
         }
         _ => Err("Not a MongoDB/Elasticsearch connection".to_string()),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn mongo_find_documents_core(
     state: &AppState,
     connection_id: &str,
@@ -225,5 +263,39 @@ pub async fn mongo_delete_documents_core(
         }
         PoolKind::Agent(_) => Err("MongoDB legacy agent does not support bulk deleteOne/deleteMany writes".to_string()),
         _ => Err("Not a MongoDB connection".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fallback_mongo_database, mongo_list_databases_unauthorized, sort_names};
+
+    #[test]
+    fn sorts_names_case_insensitively() {
+        let sorted = sort_names(vec![
+            "movies".to_string(),
+            "Comments".to_string(),
+            "users".to_string(),
+            "embedded_movies".to_string(),
+        ]);
+
+        assert_eq!(sorted, vec!["Comments", "embedded_movies", "movies", "users"]);
+    }
+
+    #[test]
+    fn detects_mongo_list_databases_unauthorized_errors() {
+        assert!(mongo_list_databases_unauthorized(
+            "Command failed with error 13 (Unauthorized): not authorized on admin to execute command { listDatabases: 1 }",
+        ));
+        assert!(!mongo_list_databases_unauthorized("not authorized to execute command { find: \"orders\" }"));
+    }
+
+    #[test]
+    fn falls_back_to_configured_mongo_database() {
+        assert_eq!(
+            fallback_mongo_database("not authorized", Some("app".to_string())).unwrap(),
+            vec!["app".to_string()],
+        );
+        assert_eq!(fallback_mongo_database("not authorized", None).unwrap_err(), "not authorized");
     }
 }

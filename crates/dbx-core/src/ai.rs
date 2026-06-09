@@ -3,6 +3,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{Notify, RwLock};
@@ -51,17 +52,12 @@ pub enum AiProvider {
     Custom,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AiApiStyle {
+    #[default]
     Completions,
     Responses,
-}
-
-impl Default for AiApiStyle {
-    fn default() -> Self {
-        Self::Completions
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,12 +226,53 @@ pub fn claude_stream_text(event: &serde_json::Value) -> Option<&str> {
     None
 }
 
-pub fn openai_stream_text(event: &serde_json::Value) -> Option<&str> {
+fn text_from_content_value(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
+        return Some(text.to_string());
+    }
+
+    value.as_array().and_then(|parts| {
+        let text = parts
+            .iter()
+            .filter_map(|part| {
+                part["text"]
+                    .as_str()
+                    .or_else(|| part["content"].as_str())
+                    .or_else(|| part["input_text"].as_str())
+                    .or_else(|| part["output_text"].as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        (!text.is_empty()).then_some(text)
+    })
+}
+
+pub fn openai_response_text(data: &serde_json::Value) -> String {
+    data["choices"]
+        .get(0)
+        .and_then(|choice| {
+            text_from_content_value(&choice["message"]["content"])
+                .or_else(|| text_from_content_value(&choice["text"]))
+                .or_else(|| text_from_content_value(&choice["delta"]["content"]))
+        })
+        .or_else(|| text_from_content_value(&data["content"]))
+        .or_else(|| {
+            let text = responses_text(data);
+            (!text.is_empty()).then_some(text)
+        })
+        .unwrap_or_default()
+}
+
+pub fn openai_stream_text(event: &serde_json::Value) -> Option<String> {
     event["choices"]
         .get(0)
-        .and_then(|choice| choice["delta"]["content"].as_str().or_else(|| choice["message"]["content"].as_str()))
-        .or_else(|| event["content"].as_str())
-        .filter(|text| !text.is_empty())
+        .and_then(|choice| {
+            text_from_content_value(&choice["delta"]["content"])
+                .or_else(|| text_from_content_value(&choice["message"]["content"]))
+                .or_else(|| text_from_content_value(&choice["text"]))
+        })
+        .or_else(|| text_from_content_value(&event["content"]))
+        .or_else(|| event["delta"].as_str().filter(|text| !text.is_empty()).map(ToString::to_string))
 }
 
 pub fn openai_stream_reasoning(event: &serde_json::Value) -> Option<&str> {
@@ -247,6 +284,45 @@ pub fn openai_stream_reasoning(event: &serde_json::Value) -> Option<&str> {
 
 pub fn responses_stream_text(event: &serde_json::Value) -> Option<&str> {
     event["delta"].as_str().filter(|s| !s.is_empty())
+}
+
+fn responses_max_output_tokens(max_tokens: Option<u32>) -> u32 {
+    max_tokens.unwrap_or(2048).max(16)
+}
+
+fn is_openai_api_config(config: &AiConfig) -> bool {
+    matches!(config.provider, AiProvider::Openai) || config.endpoint.to_ascii_lowercase().contains("api.openai.com")
+}
+
+fn is_openai_reasoning_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.starts_with("gpt-5") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4")
+}
+
+pub fn supports_temperature(config: &AiConfig) -> bool {
+    !(is_openai_api_config(config) && is_openai_reasoning_model(&config.model))
+}
+
+fn add_temperature_if_supported(body: &mut serde_json::Value, request: &AiCompletionRequest) {
+    if supports_temperature(&request.config) {
+        body["temperature"] = json!(request.temperature.unwrap_or(0.2));
+    }
+}
+
+fn responses_text(data: &serde_json::Value) -> String {
+    if let Some(text) = data["output_text"].as_str().filter(|text| !text.is_empty()) {
+        return text.to_string();
+    }
+
+    data["output"]
+        .as_array()
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                item["content"].as_array().and_then(|parts| parts.iter().find_map(|p| p["text"].as_str()))
+            })
+        })
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub fn gemini_text(data: &serde_json::Value) -> String {
@@ -322,10 +398,31 @@ fn claude_headers(config: &AiConfig) -> Result<HeaderMap, String> {
     Ok(headers)
 }
 
+fn normalize_ai_proxy_url(proxy_url: &str) -> String {
+    let proxy_url = proxy_url.trim();
+    if proxy_url.contains("://") || proxy_url.is_empty() {
+        proxy_url.to_string()
+    } else {
+        format!("http://{proxy_url}")
+    }
+}
+
+fn ai_endpoint_is_loopback(config: &AiConfig) -> bool {
+    let endpoint = resolve_endpoint(config);
+    let Ok(url) = reqwest::Url::parse(&endpoint) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().map(|addr| addr.is_loopback()).unwrap_or(false)
+}
+
 pub fn build_ai_http_client(config: &AiConfig, timeout_secs: u64) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(timeout_secs));
-    if config.proxy_enabled && !config.proxy_url.trim().is_empty() {
-        let proxy = reqwest::Proxy::all(config.proxy_url.trim()).map_err(|e| format!("Invalid AI proxy URL: {e}"))?;
+    if config.proxy_enabled && !config.proxy_url.trim().is_empty() && !ai_endpoint_is_loopback(config) {
+        let proxy_url = normalize_ai_proxy_url(&config.proxy_url);
+        let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| format!("Invalid AI proxy URL: {e}"))?;
         builder = builder.proxy(proxy);
     }
     builder.build().map_err(|e| e.to_string())
@@ -430,7 +527,7 @@ pub async fn call_claude(client: &reqwest::Client, request: AiCompletionRequest)
     });
 
     let res = client
-        .post(&resolve_endpoint(&request.config))
+        .post(resolve_endpoint(&request.config))
         .headers(claude_headers(&request.config)?)
         .json(&body)
         .send()
@@ -460,8 +557,8 @@ pub async fn call_openai_compatible(client: &reqwest::Client, request: AiComplet
         "model": request.config.model,
         "messages": messages,
         "max_tokens": request.max_tokens.unwrap_or(2048),
-        "temperature": request.temperature.unwrap_or(0.2),
     });
+    add_temperature_if_supported(&mut body_obj, &request);
     if !request.config.enable_thinking {
         body_obj["extra_body"] = json!({
             "chat_template_kwargs": { "enable_thinking": false }
@@ -469,7 +566,7 @@ pub async fn call_openai_compatible(client: &reqwest::Client, request: AiComplet
     }
 
     let res = client
-        .post(&resolve_endpoint(&request.config))
+        .post(resolve_endpoint(&request.config))
         .headers(headers)
         .json(&body_obj)
         .send()
@@ -482,21 +579,21 @@ pub async fn call_openai_compatible(client: &reqwest::Client, request: AiComplet
         return Err(extract_error(&data).unwrap_or_else(|| format!("API error: {status}")));
     }
 
-    Ok(data["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string())
+    Ok(openai_response_text(&data))
 }
 
 pub async fn call_responses_api(client: &reqwest::Client, request: AiCompletionRequest) -> Result<String, String> {
     let headers = maybe_bearer_headers(&request.config)?;
 
-    let body = json!({
+    let mut body = json!({
         "model": request.config.model,
         "input": build_responses_input(&request.system_prompt, &request.messages),
-        "max_output_tokens": request.max_tokens.unwrap_or(2048),
-        "temperature": request.temperature.unwrap_or(0.2),
+        "max_output_tokens": responses_max_output_tokens(request.max_tokens),
     });
+    add_temperature_if_supported(&mut body, &request);
 
     let res = client
-        .post(&resolve_endpoint(&request.config))
+        .post(resolve_endpoint(&request.config))
         .headers(headers)
         .json(&body)
         .send()
@@ -509,15 +606,7 @@ pub async fn call_responses_api(client: &reqwest::Client, request: AiCompletionR
         return Err(extract_error(&data).unwrap_or_else(|| format!("API error: {status}")));
     }
 
-    Ok(data["output"]
-        .as_array()
-        .and_then(|items| {
-            items.iter().find_map(|item| {
-                item["content"].as_array().and_then(|parts| parts.iter().find_map(|p| p["text"].as_str()))
-            })
-        })
-        .unwrap_or_default()
-        .to_string())
+    Ok(responses_text(&data))
 }
 
 pub async fn call_gemini(client: &reqwest::Client, request: AiCompletionRequest) -> Result<String, String> {
@@ -542,7 +631,7 @@ pub async fn call_gemini(client: &reqwest::Client, request: AiCompletionRequest)
     });
 
     let res = client
-        .post(&resolve_endpoint(&request.config))
+        .post(resolve_endpoint(&request.config))
         .query(&[("key", request.config.api_key.as_str())])
         .header(CONTENT_TYPE, "application/json")
         .json(&body)
@@ -668,7 +757,7 @@ async fn stream_claude(
     });
 
     let res = client
-        .post(&resolve_endpoint(&request.config))
+        .post(resolve_endpoint(&request.config))
         .headers(claude_headers(&request.config)?)
         .json(&body)
         .send()
@@ -745,9 +834,9 @@ async fn stream_openai(
         "model": request.config.model,
         "messages": messages,
         "max_tokens": request.max_tokens.unwrap_or(2048),
-        "temperature": request.temperature.unwrap_or(0.2),
         "stream": true,
     });
+    add_temperature_if_supported(&mut body_obj, request);
     if !request.config.enable_thinking {
         body_obj["extra_body"] = json!({
             "chat_template_kwargs": { "enable_thinking": false }
@@ -755,7 +844,7 @@ async fn stream_openai(
     }
 
     let res = client
-        .post(&resolve_endpoint(&request.config))
+        .post(resolve_endpoint(&request.config))
         .headers(headers)
         .json(&body_obj)
         .send()
@@ -800,7 +889,7 @@ async fn stream_openai(
                         if let Some(text) = openai_stream_text(&event) {
                             on_chunk(AiStreamChunk {
                                 session_id: session_id.to_string(),
-                                delta: text.to_string(),
+                                delta: text,
                                 reasoning_delta: None,
                                 done: false,
                             });
@@ -833,16 +922,16 @@ async fn stream_responses_api(
 ) -> Result<(), String> {
     let headers = maybe_bearer_headers(&request.config)?;
 
-    let body = json!({
+    let mut body = json!({
         "model": request.config.model,
         "input": build_responses_input(&request.system_prompt, &request.messages),
-        "max_output_tokens": request.max_tokens.unwrap_or(2048),
-        "temperature": request.temperature.unwrap_or(0.2),
+        "max_output_tokens": responses_max_output_tokens(request.max_tokens),
         "stream": true,
     });
+    add_temperature_if_supported(&mut body, request);
 
     let res = client
-        .post(&resolve_endpoint(&request.config))
+        .post(resolve_endpoint(&request.config))
         .headers(headers)
         .json(&body)
         .send()
@@ -931,7 +1020,7 @@ async fn stream_gemini(
     });
 
     let res = client
-        .post(&resolve_gemini_stream_endpoint(&request.config))
+        .post(resolve_gemini_stream_endpoint(&request.config))
         .query(&[("key", request.config.api_key.as_str()), ("alt", "sse")])
         .header(CONTENT_TYPE, "application/json")
         .json(&body)
@@ -1041,8 +1130,9 @@ pub fn load_config(path: &Path) -> Result<Option<AiConfig>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_ai_http_client, gemini_text, parse_model_list_response, resolve_endpoint, resolve_model_list_endpoint,
-        validate_config, AiApiStyle, AiConfig, AiModelInfo, AiProvider,
+        build_ai_http_client, gemini_text, openai_response_text, openai_stream_text, parse_model_list_response,
+        resolve_endpoint, resolve_model_list_endpoint, responses_max_output_tokens, responses_text,
+        supports_temperature, validate_config, AiApiStyle, AiConfig, AiModelInfo, AiProvider,
     };
 
     #[test]
@@ -1056,9 +1146,9 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(config.proxy_enabled, false);
+        assert!(!config.proxy_enabled);
         assert_eq!(config.proxy_url, "");
-        assert_eq!(config.enable_thinking, true);
+        assert!(config.enable_thinking);
     }
 
     #[test]
@@ -1077,6 +1167,38 @@ mod tests {
         let err = build_ai_http_client(&config, 1).unwrap_err();
 
         assert!(err.contains("Invalid AI proxy URL"));
+    }
+
+    #[test]
+    fn ai_http_client_accepts_proxy_host_port_without_scheme() {
+        let config = AiConfig {
+            provider: AiProvider::Openai,
+            api_key: "key".to_string(),
+            endpoint: "https://api.openai.com/v1/chat/completions".to_string(),
+            model: "gpt-4o".to_string(),
+            api_style: AiApiStyle::Completions,
+            proxy_enabled: true,
+            proxy_url: "127.0.0.1:7890".to_string(),
+            enable_thinking: true,
+        };
+
+        build_ai_http_client(&config, 1).unwrap();
+    }
+
+    #[test]
+    fn ai_http_client_bypasses_proxy_for_loopback_endpoint() {
+        let config = AiConfig {
+            provider: AiProvider::OpenaiCompatible,
+            api_key: "key".to_string(),
+            endpoint: "http://127.0.0.1:3456/v1".to_string(),
+            model: "gpt-4o".to_string(),
+            api_style: AiApiStyle::Completions,
+            proxy_enabled: true,
+            proxy_url: "not a proxy url".to_string(),
+            enable_thinking: true,
+        };
+
+        build_ai_http_client(&config, 1).unwrap();
     }
 
     #[test]
@@ -1159,6 +1281,86 @@ mod tests {
                     display_name: Some("Claude Sonnet 4".to_string())
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn responses_api_clamps_tiny_output_token_requests() {
+        assert_eq!(responses_max_output_tokens(Some(1)), 16);
+        assert_eq!(responses_max_output_tokens(Some(16)), 16);
+        assert_eq!(responses_max_output_tokens(Some(2400)), 2400);
+        assert_eq!(responses_max_output_tokens(None), 2048);
+    }
+
+    #[test]
+    fn omits_temperature_for_openai_reasoning_models() {
+        let mut config = AiConfig {
+            provider: AiProvider::Openai,
+            api_key: "key".to_string(),
+            endpoint: "https://api.openai.com/v1/chat/completions".to_string(),
+            model: "gpt-5.5".to_string(),
+            api_style: AiApiStyle::Completions,
+            proxy_enabled: false,
+            proxy_url: String::new(),
+            enable_thinking: true,
+        };
+
+        assert!(!supports_temperature(&config));
+
+        config.model = "o4-mini".to_string();
+        assert!(!supports_temperature(&config));
+
+        config.model = "gpt-4o".to_string();
+        assert!(supports_temperature(&config));
+
+        config.provider = AiProvider::OpenaiCompatible;
+        config.endpoint = "http://localhost:11434/v1".to_string();
+        config.model = "gpt-5-local".to_string();
+        assert!(supports_temperature(&config));
+    }
+
+    #[test]
+    fn parses_responses_text_from_current_and_nested_shapes() {
+        assert_eq!(
+            responses_text(&serde_json::json!({
+                "output_text": "SELECT 1;"
+            })),
+            "SELECT 1;"
+        );
+
+        assert_eq!(
+            responses_text(&serde_json::json!({
+                "output": [{
+                    "content": [{ "type": "output_text", "text": "SELECT 2;" }]
+                }]
+            })),
+            "SELECT 2;"
+        );
+    }
+
+    #[test]
+    fn parses_openai_compatible_proxy_response_shapes() {
+        assert_eq!(
+            openai_response_text(&serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": [
+                            { "type": "text", "text": "SELECT " },
+                            { "type": "text", "text": "1;" }
+                        ]
+                    }
+                }]
+            })),
+            "SELECT 1;"
+        );
+
+        assert_eq!(
+            openai_stream_text(&serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": "SELECT 2;"
+            }))
+            .as_deref(),
+            Some("SELECT 2;")
         );
     }
 

@@ -48,10 +48,11 @@ pub enum AgentCapability {
     PagedQuery,
     Transaction,
     Ddl,
+    Kv,
 }
 
 impl AgentCapability {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Connect,
         Self::TestConnection,
         Self::Metadata,
@@ -59,6 +60,7 @@ impl AgentCapability {
         Self::PagedQuery,
         Self::Transaction,
         Self::Ddl,
+        Self::Kv,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -70,6 +72,7 @@ impl AgentCapability {
             Self::PagedQuery => "paged_query",
             Self::Transaction => "transaction",
             Self::Ddl => "ddl",
+            Self::Kv => "kv",
         }
     }
 }
@@ -93,13 +96,14 @@ pub enum AgentMethod {
     ExecuteQueryPage,
     FetchQueryPage,
     CloseQuerySession,
+    GetExplainInfo,
     ExecuteTransaction,
     Disconnect,
     Shutdown,
 }
 
 impl AgentMethod {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::Handshake,
         Self::Connect,
         Self::TestConnection,
@@ -117,6 +121,7 @@ impl AgentMethod {
         Self::ExecuteQueryPage,
         Self::FetchQueryPage,
         Self::CloseQuerySession,
+        Self::GetExplainInfo,
         Self::ExecuteTransaction,
         Self::Disconnect,
         Self::Shutdown,
@@ -141,6 +146,7 @@ impl AgentMethod {
             Self::ExecuteQueryPage => "execute_query_page",
             Self::FetchQueryPage => "fetch_query_page",
             Self::CloseQuerySession => "close_query_session",
+            Self::GetExplainInfo => "get_explain_info",
             Self::ExecuteTransaction => "execute_transaction",
             Self::Disconnect => "disconnect",
             Self::Shutdown => "shutdown",
@@ -176,6 +182,27 @@ impl MongoAgentMethod {
             Self::InsertDocument => "insert_document",
             Self::UpdateDocument => "update_document",
             Self::DeleteDocument => "delete_document",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentKvMethod {
+    ListPrefix,
+    Get,
+    Put,
+    Delete,
+}
+
+impl AgentKvMethod {
+    pub const ALL: [Self; 4] = [Self::ListPrefix, Self::Get, Self::Put, Self::Delete];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ListPrefix => "kv_list_prefix",
+            Self::Get => "kv_get",
+            Self::Put => "kv_put",
+            Self::Delete => "kv_delete",
         }
     }
 }
@@ -287,6 +314,17 @@ impl AgentDriverClient {
         method: &str,
         params: Value,
     ) -> Result<T, String> {
+        self.call_with_timeout(method, params, Some(Duration::from_secs(RPC_TIMEOUT_SECS))).await
+    }
+
+    /// Send a JSON-RPC 2.0 request and wait for the response.
+    /// `None` disables the client-side RPC timeout for long-running query calls.
+    pub async fn call_with_timeout<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
         self.next_id += 1;
         let id = self.next_id;
 
@@ -317,37 +355,42 @@ impl AgentDriverClient {
         // Read response from stdout (blocking, with timeout)
         let mut reader = self.stdout.take().ok_or("Agent stdout not available")?;
 
-        let (returned_reader, result) = tokio::time::timeout(
-            Duration::from_secs(RPC_TIMEOUT_SECS),
-            tokio::task::spawn_blocking(move || {
-                let line = match read_agent_line(&mut reader, "response") {
-                    Ok(line) => line,
-                    Err(e) => return (reader, Err(e)),
-                };
+        let response_task = tokio::task::spawn_blocking(move || {
+            let line = match read_agent_line(&mut reader, "response") {
+                Ok(line) => line,
+                Err(e) => return (reader, Err(e)),
+            };
 
-                let resp: Value = match serde_json::from_str(line.trim()) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return (reader, Err(format!("Invalid JSON response from agent: {e}")));
-                    }
-                };
+            let resp: Value = match serde_json::from_str(line.trim()) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (reader, Err(format!("Invalid JSON response from agent: {e}")));
+                }
+            };
 
-                let result = if let Some(err) = resp.get("error") {
-                    let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown agent error");
-                    let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-                    Err(format!("Agent RPC error ({code}): {msg}"))
-                } else if let Some(result_val) = resp.get("result") {
-                    serde_json::from_value::<T>(result_val.clone())
-                        .map_err(|e| format!("Failed to deserialize agent result: {e}"))
-                } else {
-                    Err(format!("Agent response missing both 'result' and 'error': {line}"))
-                };
+            let result = if let Some(err) = resp.get("error") {
+                let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown agent error");
+                let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+                Err(format!("Agent RPC error ({code}): {msg}"))
+            } else if let Some(result_val) = resp.get("result") {
+                serde_json::from_value::<T>(result_val.clone())
+                    .map_err(|e| format!("Failed to deserialize agent result: {e}"))
+            } else {
+                Err(format!("Agent response missing both 'result' and 'error': {line}"))
+            };
 
-                (reader, result)
-            }),
-        )
-        .await
-        .map_err(|_| format!("Agent RPC call timed out ({RPC_TIMEOUT_SECS}s)"))?
+            (reader, result)
+        });
+        let (returned_reader, result) = match timeout_duration {
+            Some(duration) => match tokio::time::timeout(duration, response_task).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.kill();
+                    return Err(format!("Agent RPC call timed out ({}s)", duration.as_secs()));
+                }
+            },
+            None => response_task.await,
+        }
         .map_err(|e| format!("Agent RPC task failed: {e}"))?;
 
         let _ = self.stdout.insert(returned_reader);
@@ -360,6 +403,15 @@ impl AgentDriverClient {
         params: Value,
     ) -> Result<T, String> {
         self.call(method.as_str(), params).await
+    }
+
+    pub async fn call_method_with_timeout<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: AgentMethod,
+        params: Value,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_with_timeout(method.as_str(), params, timeout_duration).await
     }
 
     pub async fn connect(&mut self, params: Value) -> Result<Value, String> {
@@ -458,6 +510,14 @@ impl AgentDriverClient {
         self.call_method(AgentMethod::ExecuteQuery, params).await
     }
 
+    pub async fn execute_query_with_timeout<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(AgentMethod::ExecuteQuery, params, timeout_duration).await
+    }
+
     pub async fn execute_query_page<T: DeserializeOwned + Send + 'static>(
         &mut self,
         params: Value,
@@ -465,8 +525,28 @@ impl AgentDriverClient {
         self.call_method(AgentMethod::ExecuteQueryPage, params).await
     }
 
+    pub async fn execute_query_page_with_timeout<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(AgentMethod::ExecuteQueryPage, params, timeout_duration).await
+    }
+
     pub async fn fetch_query_page<T: DeserializeOwned + Send + 'static>(&mut self, params: Value) -> Result<T, String> {
         self.call_method(AgentMethod::FetchQueryPage, params).await
+    }
+
+    pub async fn fetch_query_page_with_timeout<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(AgentMethod::FetchQueryPage, params, timeout_duration).await
+    }
+
+    pub async fn get_explain_info<T: DeserializeOwned + Send + 'static>(&mut self, params: Value) -> Result<T, String> {
+        self.call_method(AgentMethod::GetExplainInfo, params).await
     }
 
     pub async fn close_query_session<T: DeserializeOwned + Send + 'static>(
@@ -488,6 +568,14 @@ impl AgentDriverClient {
     pub async fn call_mongo_method<T: DeserializeOwned + Send + 'static>(
         &mut self,
         method: MongoAgentMethod,
+        params: Value,
+    ) -> Result<T, String> {
+        self.call(method.as_str(), params).await
+    }
+
+    pub async fn call_kv_method<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: AgentKvMethod,
         params: Value,
     ) -> Result<T, String> {
         self.call(method.as_str(), params).await
@@ -591,6 +679,14 @@ impl AgentDriverClient {
         // Reap the child to avoid zombie processes
         let _ = self.child.wait();
     }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn stderr_tail_snapshot(&self) -> String {
+        self.stderr_tail.lock().map(|tail| tail.snapshot()).unwrap_or_default()
+    }
 }
 
 pub fn agent_handshake_params(app_version: &str) -> Value {
@@ -607,6 +703,9 @@ pub fn is_unsupported_handshake_error(error: &str) -> bool {
 }
 
 pub fn agent_supports_capability(handshake: Option<&AgentHandshake>, capability: AgentCapability) -> bool {
+    if capability == AgentCapability::Kv {
+        return handshake.map(|value| value.supports(capability)).unwrap_or(false);
+    }
     handshake.map(|value| value.supports(capability)).unwrap_or(true)
 }
 
@@ -662,6 +761,10 @@ fn agent_java_args(jar_path: &str) -> Vec<String> {
     .into_iter()
     .map(str::to_string)
     .collect::<Vec<_>>();
+
+    if agent_jar_path_matches_key(jar_path, "kingbase") {
+        args.push("-Djava.net.preferIPv4Stack=true".to_string());
+    }
 
     if !agent_jar_path_matches_key(jar_path, "oracle-10g") {
         args.push("--add-opens=java.sql/java.sql=ALL-UNNAMED".to_string());
@@ -783,7 +886,7 @@ mod tests {
         agent_proxy_env_vars, agent_schema_params, agent_schema_table_params, agent_supports_capability,
         agent_transaction_params, format_agent_process_error, is_unsupported_handshake_error, mongo_collection_params,
         mongo_database_params, mongo_document_id_params, read_agent_line, AgentCapability, AgentDriverClient,
-        AgentHandshake, AgentMethod, MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
+        AgentHandshake, AgentKvMethod, AgentMethod, MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
     };
     use std::io::Cursor;
 
@@ -817,6 +920,20 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "-Dhttp.proxyHost="));
         assert!(args.iter().any(|arg| arg == "-Dhttps.proxyHost="));
         assert!(args.iter().any(|arg| arg == "-DsocksProxyHost="));
+    }
+
+    #[test]
+    fn agent_java_args_prefer_ipv4_for_kingbase() {
+        let args = agent_java_args("/tmp/dbx/drivers/kingbase/agent.jar");
+
+        assert!(args.iter().any(|arg| arg == "-Djava.net.preferIPv4Stack=true"));
+    }
+
+    #[test]
+    fn agent_java_args_do_not_prefer_ipv4_for_other_agents() {
+        let args = agent_java_args("/tmp/dbx/drivers/highgo/agent.jar");
+
+        assert!(!args.iter().any(|arg| arg == "-Djava.net.preferIPv4Stack=true"));
     }
 
     #[test]
@@ -901,7 +1018,8 @@ mod tests {
         assert_eq!(AgentCapability::PagedQuery.as_str(), "paged_query");
         assert_eq!(AgentCapability::Transaction.as_str(), "transaction");
         assert_eq!(AgentCapability::Ddl.as_str(), "ddl");
-        assert_eq!(AgentCapability::ALL.len(), 7);
+        assert_eq!(AgentCapability::Kv.as_str(), "kv");
+        assert_eq!(AgentCapability::ALL.len(), 8);
     }
 
     #[test]
@@ -939,6 +1057,15 @@ mod tests {
     }
 
     #[test]
+    fn defines_kv_agent_protocol_methods() {
+        assert_eq!(AgentKvMethod::ListPrefix.as_str(), "kv_list_prefix");
+        assert_eq!(AgentKvMethod::Get.as_str(), "kv_get");
+        assert_eq!(AgentKvMethod::Put.as_str(), "kv_put");
+        assert_eq!(AgentKvMethod::Delete.as_str(), "kv_delete");
+        assert_eq!(AgentKvMethod::ALL.len(), 4);
+    }
+
+    #[test]
     fn exposes_schema_and_query_protocol_wrappers() {
         let _list_databases = AgentDriverClient::list_databases::<serde_json::Value>;
         let _list_schemas = AgentDriverClient::list_schemas::<serde_json::Value>;
@@ -965,6 +1092,11 @@ mod tests {
         let _mongo_insert_document = AgentDriverClient::mongo_insert_document::<serde_json::Value>;
         let _mongo_update_document = AgentDriverClient::mongo_update_document::<serde_json::Value>;
         let _mongo_delete_document = AgentDriverClient::mongo_delete_document::<serde_json::Value>;
+    }
+
+    #[test]
+    fn exposes_kv_protocol_wrapper() {
+        let _call_kv_method = AgentDriverClient::call_kv_method::<serde_json::Value>;
     }
 
     #[test]
@@ -1029,6 +1161,10 @@ mod tests {
             string_array(&contract["mongoLegacyMethods"]),
             MongoAgentMethod::ALL.iter().map(|method| method.as_str()).collect::<Vec<_>>()
         );
+        assert_eq!(
+            string_array(&contract["kvMethods"]),
+            AgentKvMethod::ALL.iter().map(|method| method.as_str()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1042,6 +1178,7 @@ mod tests {
         assert!(handshake.supports(AgentCapability::Connect));
         assert!(handshake.supports(AgentCapability::Metadata));
         assert!(!handshake.supports(AgentCapability::Query));
+        assert!(!handshake.supports(AgentCapability::Kv));
     }
 
     #[test]
@@ -1055,6 +1192,8 @@ mod tests {
         assert!(agent_supports_capability(None, AgentCapability::Query));
         assert!(agent_supports_capability(Some(&handshake), AgentCapability::Connect));
         assert!(!agent_supports_capability(Some(&handshake), AgentCapability::Query));
+        assert!(!agent_supports_capability(None, AgentCapability::Kv));
+        assert!(!agent_supports_capability(Some(&handshake), AgentCapability::Kv));
     }
 
     #[test]

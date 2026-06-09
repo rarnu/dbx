@@ -1,5 +1,5 @@
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use duckdb::types::{TimeUnit, ValueRef};
+use duckdb::types::{TimeUnit, Value, ValueRef};
 use mysql_async::prelude::Queryable;
 use std::future::Future;
 use std::time::Duration;
@@ -9,15 +9,46 @@ use tokio_util::sync::CancellationToken;
 use crate::connection::{AppState, PoolKind};
 use crate::db;
 use crate::models::connection::DatabaseType;
-use crate::sql::{split_sql_batches, split_sql_statements, starts_with_executable_sql_keyword};
+use crate::sql::{split_sql_batches, split_sql_statements, starts_with_duckdb_result_sql_keyword};
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_ROWS: usize = 10000;
 pub const QUERY_CANCELED: &str = "Query canceled";
 
+async fn connection_is_mongodb(state: &AppState, connection_id: &str) -> bool {
+    let configs = state.configs.read().await;
+    configs.get(connection_id).is_some_and(|config| config.db_type == DatabaseType::MongoDb)
+}
+
 async fn connection_database_type(state: &AppState, connection_id: &str) -> Option<DatabaseType> {
     let configs = state.configs.read().await;
     configs.get(connection_id).map(|config| config.db_type)
+}
+
+async fn connection_mysql_query_dialect(state: &AppState, connection_id: &str) -> db::mysql::MySqlQueryDialect {
+    let configs = state.configs.read().await;
+    configs
+        .get(connection_id)
+        .map(|config| db::mysql::MySqlQueryDialect::for_connection(config.db_type, config.driver_profile.as_deref()))
+        .unwrap_or_default()
+}
+
+async fn connection_database_type_for_pool_key(state: &AppState, pool_key: &str) -> Option<DatabaseType> {
+    let configs = state.configs.read().await;
+    configs
+        .iter()
+        .filter(|(connection_id, _)| {
+            pool_key.strip_prefix(connection_id.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+        })
+        .max_by_key(|(connection_id, _)| connection_id.len())
+        .map(|(_, config)| config.db_type)
+}
+
+fn schema_for_execution_context(db_type: Option<DatabaseType>, schema: Option<&str>) -> Option<&str> {
+    match db_type {
+        Some(DatabaseType::Iris) => None,
+        _ => schema,
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -30,6 +61,7 @@ pub struct QueryExecutionOptions {
     /// Query timeout in seconds. `None` uses the default (30s).
     /// `Some(0)` disables the timeout entirely.
     pub timeout_secs: Option<u64>,
+    pub execution_id: Option<String>,
 }
 
 fn query_result_row_limit(max_rows: Option<usize>) -> usize {
@@ -82,7 +114,70 @@ fn duckdb_value_to_json(row: &duckdb::Row<'_>, idx: usize) -> serde_json::Value 
         ValueRef::Interval { months, days, nanos } => {
             serde_json::Value::String(duckdb_interval_to_string(months, days, nanos))
         }
-        _ => row.get::<_, String>(idx).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+        ValueRef::List(..)
+        | ValueRef::Array(..)
+        | ValueRef::Struct(..)
+        | ValueRef::Map(..)
+        | ValueRef::Enum(..)
+        | ValueRef::Union(..) => duckdb_owned_value_to_json(&value_ref.to_owned()),
+    }
+}
+
+fn duckdb_owned_value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::TinyInt(i) => serde_json::Value::Number((*i as i64).into()),
+        Value::SmallInt(i) => serde_json::Value::Number((*i as i64).into()),
+        Value::Int(i) => serde_json::Value::Number((*i as i64).into()),
+        Value::BigInt(i) => serde_json::Value::Number((*i).into()),
+        Value::HugeInt(i) => serde_json::Value::String(i.to_string()),
+        Value::UTinyInt(i) => serde_json::Value::Number((*i as u64).into()),
+        Value::USmallInt(i) => serde_json::Value::Number((*i as u64).into()),
+        Value::UInt(i) => serde_json::Value::Number((*i as u64).into()),
+        Value::UBigInt(i) => serde_json::Value::Number((*i).into()),
+        Value::Float(f) => {
+            serde_json::Number::from_f64(*f as f64).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+        }
+        Value::Double(f) => {
+            serde_json::Number::from_f64(*f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+        }
+        Value::Decimal(d) => serde_json::Value::String(d.to_string()),
+        Value::Timestamp(unit, value) => {
+            duckdb_timestamp_to_string(*unit, *value).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null)
+        }
+        Value::Text(text) | Value::Enum(text) => serde_json::Value::String(text.clone()),
+        Value::Blob(bytes) => {
+            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            serde_json::Value::String(format!("\\x{hex}"))
+        }
+        Value::Date32(days) => {
+            duckdb_date32_to_string(*days).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null)
+        }
+        Value::Time64(unit, value) => {
+            duckdb_time64_to_string(*unit, *value).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null)
+        }
+        Value::Interval { months, days, nanos } => {
+            serde_json::Value::String(duckdb_interval_to_string(*months, *days, *nanos))
+        }
+        Value::List(values) | Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(duckdb_owned_value_to_json).collect())
+        }
+        Value::Struct(entries) => serde_json::Value::Object(
+            entries.iter().map(|(key, value)| (key.clone(), duckdb_owned_value_to_json(value))).collect(),
+        ),
+        Value::Map(entries) => serde_json::Value::Array(
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    serde_json::json!({
+                        "key": duckdb_owned_value_to_json(key),
+                        "value": duckdb_owned_value_to_json(value),
+                    })
+                })
+                .collect(),
+        ),
+        Value::Union(value) => duckdb_owned_value_to_json(value),
     }
 }
 
@@ -183,7 +278,7 @@ pub fn duckdb_execute_with_max_rows(
     let start = std::time::Instant::now();
     let row_limit = query_result_row_limit(max_rows);
 
-    if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH", "PRAGMA"]) {
+    if starts_with_duckdb_result_sql_keyword(sql) {
         let mut stmt = con.prepare(sql).map_err(|e| e.to_string())?;
         let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
         let stmt_ref = rows.as_ref().ok_or("DuckDB statement unavailable")?;
@@ -207,6 +302,8 @@ pub fn duckdb_execute_with_max_rows(
         }
         Ok(db::QueryResult {
             columns,
+            column_types: Vec::new(),
+            column_sortables: vec![],
             rows: result_rows,
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
@@ -218,6 +315,8 @@ pub fn duckdb_execute_with_max_rows(
         let affected = con.execute(sql, []).map_err(|e| e.to_string())?;
         Ok(db::QueryResult {
             columns: vec![],
+            column_types: Vec::new(),
+            column_sortables: vec![],
             rows: vec![],
             affected_rows: affected as u64,
             execution_time_ms: start.elapsed().as_millis(),
@@ -308,6 +407,9 @@ pub fn agent_execute_query_params(
     if let Some(fetch_size) = options.fetch_size {
         params["fetchSize"] = serde_json::json!(fetch_size);
     }
+    if let Some(timeout_secs) = options.timeout_secs {
+        params["timeoutSecs"] = serde_json::json!(timeout_secs);
+    }
     params
 }
 
@@ -330,6 +432,9 @@ pub fn agent_execute_query_page_params(
     }
     if let Some(fetch_size) = options.fetch_size {
         params["fetchSize"] = serde_json::json!(fetch_size);
+    }
+    if let Some(timeout_secs) = options.timeout_secs {
+        params["timeoutSecs"] = serde_json::json!(timeout_secs);
     }
     params
 }
@@ -354,11 +459,14 @@ pub fn is_connection_error(err: &str) -> bool {
         || lower.contains("reset by peer")
         || lower.contains("timed out")
         || lower.contains("closed")
+        || lower.contains("关闭的连接")
+        || lower.contains("连接已关闭")
         || lower.contains("eof")
         || lower.contains("i/o error")
         || lower.contains("not connected")
         || lower.contains("end-of-file")
         || lower.contains("idle")
+        || lower.contains("communicating with the server")
         || is_os_connection_error(&lower)
 }
 
@@ -443,9 +551,11 @@ fn resolve_query_timeout(timeout_secs: Option<u64>) -> Option<Duration> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_execute(
     state: &AppState,
     pool_key: &str,
+    mysql_dialect: db::mysql::MySqlQueryDialect,
     database: Option<&str>,
     sql: &str,
     schema: Option<&str>,
@@ -460,12 +570,19 @@ pub async fn do_execute(
         .get(pool_key)
         .map(|config| config.attached_databases.iter().map(|database| database.name.clone()).collect::<Vec<_>>())
         .unwrap_or_default();
+    let pool_db_type = connection_database_type_for_pool_key(state, pool_key).await;
     let connections = state.connections.read().await;
     let pool = connections.get(pool_key).ok_or("Connection not found")?;
 
     match pool {
         PoolKind::DuckDb(con) => {
             let con = con.clone();
+            if let Some(ref execution_id) = options.execution_id {
+                let interrupt_handle = con.lock().map_err(|e| e.to_string())?.interrupt_handle();
+                state.running_queries.register_interrupt(execution_id, move || {
+                    interrupt_handle.interrupt();
+                });
+            }
             let sql = sql.to_string();
             let database = database.map(str::to_string);
             let attached_names = duckdb_attached_names;
@@ -488,7 +605,7 @@ pub async fn do_execute(
             wait_for_query_opt(
                 cancel_token,
                 query_timeout,
-                db::mysql::execute_query_with_max_rows(&p, sql, bare, max_rows),
+                db::mysql::execute_query_with_max_rows(&p, sql, bare, max_rows, mysql_dialect),
             )
             .await
         }
@@ -519,6 +636,17 @@ pub async fn do_execute(
             drop(connections);
             wait_for_query_opt(cancel_token, query_timeout, db::sqlite::execute_query_with_max_rows(&p, sql, max_rows))
                 .await
+        }
+        PoolKind::Rqlite(client) => {
+            let client = client.clone();
+            let max_rows = options.max_rows;
+            drop(connections);
+            wait_for_query_opt(
+                cancel_token,
+                query_timeout,
+                db::rqlite_driver::execute_query_with_max_rows(&client, sql, max_rows),
+            )
+            .await
         }
         PoolKind::ClickHouse(client) => {
             let client = client.clone();
@@ -568,30 +696,37 @@ pub async fn do_execute(
             let client = client.clone();
             let sql = sql.to_string();
             let database = database.map(|s| s.to_string());
-            let schema = schema.map(|s| s.to_string());
+            let schema = schema_for_execution_context(pool_db_type, schema).map(|s| s.to_string());
             let max_rows = options.max_rows;
+            let rpc_timeout = query_timeout;
             drop(connections);
             wait_for_query_opt(cancel_token, query_timeout, async move {
                 let mut client = client.lock().await;
                 if let Some(session_id) = options.result_session_id.as_deref() {
                     let params = agent_fetch_query_page_params(session_id, options.page_size.unwrap_or(MAX_ROWS));
-                    client.fetch_query_page(params).await
+                    client.fetch_query_page_with_timeout(params, rpc_timeout).await
                 } else if options.page_size.is_some() {
                     let params = agent_execute_query_page_params(&sql, database.as_deref(), schema.as_deref(), options);
-                    client.execute_query_page(params).await
+                    client.execute_query_page_with_timeout(params, rpc_timeout).await
                 } else {
                     let params = agent_execute_query_params(&sql, database.as_deref(), schema.as_deref(), options);
-                    client.execute_query(params).await
+                    client.execute_query_with_timeout(params, rpc_timeout).await
                 }
             })
             .await
             .map(|result| normalize_query_result_for_js(truncate_result_with_max_rows(result, max_rows)))
         }
         PoolKind::ExternalTabular(ext_pool) => {
-            if !starts_with_executable_sql_keyword(sql, &["SELECT", "WITH", "SHOW", "DESCRIBE", "EXPLAIN", "PRAGMA"]) {
+            if !starts_with_duckdb_result_sql_keyword(sql) {
                 return Err("External data sources are read-only. Only SELECT queries are supported.".to_string());
             }
             let con = ext_pool.cache.clone();
+            if let Some(ref execution_id) = options.execution_id {
+                let interrupt_handle = con.lock().map_err(|e| e.to_string())?.interrupt_handle();
+                state.running_queries.register_interrupt(execution_id, move || {
+                    interrupt_handle.interrupt();
+                });
+            }
             let sql = sql.to_string();
             let max_rows = options.max_rows;
             drop(connections);
@@ -609,12 +744,14 @@ pub async fn do_execute(
             let session = session.clone();
             let sql = sql.to_string();
             let schema = schema.map(str::to_string);
-            let database = config.effective_database().unwrap_or("").to_string();
+            let database = database.unwrap_or_else(|| config.effective_database().unwrap_or("")).to_string();
             let max_rows = options.max_rows;
+            let plugin_timeout = query_timeout;
             drop(connections);
             wait_for_query_opt(cancel_token, query_timeout, async move {
-                let params = external_driver_query_params(config.as_ref(), &sql, &database, schema.as_deref());
-                session.invoke::<db::QueryResult>("executeQuery", params).await
+                let params =
+                    external_driver_query_params(config.as_ref(), &sql, &database, schema.as_deref(), &options);
+                session.invoke_with_timeout::<db::QueryResult>("executeQuery", params, plugin_timeout).await
             })
             .await
             .map(|result| normalize_query_result_for_js(truncate_result_with_max_rows(result, max_rows)))
@@ -627,13 +764,22 @@ fn external_driver_query_params(
     sql: &str,
     database: &str,
     schema: Option<&str>,
+    options: &QueryExecutionOptions,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut params = serde_json::json!({
         "connection": config,
         "sql": sql,
         "database": database,
         "schema": schema,
-    })
+        "maxRows": options.max_rows.unwrap_or(MAX_ROWS),
+    });
+    if let Some(fetch_size) = options.fetch_size {
+        params["fetchSize"] = serde_json::json!(fetch_size);
+    }
+    if let Some(timeout_secs) = options.timeout_secs {
+        params["timeoutSecs"] = serde_json::json!(timeout_secs);
+    }
+    params
 }
 
 pub async fn execute_sql_statement(
@@ -665,12 +811,19 @@ pub async fn execute_sql_statement_with_options(
     cancel_token: Option<CancellationToken>,
     options: QueryExecutionOptions,
 ) -> Result<db::QueryResult, String> {
-    // When database is not set, fall back to the shared (non-session-scoped) pool
-    // to avoid creating a connection without a default database context.
-    // This is particularly important for Doris/StarRocks, where metadata connections
-    // omit the database and would cause "Current database is not selected" errors.
+    // MongoDB connections use shell-style commands dispatched through the
+    // frontend parser. Queries that fall through to the generic SQL executor
+    // (e.g. typos) must be rejected before any pool/key creation so that
+    // session-scoped pools do not leak MongoDB Clients and SSH tunnels.
+    if connection_is_mongodb(state, connection_id).await {
+        return Err("Use MongoDB-specific commands".to_string());
+    }
+
+    // When a query tab has a client session, keep even database-less execution
+    // on that tab-scoped pool so connection-level state (for example MySQL @vars)
+    // survives across runs.
     let pool_key = if database.is_empty() {
-        state.get_or_create_pool(connection_id, None).await?
+        state.get_or_create_pool_for_session(connection_id, None, options.client_session_id.as_deref()).await?
     } else {
         state
             .get_or_create_pool_for_session(connection_id, Some(database), options.client_session_id.as_deref())
@@ -681,17 +834,17 @@ pub async fn execute_sql_statement_with_options(
         return Err(canceled_error());
     }
 
-    let result = do_execute(state, &pool_key, Some(database), sql, schema, cancel_token.clone(), options.clone()).await;
+    let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
+    let result =
+        do_execute(state, &pool_key, mysql_dialect, Some(database), sql, schema, cancel_token.clone(), options.clone())
+            .await;
 
     match &result {
         Err(e) if is_connection_error(e) && !is_canceled(&cancel_token) => {
             let db_opt = if database.is_empty() { None } else { Some(database) };
-            let new_key = if database.is_empty() {
-                state.reconnect_pool(connection_id, db_opt).await?
-            } else {
-                state.reconnect_pool_for_session(connection_id, db_opt, options.client_session_id.as_deref()).await?
-            };
-            do_execute(state, &new_key, Some(database), sql, schema, cancel_token, options).await
+            let new_key =
+                state.reconnect_pool_for_session(connection_id, db_opt, options.client_session_id.as_deref()).await?;
+            do_execute(state, &new_key, mysql_dialect, Some(database), sql, schema, cancel_token, options).await
         }
         _ => result,
     }
@@ -705,7 +858,7 @@ pub async fn close_query_session(
     client_session_id: Option<&str>,
 ) -> Result<bool, String> {
     let pool_key = if database.is_empty() {
-        state.get_or_create_pool(connection_id, None).await?
+        state.get_or_create_pool_for_session(connection_id, None, client_session_id).await?
     } else {
         state.get_or_create_pool_for_session(connection_id, Some(database), client_session_id).await?
     };
@@ -752,8 +905,13 @@ pub async fn execute_multi_core_with_options(
     cancel_token: Option<CancellationToken>,
     options: QueryExecutionOptions,
 ) -> Result<Vec<db::QueryResult>, String> {
+    // Reject MongoDB queries that fall through to the generic executor.
+    if connection_is_mongodb(state, connection_id).await {
+        return Err("Use MongoDB-specific commands".to_string());
+    }
+
     let pool_key = if database.is_empty() {
-        state.get_or_create_pool(connection_id, None).await?
+        state.get_or_create_pool_for_session(connection_id, None, options.client_session_id.as_deref()).await?
     } else {
         state
             .get_or_create_pool_for_session(connection_id, Some(database), options.client_session_id.as_deref())
@@ -774,6 +932,15 @@ pub async fn execute_multi_core_with_options(
         || split_sql_statements(sql),
         |db_type| crate::sql::split_sql_statements_for_database(sql, db_type),
     );
+
+    let mysql_pool = {
+        let connections = state.connections.read().await;
+        match connections.get(&pool_key) {
+            Some(PoolKind::Mysql(pool, mode)) => Some((pool.clone(), *mode)),
+            _ => None,
+        }
+    };
+
     if statements.len() <= 1 {
         let single_sql = statements.into_iter().next().unwrap_or_default();
         let result = execute_sql_statement_with_options(
@@ -789,18 +956,15 @@ pub async fn execute_multi_core_with_options(
         return Ok(vec![result]);
     }
 
+    if let Some((pool, mode)) = mysql_pool {
+        let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
+        return execute_multi_mysql(&pool, mode, mysql_dialect, &statements, cancel_token, options).await;
+    }
+
     let mut results = Vec::with_capacity(statements.len());
     for stmt in &statements {
         if is_canceled(&cancel_token) {
-            results.push(db::QueryResult {
-                columns: vec!["Error".to_string()],
-                rows: vec![vec![serde_json::Value::String(canceled_error())]],
-                affected_rows: 0,
-                execution_time_ms: 0,
-                truncated: false,
-                session_id: None,
-                has_more: false,
-            });
+            results.push(error_query_result(canceled_error()));
             break;
         }
         match execute_sql_statement_with_options(
@@ -816,20 +980,64 @@ pub async fn execute_multi_core_with_options(
         {
             Ok(r) => results.push(r),
             Err(e) => {
-                results.push(db::QueryResult {
-                    columns: vec!["Error".to_string()],
-                    rows: vec![vec![serde_json::Value::String(e)]],
-                    affected_rows: 0,
-                    execution_time_ms: 0,
-                    truncated: false,
-                    session_id: None,
-                    has_more: false,
-                });
+                results.push(error_query_result(e));
             }
         }
     }
 
     Ok(results)
+}
+
+async fn execute_multi_mysql(
+    pool: &db::mysql::MySqlPool,
+    mode: crate::connection::MysqlMode,
+    dialect: db::mysql::MySqlQueryDialect,
+    statements: &[String],
+    cancel_token: Option<CancellationToken>,
+    options: QueryExecutionOptions,
+) -> Result<Vec<db::QueryResult>, String> {
+    let query_timeout = resolve_query_timeout(options.timeout_secs);
+    let bare = mode == crate::connection::MysqlMode::Bare;
+    let max_rows = options.max_rows;
+    let mut conn = match db::mysql::get_conn_with_health_check(pool).await {
+        Ok(conn) => conn,
+        Err(err) => return Ok(vec![error_query_result(err)]),
+    };
+    let mut results = Vec::with_capacity(statements.len());
+
+    for stmt in statements {
+        if is_canceled(&cancel_token) {
+            results.push(error_query_result(canceled_error()));
+            break;
+        }
+
+        match wait_for_query_opt(
+            cancel_token.clone(),
+            query_timeout,
+            db::mysql::execute_query_on_conn_with_max_rows(&mut conn, stmt, bare, max_rows, dialect),
+        )
+        .await
+        {
+            Ok(result) => results.push(result),
+            Err(err) => results.push(error_query_result(err)),
+        }
+    }
+
+    Ok(results)
+}
+
+fn error_query_result(message: String) -> db::QueryResult {
+    db::QueryResult {
+        columns: vec!["Error".to_string()],
+        column_types: Vec::new(),
+        column_sortables: vec![],
+        rows: vec![vec![serde_json::Value::String(message)]],
+        affected_rows: 0,
+        execution_time_ms: 0,
+        truncated: false,
+        session_id: None,
+        has_more: false,
+    }
 }
 
 async fn execute_multi_sqlserver(
@@ -847,6 +1055,8 @@ async fn execute_multi_sqlserver(
         if is_canceled(&cancel_token) {
             all_results.push(db::QueryResult {
                 columns: vec!["Error".to_string()],
+                column_types: Vec::new(),
+                column_sortables: vec![],
                 rows: vec![vec![serde_json::Value::String(canceled_error())]],
                 affected_rows: 0,
                 execution_time_ms: 0,
@@ -879,6 +1089,8 @@ async fn execute_multi_sqlserver(
             Err(e) => {
                 all_results.push(db::QueryResult {
                     columns: vec!["Error".to_string()],
+                    column_types: Vec::new(),
+                    column_sortables: vec![],
                     rows: vec![vec![serde_json::Value::String(e)]],
                     affected_rows: 0,
                     execution_time_ms: 0,
@@ -893,6 +1105,8 @@ async fn execute_multi_sqlserver(
     if all_results.is_empty() {
         all_results.push(db::QueryResult {
             columns: vec![],
+            column_types: Vec::new(),
+            column_sortables: vec![],
             rows: vec![],
             affected_rows: 0,
             execution_time_ms: 0,
@@ -911,6 +1125,7 @@ pub async fn execute_statements(
     database: &str,
     statements: &[String],
     schema: Option<&str>,
+    timeout_secs: Option<u64>,
 ) -> Result<db::QueryResult, String> {
     let pool_key = if database.is_empty() {
         connection_id.to_string()
@@ -920,9 +1135,21 @@ pub async fn execute_statements(
 
     let mut total_affected: u64 = 0;
     let start = std::time::Instant::now();
+    let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
 
     for (i, sql) in statements.iter().enumerate() {
-        match do_execute(state, &pool_key, Some(database), sql, schema, None, QueryExecutionOptions::default()).await {
+        match do_execute(
+            state,
+            &pool_key,
+            mysql_dialect,
+            Some(database),
+            sql,
+            schema,
+            None,
+            QueryExecutionOptions { timeout_secs, ..Default::default() },
+        )
+        .await
+        {
             Ok(result) => {
                 total_affected += result.affected_rows;
             }
@@ -943,6 +1170,8 @@ pub async fn execute_statements(
 
     Ok(db::QueryResult {
         columns: vec![],
+        column_types: Vec::new(),
+        column_sortables: vec![],
         rows: vec![],
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
@@ -981,7 +1210,9 @@ pub async fn execute_statements_in_transaction(
             PoolKind::Postgres(pg) => TxPath::Pg(pg.clone()),
             PoolKind::Mysql(mp, _mode) => TxPath::Mysql(mp.clone(), false),
             PoolKind::Sqlite(sq) => TxPath::Sqlite(sq.clone()),
-            PoolKind::ClickHouse(_) | PoolKind::SqlServer(_) | PoolKind::Agent(_) => TxPath::Explicit,
+            PoolKind::ClickHouse(_) | PoolKind::Rqlite(_) | PoolKind::SqlServer(_) | PoolKind::Agent(_) => {
+                TxPath::Explicit
+            }
             PoolKind::DuckDb(_)
             | PoolKind::Redis(_)
             | PoolKind::MongoDb(_)
@@ -996,9 +1227,13 @@ pub async fn execute_statements_in_transaction(
         Some(TxPath::Mysql(pool, _bare)) => exec_tx_mysql_inner(pool, statements, start).await,
         Some(TxPath::Sqlite(pool)) => exec_tx_sqlite_inner(pool, statements, start).await,
         Some(TxPath::Explicit) => {
-            exec_tx_explicit_inner(state, &pool_key, Some(database), statements, schema, start).await
+            let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
+            exec_tx_explicit_inner(state, &pool_key, mysql_dialect, Some(database), statements, schema, start).await
         }
-        Some(TxPath::None) => exec_tx_none_inner(state, &pool_key, Some(database), statements, schema, start).await,
+        Some(TxPath::None) => {
+            let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
+            exec_tx_none_inner(state, &pool_key, mysql_dialect, Some(database), statements, schema, start).await
+        }
         None => Err("Connection not found for transaction".to_string()),
     }
 }
@@ -1039,6 +1274,8 @@ async fn exec_tx_pg_inner(
     match tx_result {
         Ok(total_affected) => Ok(db::QueryResult {
             columns: vec![],
+            column_types: Vec::new(),
+            column_sortables: vec![],
             rows: vec![],
             affected_rows: total_affected,
             execution_time_ms: start.elapsed().as_millis(),
@@ -1071,7 +1308,7 @@ async fn exec_tx_mysql_inner(
     statements: &[String],
     start: std::time::Instant,
 ) -> Result<db::QueryResult, String> {
-    let mut conn = pool.get_conn().await.map_err(|e| format!("Failed to acquire connection: {}", e))?;
+    let mut conn = db::mysql::get_conn_with_health_check(&pool).await?;
     conn.query_drop("START TRANSACTION").await.map_err(|e| format!("Failed to begin transaction: {}", e))?;
     let mut total_affected: u64 = 0;
     for (i, sql) in statements.iter().enumerate() {
@@ -1086,6 +1323,8 @@ async fn exec_tx_mysql_inner(
     conn.query_drop("COMMIT").await.map_err(|e| format!("COMMIT failed: {}", e))?;
     Ok(db::QueryResult {
         columns: vec![],
+        column_types: Vec::new(),
+        column_sortables: vec![],
         rows: vec![],
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
@@ -1117,6 +1356,8 @@ async fn exec_tx_sqlite_inner(
             conn.execute_batch("COMMIT").map_err(|e| format!("COMMIT failed: {}", e))?;
             Ok(db::QueryResult {
                 columns: vec![],
+                column_types: Vec::new(),
+                column_sortables: vec![],
                 rows: vec![],
                 affected_rows: total_affected,
                 execution_time_ms: start.elapsed().as_millis(),
@@ -1133,6 +1374,7 @@ async fn exec_tx_sqlite_inner(
 async fn exec_tx_explicit_inner(
     state: &AppState,
     pool_key: &str,
+    mysql_dialect: db::mysql::MySqlQueryDialect,
     database: Option<&str>,
     statements: &[String],
     schema: Option<&str>,
@@ -1140,26 +1382,47 @@ async fn exec_tx_explicit_inner(
 ) -> Result<db::QueryResult, String> {
     let conns = state.connections.read().await;
     if let Some(crate::connection::PoolKind::Agent(client)) = conns.get(pool_key) {
+        let db_type = connection_database_type_for_pool_key(state, pool_key).await;
+        let schema = schema_for_execution_context(db_type, schema);
         let mut client = client.lock().await;
         let result: db::QueryResult = client.execute_transaction(database, statements, schema).await?;
         return Ok(db::QueryResult { execution_time_ms: start.elapsed().as_millis(), ..result });
     }
     drop(conns);
 
-    do_execute(state, pool_key, database, "BEGIN TRANSACTION", schema, None, QueryExecutionOptions::default())
-        .await
-        .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+    do_execute(
+        state,
+        pool_key,
+        mysql_dialect,
+        database,
+        "BEGIN TRANSACTION",
+        schema,
+        None,
+        QueryExecutionOptions::default(),
+    )
+    .await
+    .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
     let mut total_affected: u64 = 0;
     for (i, sql) in statements.iter().enumerate() {
-        match do_execute(state, pool_key, database, sql, schema, None, QueryExecutionOptions::default()).await {
+        match do_execute(state, pool_key, mysql_dialect, database, sql, schema, None, QueryExecutionOptions::default())
+            .await
+        {
             Ok(result) => {
                 total_affected += result.affected_rows;
             }
             Err(e) => {
-                if let Err(rb_err) =
-                    do_execute(state, pool_key, database, "ROLLBACK", schema, None, QueryExecutionOptions::default())
-                        .await
+                if let Err(rb_err) = do_execute(
+                    state,
+                    pool_key,
+                    mysql_dialect,
+                    database,
+                    "ROLLBACK",
+                    schema,
+                    None,
+                    QueryExecutionOptions::default(),
+                )
+                .await
                 {
                     log::error!("ROLLBACK failed after statement {} error: {}", i + 1, rb_err);
                 }
@@ -1168,12 +1431,14 @@ async fn exec_tx_explicit_inner(
         }
     }
 
-    do_execute(state, pool_key, database, "COMMIT", schema, None, QueryExecutionOptions::default())
+    do_execute(state, pool_key, mysql_dialect, database, "COMMIT", schema, None, QueryExecutionOptions::default())
         .await
         .map_err(|e| format!("COMMIT failed: {}", e))?;
 
     Ok(db::QueryResult {
         columns: vec![],
+        column_types: Vec::new(),
+        column_sortables: vec![],
         rows: vec![],
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
@@ -1186,6 +1451,7 @@ async fn exec_tx_explicit_inner(
 async fn exec_tx_none_inner(
     state: &AppState,
     pool_key: &str,
+    mysql_dialect: db::mysql::MySqlQueryDialect,
     database: Option<&str>,
     statements: &[String],
     schema: Option<&str>,
@@ -1194,7 +1460,9 @@ async fn exec_tx_none_inner(
     let mut total_affected: u64 = 0;
     for (i, sql) in statements.iter().enumerate() {
         log::info!("[query][tx-none:statement:start] index={} sql={}", i + 1, sql);
-        match do_execute(state, pool_key, database, sql, schema, None, QueryExecutionOptions::default()).await {
+        match do_execute(state, pool_key, mysql_dialect, database, sql, schema, None, QueryExecutionOptions::default())
+            .await
+        {
             Ok(result) => {
                 total_affected += result.affected_rows;
                 log::info!("[query][tx-none:statement:done] index={} affected_rows={}", i + 1, result.affected_rows);
@@ -1212,6 +1480,8 @@ async fn exec_tx_none_inner(
 
     Ok(db::QueryResult {
         columns: vec![],
+        column_types: Vec::new(),
+        column_sortables: vec![],
         rows: vec![],
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
@@ -1224,7 +1494,7 @@ async fn exec_tx_none_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::connection::{ConnectionConfig, DatabaseType, ProxyType};
+    use crate::models::connection::{ConnectionConfig, DatabaseType};
 
     #[tokio::test]
     async fn wait_for_query_returns_cancelled_when_token_is_cancelled() {
@@ -1235,6 +1505,8 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
             Ok(db::QueryResult {
                 columns: vec![],
+                column_types: Vec::new(),
+                column_sortables: vec![],
                 rows: vec![],
                 affected_rows: 0,
                 execution_time_ms: 0,
@@ -1254,6 +1526,8 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
             Ok(db::QueryResult {
                 columns: vec![],
+                column_types: Vec::new(),
+                column_sortables: vec![],
                 rows: vec![],
                 affected_rows: 0,
                 execution_time_ms: 0,
@@ -1275,6 +1549,7 @@ mod tests {
         assert!(is_connection_error("Connection timed out"));
         assert!(is_connection_error("socket closed"));
         assert!(is_connection_error("unexpected eof"));
+        assert!(is_connection_error("Error occurred while creating a new object: error communicating with the server"));
     }
 
     #[test]
@@ -1286,6 +1561,8 @@ mod tests {
         assert!(is_connection_error("ORA-03113: end-of-file on communication channel"));
         assert!(is_connection_error("ORA-03114: not connected to Oracle"));
         assert!(is_connection_error("ORA-03135: connection lost contact"));
+        assert!(is_connection_error("Agent RPC error (-1): java.sql.SQLRecoverableException: 关闭的连接"));
+        assert!(is_connection_error("java.sql.SQLRecoverableException: 连接已关闭"));
     }
 
     #[test]
@@ -1316,13 +1593,13 @@ mod tests {
         let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
         let result = duckdb_execute(
             &con,
-            "SELECT 3.14159::DOUBLE AS pi, 0.5::DOUBLE AS half, 99.99::DOUBLE AS price, 1.0::DOUBLE AS one",
+            "SELECT 12.34567::DOUBLE AS sample, 0.5::DOUBLE AS half, 99.99::DOUBLE AS price, 1.0::DOUBLE AS one",
         )
         .expect("execute double query");
 
-        assert_eq!(result.columns, vec!["pi", "half", "price", "one"]);
+        assert_eq!(result.columns, vec!["sample", "half", "price", "one"]);
         let row = &result.rows[0];
-        assert_eq!(row[0], serde_json::json!(3.14159));
+        assert_eq!(row[0], serde_json::json!(12.34567));
         assert_eq!(row[1], serde_json::json!(0.5));
         assert_eq!(row[2], serde_json::json!(99.99));
         assert_eq!(row[3], serde_json::json!(1.0));
@@ -1343,6 +1620,32 @@ mod tests {
     }
 
     #[test]
+    fn duckdb_execute_returns_rows_for_from_first_query() {
+        let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
+        con.execute_batch("CREATE TABLE users (id INTEGER, name VARCHAR)").expect("create table");
+        con.execute_batch("INSERT INTO users VALUES (2, 'Grace'), (1, 'Ada')").expect("insert");
+
+        let result = duckdb_execute(&con, "FROM users ORDER BY id").expect("execute from-first query");
+
+        assert_eq!(result.columns, vec!["id", "name"]);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0], vec![serde_json::json!(1), serde_json::json!("Ada")]);
+        assert_eq!(result.rows[1], vec![serde_json::json!(2), serde_json::json!("Grace")]);
+    }
+
+    #[test]
+    fn duckdb_execute_returns_rows_for_summarize_query() {
+        let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
+        con.execute_batch("CREATE TABLE metrics (value INTEGER)").expect("create table");
+        con.execute_batch("INSERT INTO metrics VALUES (1), (2), (NULL)").expect("insert");
+
+        let result = duckdb_execute(&con, "SUMMARIZE metrics").expect("execute summarize query");
+
+        assert!(!result.columns.is_empty());
+        assert!(!result.rows.is_empty());
+    }
+
+    #[test]
     fn duckdb_execute_handles_various_types() {
         let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
         let result = duckdb_execute(
@@ -1357,6 +1660,46 @@ mod tests {
         assert_eq!(row[2], serde_json::Value::String("hello".to_string()));
         assert!(row[3].is_number());
         assert_eq!(row[4], serde_json::json!(123456789012345_i64));
+    }
+
+    #[test]
+    fn duckdb_execute_returns_list_values_as_json_arrays() {
+        let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
+        let result = duckdb_execute(&con, "SELECT ['a','b','c','d'];").expect("execute list query");
+
+        assert_eq!(result.rows, vec![vec![serde_json::json!(["a", "b", "c", "d"])]]);
+    }
+
+    #[test]
+    fn duckdb_execute_preserves_nulls_inside_list_values() {
+        let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
+        let result = duckdb_execute(&con, "SELECT [1, NULL, 3] AS items;").expect("execute nullable list query");
+
+        assert_eq!(result.columns, vec!["items"]);
+        assert_eq!(result.rows, vec![vec![serde_json::json!([1, null, 3])]]);
+    }
+
+    #[test]
+    fn duckdb_execute_returns_nested_complex_values_as_json() {
+        let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
+        let result = duckdb_execute(
+            &con,
+            "SELECT {'name': 'Ada', 'scores': [10, 20]} AS profile, MAP(['x', 'y'], [1, 2]) AS lookup, [1, 2, 3]::INTEGER[3] AS fixed_items",
+        )
+        .expect("execute complex values query");
+
+        assert_eq!(result.columns, vec!["profile", "lookup", "fixed_items"]);
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                serde_json::json!({ "name": "Ada", "scores": [10, 20] }),
+                serde_json::json!([
+                    { "key": "x", "value": 1 },
+                    { "key": "y", "value": 2 },
+                ]),
+                serde_json::json!([1, 2, 3]),
+            ]]
+        );
     }
 
     #[test]
@@ -1397,25 +1740,14 @@ mod tests {
             visible_databases: None,
             attached_databases: Vec::new(),
             color: None,
-            ssh_enabled: false,
-            ssh_host: String::new(),
-            ssh_port: 22,
-            ssh_user: String::new(),
-            ssh_password: String::new(),
-            ssh_key_path: String::new(),
-            ssh_key_passphrase: String::new(),
-            ssh_expose_lan: false,
-            ssh_connect_timeout_secs: 5,
+            transport_layers: Vec::new(),
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
-            proxy_enabled: false,
-            proxy_type: ProxyType::Socks5,
-            proxy_host: String::new(),
-            proxy_port: 1080,
-            proxy_username: String::new(),
-            proxy_password: String::new(),
+            idle_timeout_secs: 60,
             ssl: false,
             ca_cert_path: String::new(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
             sysdba: false,
             oracle_connection_type: None,
             connection_string: Some("jdbc:h2:mem:test".to_string()),
@@ -1426,18 +1758,33 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
         };
 
-        let params = external_driver_query_params(&config, "SELECT * FROM events", "analytics", Some("app"));
+        let params = external_driver_query_params(
+            &config,
+            "SELECT * FROM events",
+            "analytics",
+            Some("app"),
+            &QueryExecutionOptions {
+                max_rows: Some(500),
+                fetch_size: Some(250),
+                timeout_secs: Some(600),
+                ..Default::default()
+            },
+        );
 
         assert_eq!(params["connection"]["id"], "jdbc-1");
         assert_eq!(params["sql"], "SELECT * FROM events");
         assert_eq!(params["database"], "analytics");
         assert_eq!(params["schema"], "app");
+        assert_eq!(params["maxRows"], 500);
+        assert_eq!(params["fetchSize"], 250);
+        assert_eq!(params["timeoutSecs"], 600);
     }
 
     #[test]
@@ -1446,7 +1793,12 @@ mod tests {
             "SELECT * FROM events",
             Some("analytics"),
             Some("app"),
-            QueryExecutionOptions { max_rows: Some(500), fetch_size: Some(250), ..Default::default() },
+            QueryExecutionOptions {
+                max_rows: Some(500),
+                fetch_size: Some(250),
+                timeout_secs: Some(600),
+                ..Default::default()
+            },
         );
 
         assert_eq!(params["sql"], "SELECT * FROM events");
@@ -1454,6 +1806,14 @@ mod tests {
         assert_eq!(params["schema"], "app");
         assert_eq!(params["maxRows"], 500);
         assert_eq!(params["fetchSize"], 250);
+        assert_eq!(params["timeoutSecs"], 600);
+    }
+
+    #[test]
+    fn iris_execution_context_omits_schema() {
+        assert_eq!(schema_for_execution_context(Some(DatabaseType::Iris), Some("SQLUser")), None);
+        assert_eq!(schema_for_execution_context(Some(DatabaseType::Oracle), Some("APP")), Some("APP"));
+        assert_eq!(schema_for_execution_context(None, Some("APP")), Some("APP"));
     }
 
     #[test]
@@ -1465,6 +1825,7 @@ mod tests {
         assert!(params.get("schema").is_none());
         assert_eq!(params["maxRows"], MAX_ROWS);
         assert!(params.get("fetchSize").is_none());
+        assert!(params.get("timeoutSecs").is_none());
     }
 
     #[test]
@@ -1473,7 +1834,12 @@ mod tests {
             "SELECT * FROM events",
             Some("analytics"),
             Some("app"),
-            QueryExecutionOptions { page_size: Some(500), fetch_size: Some(250), ..Default::default() },
+            QueryExecutionOptions {
+                page_size: Some(500),
+                fetch_size: Some(250),
+                timeout_secs: Some(600),
+                ..Default::default()
+            },
         );
 
         assert_eq!(params["sql"], "SELECT * FROM events");
@@ -1481,6 +1847,7 @@ mod tests {
         assert_eq!(params["schema"], "app");
         assert_eq!(params["pageSize"], 500);
         assert_eq!(params["fetchSize"], 250);
+        assert_eq!(params["timeoutSecs"], 600);
         assert_eq!(params["maxRows"], MAX_ROWS);
     }
 
@@ -1503,6 +1870,8 @@ mod tests {
     fn query_results_convert_unsafe_json_integers_to_strings_for_js() {
         let result = db::QueryResult {
             columns: vec!["id".to_string(), "nested".to_string()],
+            column_types: Vec::new(),
+            column_sortables: vec![],
             rows: vec![vec![
                 serde_json::json!(2_041_797_190_226_354_178_i64),
                 serde_json::json!([1, 2_041_797_190_226_354_178_i64]),

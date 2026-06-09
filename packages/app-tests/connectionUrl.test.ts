@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
-import test from "node:test";
-import { parseConnectionUrl } from "../../apps/desktop/src/lib/connectionUrl.ts";
+import { test } from "vitest";
+import { normalizeMongoConnectionString, parseConnectionUrl } from "../../apps/desktop/src/lib/connectionUrl.ts";
 
 test("parses postgres connection URLs", () => {
   assert.deepEqual(parseConnectionUrl("postgresql://alice:secret@db.example.com:5433/app?sslmode=require"), {
@@ -12,6 +12,21 @@ test("parses postgres connection URLs", () => {
     username: "alice",
     password: "secret",
     database: "app",
+    urlParams: "sslmode=require",
+    ssl: true,
+  });
+});
+
+test("parses KWDB connection URLs", () => {
+  assert.deepEqual(parseConnectionUrl("kwdb://root:secret@kw.example.com/defaultdb?sslmode=require"), {
+    dbType: "kwdb",
+    driverProfile: "kwdb",
+    driverLabel: "KWDB",
+    host: "kw.example.com",
+    port: 26257,
+    username: "root",
+    password: "secret",
+    database: "defaultdb",
     urlParams: "sslmode=require",
     ssl: true,
   });
@@ -33,6 +48,50 @@ test("parses mysql URLs with encoded credentials", () => {
 test("parses mysql TLS URL params into the SSL switch state", () => {
   assert.equal(parseConnectionUrl("mysql://root@tidb.example.com:4000/test?ssl-mode=required").ssl, true);
   assert.equal(parseConnectionUrl("mysql://root@tidb.example.com:4000/test?require_ssl=true").ssl, true);
+});
+
+test("parses TiDB Cloud MySQL URLs as TLS connections", () => {
+  const parsed = parseConnectionUrl(
+    "mysql://root:secret@gateway01.us-west-2.prod.aws.tidbcloud.com:4000/test",
+  );
+
+  assert.equal(parsed.dbType, "mysql");
+  assert.equal(parsed.ssl, true);
+});
+
+test("parses MySQL JDBC user and password URL params as credentials", () => {
+  const parsed = parseConnectionUrl(
+    "jdbc:mysql://127.0.0.1:1234/example?user=admin&password=pwd&useUnicode=true&characterEncoding=UTF8&useSSL=false",
+  );
+
+  assert.equal(parsed.dbType, "mysql");
+  assert.equal(parsed.host, "127.0.0.1");
+  assert.equal(parsed.port, 1234);
+  assert.equal(parsed.username, "admin");
+  assert.equal(parsed.password, "pwd");
+  assert.equal(parsed.database, "example");
+  assert.equal(parsed.urlParams, "useUnicode=true&characterEncoding=UTF8&useSSL=false");
+});
+
+test("leaves non-JDBC MySQL user and password URL params untouched", () => {
+  const parsed = parseConnectionUrl("mysql://127.0.0.1:1234/example?user=admin&password=pwd&charset=utf8mb4");
+
+  assert.equal(parsed.username, "");
+  assert.equal(parsed.password, "");
+  assert.equal(parsed.urlParams, "user=admin&password=pwd&charset=utf8mb4");
+});
+
+test("parses Redis insecure TLS URL fragments into URL params", () => {
+  const parsed = parseConnectionUrl("rediss://default:secret@redis.example.com:6379/0#insecure");
+
+  assert.equal(parsed.dbType, "redis");
+  assert.equal(parsed.host, "redis.example.com");
+  assert.equal(parsed.port, 6379);
+  assert.equal(parsed.username, "default");
+  assert.equal(parsed.password, "secret");
+  assert.equal(parsed.database, "0");
+  assert.equal(parsed.urlParams, "insecure=true");
+  assert.equal(parsed.ssl, true);
 });
 
 test("parses JDBC URLs by using the inner database URL", () => {
@@ -69,6 +128,50 @@ test("parses TDengine WebSocket JDBC URLs", () => {
   assert.equal(parsed.password, "taosdata");
   assert.equal(parsed.database, "power");
   assert.equal(parsed.urlParams, "timezone=UTC");
+});
+
+test("parses XuguDB JDBC URLs", () => {
+  const parsed = parseConnectionUrl("jdbc:xugu://alice:secret@xugu.example.com:5138/demo?charset=utf8");
+
+  assert.equal(parsed.dbType, "xugu");
+  assert.equal(parsed.driverProfile, "xugu");
+  assert.equal(parsed.driverLabel, "XuguDB");
+  assert.equal(parsed.host, "xugu.example.com");
+  assert.equal(parsed.port, 5138);
+  assert.equal(parsed.username, "alice");
+  assert.equal(parsed.password, "secret");
+  assert.equal(parsed.database, "demo");
+  assert.equal(parsed.urlParams, "charset=utf8");
+});
+
+test("parses Apache IoTDB JDBC URLs", () => {
+  const parsed = parseConnectionUrl("jdbc:iotdb://root:secret@iotdb.example.com:6667?sql_dialect=table");
+
+  assert.equal(parsed.dbType, "iotdb");
+  assert.equal(parsed.driverProfile, "iotdb");
+  assert.equal(parsed.driverLabel, "Apache IoTDB");
+  assert.equal(parsed.host, "iotdb.example.com");
+  assert.equal(parsed.port, 6667);
+  assert.equal(parsed.username, "root");
+  assert.equal(parsed.password, "secret");
+  assert.equal(parsed.database, undefined);
+  assert.equal(parsed.urlParams, "sql_dialect=table");
+});
+
+test("parses GBase 8s JDBC URLs", () => {
+  const parsed = parseConnectionUrl(
+    "jdbc:gbasedbt-sqli://gbasedbt:secret@gbase.example.com:20013/testdb:GBASEDBTSERVER=gbase01;CLIENT_LOCALE=zh_cn.utf8",
+  );
+
+  assert.equal(parsed.dbType, "gbase");
+  assert.equal(parsed.driverProfile, "gbase8s");
+  assert.equal(parsed.driverLabel, "GBase 8s");
+  assert.equal(parsed.host, "gbase.example.com");
+  assert.equal(parsed.port, 20013);
+  assert.equal(parsed.username, "gbasedbt");
+  assert.equal(parsed.password, "secret");
+  assert.equal(parsed.database, "testdb");
+  assert.equal(parsed.urlParams, "GBASEDBTSERVER=gbase01;CLIENT_LOCALE=zh_cn.utf8");
 });
 
 test("parses UCanAccess JDBC URLs as Access database files", () => {
@@ -120,6 +223,20 @@ test("parses Oracle JDBC SID URLs", () => {
   assert.equal(parsed.oracleConnectionType, "sid");
 });
 
+test("parses Oracle JDBC descriptors and keeps the original connection string", () => {
+  const source =
+    "jdbc:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=oracle.example.com)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=orcl)))";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.dbType, "oracle");
+  assert.equal(parsed.driverProfile, "oracle");
+  assert.equal(parsed.host, "oracle.example.com");
+  assert.equal(parsed.port, 1521);
+  assert.equal(parsed.database, "orcl");
+  assert.equal(parsed.oracleConnectionType, "service_name");
+  assert.equal(parsed.connectionString, source);
+});
+
 test("keeps MongoDB URLs as connection strings", () => {
   const source = "mongodb+srv://reader:secret@cluster.example.com/app?retryWrites=true";
   const parsed = parseConnectionUrl(source);
@@ -132,6 +249,21 @@ test("keeps MongoDB URLs as connection strings", () => {
   assert.equal(parsed.connectionString, source);
   assert.equal(parsed.useMongoUrl, true);
   assert.equal(parsed.ssl, true);
+});
+
+test("normalizes MongoDB URL credentials when reserved characters can be parsed safely", () => {
+  const parsed = parseConnectionUrl("mongodb://reader:pa@ss:word@mongo.example.com/admin?authSource=admin");
+
+  assert.equal(parsed.username, "reader");
+  assert.equal(parsed.password, "pa@ss:word");
+  assert.equal(parsed.connectionString, "mongodb://reader:pa%40ss%3Aword@mongo.example.com/admin?authSource=admin");
+});
+
+test("normalizes invalid percent escapes in MongoDB URL credentials", () => {
+  assert.equal(
+    normalizeMongoConnectionString("mongodb://reader:pa%ss@mongo.example.com/admin"),
+    "mongodb://reader:pa%25ss@mongo.example.com/admin",
+  );
 });
 
 test("uses selected HTTP-compatible profile for HTTP URLs", () => {
@@ -159,6 +291,66 @@ test("parses HTTPS ClickHouse URLs with selected profile", () => {
   assert.equal(parsed.database, "default");
   assert.equal(parsed.urlParams, "secure=true");
   assert.equal(parsed.ssl, true);
+});
+
+test("parses MongoDB multi-host replica set URL", () => {
+  const source =
+    "mongodb://test:test@1.1.1.1:27017,1.1.1.2:27017,1.1.1.3:27017/admin?authMechanism=SCRAM-SHA-256&authSource=admin&replicaSet=testRS0";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.dbType, "mongodb");
+  assert.equal(parsed.driverProfile, "mongodb");
+  assert.equal(parsed.host, "1.1.1.1");
+  assert.equal(parsed.port, 27017);
+  assert.equal(parsed.username, "test");
+  assert.equal(parsed.password, "test");
+  assert.equal(parsed.database, "admin");
+  assert.equal(parsed.urlParams, "authMechanism=SCRAM-SHA-256&authSource=admin&replicaSet=testRS0");
+  assert.equal(parsed.connectionString, source);
+  assert.equal(parsed.useMongoUrl, true);
+  assert.equal(parsed.ssl, false);
+});
+
+test("parses MongoDB single-host URL with replicaSet and auth params", () => {
+  const source =
+    "mongodb://test:test@1.1.1.1:27017/?authMechanism=SCRAM-SHA-256&authSource=admin&replicaSet=testRS0";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.dbType, "mongodb");
+  assert.equal(parsed.host, "1.1.1.1");
+  assert.equal(parsed.port, 27017);
+  assert.equal(parsed.username, "test");
+  assert.equal(parsed.password, "test");
+  assert.equal(parsed.urlParams, "authMechanism=SCRAM-SHA-256&authSource=admin&replicaSet=testRS0");
+  assert.equal(parsed.connectionString, source);
+  assert.equal(parsed.useMongoUrl, true);
+});
+
+test("parses MongoDB multi-host URL without credentials", () => {
+  const source = "mongodb://host1:27017,host2:27017/?replicaSet=rs0";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.dbType, "mongodb");
+  assert.equal(parsed.host, "host1");
+  assert.equal(parsed.port, 27017);
+  assert.equal(parsed.username, "");
+  assert.equal(parsed.password, "");
+  assert.equal(parsed.urlParams, "replicaSet=rs0");
+  assert.equal(parsed.connectionString, source);
+  assert.equal(parsed.useMongoUrl, true);
+});
+
+test("parses MongoDB URL with simple authSource only", () => {
+  const source = "mongodb://test:test@1.1.1.1:27017/?authSource=admin";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.dbType, "mongodb");
+  assert.equal(parsed.host, "1.1.1.1");
+  assert.equal(parsed.port, 27017);
+  assert.equal(parsed.username, "test");
+  assert.equal(parsed.password, "test");
+  assert.equal(parsed.urlParams, "authSource=admin");
+  assert.equal(parsed.useMongoUrl, true);
 });
 
 test("rejects unsupported URL schemes", () => {

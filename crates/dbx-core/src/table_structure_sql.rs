@@ -211,6 +211,7 @@ fn capabilities_for(database_type: Option<DatabaseType>) -> TableStructureCapabi
         Some(
             DatabaseType::Postgres
             | DatabaseType::Gaussdb
+            | DatabaseType::Kwdb
             | DatabaseType::OpenGauss
             | DatabaseType::Highgo
             | DatabaseType::Vastbase
@@ -241,7 +242,7 @@ fn capabilities_for(database_type: Option<DatabaseType>) -> TableStructureCapabi
             comment: true,
             ..base
         },
-        Some(DatabaseType::Sqlite) => TableStructureCapabilities {
+        Some(DatabaseType::Sqlite | DatabaseType::Rqlite) => TableStructureCapabilities {
             dialect: StructureDialect::Sqlite,
             add_column: true,
             drop_column: true,
@@ -278,7 +279,7 @@ fn capabilities_for(database_type: Option<DatabaseType>) -> TableStructureCapabi
             index_comment: true,
             ..base
         },
-        Some(DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::OceanbaseOracle) => {
+        Some(DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::OceanbaseOracle | DatabaseType::Iris) => {
             TableStructureCapabilities {
                 dialect: StructureDialect::Oracle,
                 add_column: true,
@@ -353,7 +354,7 @@ fn build_table_comment_sql(options: &TableStructureSqlOptions, warnings: &mut Ve
         StructureDialect::SqlServer => {
             build_sqlserver_table_comment_sql(&table, options.schema.as_deref(), &options.table_name, new_comment)
         }
-        StructureDialect::Sqlite | StructureDialect::DuckDb | _ => {
+        _ => {
             if !clean(new_comment).is_empty() {
                 warnings
                     .push(format!("Table comments are not supported for {} from this editor.", dialect_label(dialect)));
@@ -394,7 +395,7 @@ pub fn build_create_table_sql(options: TableStructureSqlOptions) -> TableStructu
         }
         let default_value = normalize_default(Some(&column.default_value));
         if !default_value.is_empty() {
-            parts.push(format!("DEFAULT {default_value}"));
+            parts.push(format!("DEFAULT {}", format_default_for_sql(dialect, &column.data_type, &default_value)));
         }
         if let Some(on_update) = column.extra.as_ref().and_then(|e| e.on_update_current_timestamp).filter(|v| *v) {
             if on_update && dialect == StructureDialect::Mysql {
@@ -494,6 +495,121 @@ pub fn build_create_table_sql(options: TableStructureSqlOptions) -> TableStructu
     }
 
     TableStructureSqlResult { statements, warnings }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleColumnAlterSqlOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_type: Option<DatabaseType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    pub table_name: String,
+    pub column: EditableStructureColumn,
+}
+
+pub fn build_single_column_alter_sql(options: SingleColumnAlterSqlOptions) -> TableStructureSqlResult {
+    let capabilities = capabilities_for(options.database_type);
+    let dialect = capabilities.dialect;
+    let table = qualified_table(dialect, options.schema.as_deref(), &options.table_name);
+    let database_label = database_label(options.database_type);
+    let mut warnings = Vec::new();
+    let mut statements = Vec::new();
+
+    if options.column.marked_for_drop {
+        let Some(original) = &options.column.original else {
+            warnings.push("No original column info available.".to_string());
+            return TableStructureSqlResult { statements, warnings };
+        };
+        if !capabilities.drop_column {
+            warnings.push(format!("Dropping columns is not supported for {database_label} from this editor."));
+            return TableStructureSqlResult { statements, warnings };
+        }
+        if original.is_primary_key {
+            warnings.push(format!("Primary key column \"{}\" cannot be dropped from this editor.", original.name));
+            return TableStructureSqlResult { statements, warnings };
+        }
+        statements.push(format!("ALTER TABLE {table} DROP COLUMN {};", quote_ident(dialect, &original.name)));
+        return TableStructureSqlResult { statements, warnings };
+    }
+
+    let Some(original) = &options.column.original else {
+        warnings.push(
+            "This column has no original state — ALTER statements are only available for existing columns.".to_string(),
+        );
+        return TableStructureSqlResult { statements, warnings };
+    };
+
+    if !has_existing_column_attribute_change(&options.column) && !has_column_extra_change(&options.column) {
+        warnings.push("No changes detected for this column.".to_string());
+        return TableStructureSqlResult { statements, warnings };
+    }
+
+    let has_rename = options.column.name != original.name;
+    let has_attribute_change = options.column.data_type.trim() != original.data_type.trim()
+        || options.column.is_nullable != original.is_nullable
+        || normalize_default(Some(&options.column.default_value)) != original_default(&options.column)
+        || clean(&options.column.comment) != original_comment(&options.column);
+
+    if has_rename && !capabilities.rename_column {
+        warnings.push(format!("Renaming columns is not supported for {database_label} from this editor."));
+    }
+    if has_attribute_change && !capabilities.alter_existing_column && dialect != StructureDialect::Sqlite {
+        warnings.push(format!("Editing existing columns is not supported for {database_label} yet."));
+    }
+
+    if (has_rename && !capabilities.rename_column)
+        || (has_attribute_change && !capabilities.alter_existing_column && dialect != StructureDialect::Sqlite)
+    {
+        return TableStructureSqlResult { statements, warnings };
+    }
+
+    match dialect {
+        StructureDialect::Mysql => statements.extend(build_mysql_existing_column_sql(&table, &options.column, "")),
+        StructureDialect::Postgres => statements.extend(build_postgres_existing_column_sql(&table, &options.column)),
+        StructureDialect::Oracle => {
+            statements.extend(build_oracle_like_existing_column_sql(dialect, &table, &options.column))
+        }
+        StructureDialect::H2 => statements.extend(build_h2_existing_column_sql(&table, &options.column)),
+        StructureDialect::ClickHouse => {
+            statements.extend(build_clickhouse_existing_column_sql(&table, &options.column, ""))
+        }
+        StructureDialect::SqlServer => statements.extend(build_sqlserver_existing_column_sql(
+            &table,
+            &options.column,
+            options.schema.as_deref(),
+            &options.table_name,
+        )),
+        StructureDialect::Sqlite => {
+            statements.extend(build_sqlite_existing_column_sql(&table, &options.column, &mut warnings))
+        }
+        _ => warnings.push(format!("Editing existing columns is not supported for {database_label} yet.")),
+    }
+
+    TableStructureSqlResult { statements, warnings }
+}
+
+fn has_column_extra_change(column: &EditableStructureColumn) -> bool {
+    let Some(original) = &column.original else { return false };
+    let current_extra = column.extra.as_ref();
+    match (current_extra, original.extra.as_deref()) {
+        // Neither has extra → no change
+        (None, None | Some("")) => false,
+        // Extra added or removed
+        (Some(_), None | Some("")) => true,
+        (None, Some(_)) => true,
+        // Both have extra → check auto_increment and on_update_current_timestamp flags
+        (Some(curr), Some(orig)) => {
+            let orig_lower = orig.to_lowercase();
+            let curr_has_ai = curr.auto_increment.unwrap_or(false);
+            let orig_has_ai = orig_lower.contains("auto_increment");
+            let curr_has_on_update = curr.on_update_current_timestamp.unwrap_or(false);
+            let orig_has_on_update = orig_lower.contains("on update");
+            let curr_has_identity = curr.identity.is_some();
+            // identity is harder to detect in free-form original.extra, so treat it as changed if present
+            curr_has_ai != orig_has_ai || curr_has_on_update != orig_has_on_update || curr_has_identity
+        }
+    }
 }
 
 fn build_column_sql(options: &TableStructureSqlOptions, warnings: &mut Vec<String>) -> Vec<String> {
@@ -642,7 +758,7 @@ fn build_primary_key_sql(
     if !old_pk_names.is_empty() {
         match dialect {
             StructureDialect::Postgres => {
-                let raw_table = options.table_name.split('.').last().unwrap_or(&options.table_name);
+                let raw_table = options.table_name.split('.').next_back().unwrap_or(&options.table_name);
                 let pk_name = format!("{}_pkey", clean(raw_table));
                 statements.push(format!("ALTER TABLE {table} DROP CONSTRAINT {};", quote_ident(dialect, &pk_name)));
             }
@@ -809,8 +925,14 @@ fn build_postgres_existing_column_sql(table: &str, column: &EditableStructureCol
     }
     if normalize_default(Some(&column.default_value)) != original_default(column) {
         let default_value = normalize_default(Some(&column.default_value));
-        let action =
-            if default_value.is_empty() { "DROP DEFAULT".to_string() } else { format!("SET DEFAULT {default_value}") };
+        let action = if default_value.is_empty() {
+            "DROP DEFAULT".to_string()
+        } else {
+            format!(
+                "SET DEFAULT {}",
+                format_default_for_sql(StructureDialect::Postgres, &column.data_type, &default_value)
+            )
+        };
         statements.push(format!(
             "ALTER TABLE {table} ALTER COLUMN {} {action};",
             quote_ident(StructureDialect::Postgres, current_name)
@@ -845,24 +967,26 @@ fn build_oracle_like_existing_column_sql(
         ));
         current_name = column.name.clone();
     }
-    if column.data_type.trim() != original.data_type.trim() {
-        statements.push(format!(
-            "ALTER TABLE {table} MODIFY ({} {});",
-            quote_ident(dialect, &current_name),
-            column_data_type(dialect, column)
-        ));
-    }
-    if column.is_nullable != original.is_nullable {
-        let nullability = if column.is_nullable { "NULL" } else { "NOT NULL" };
-        statements.push(format!("ALTER TABLE {table} MODIFY ({} {nullability});", quote_ident(dialect, &current_name)));
-    }
-    if normalize_default(Some(&column.default_value)) != original_default(column) {
+    let type_changed = column.data_type.trim() != original.data_type.trim();
+    let nullable_changed = column.is_nullable != original.is_nullable;
+    let default_changed = normalize_default(Some(&column.default_value)) != original_default(column);
+    if type_changed || nullable_changed || default_changed {
+        let data_type = column_data_type(dialect, column);
+        let mut parts = vec![quote_ident(dialect, &current_name), data_type];
+        // Always include nullability so the statement is self-contained (required by Dameng).
+        if !column.is_nullable {
+            parts.push("NOT NULL".to_string());
+        } else {
+            parts.push("NULL".to_string());
+        }
         let default_value = normalize_default(Some(&column.default_value));
-        let default_value = if default_value.is_empty() { "NULL".to_string() } else { default_value };
-        statements.push(format!(
-            "ALTER TABLE {table} MODIFY ({} DEFAULT {default_value});",
-            quote_ident(dialect, &current_name)
-        ));
+        if !default_value.is_empty() {
+            parts.push(format!("DEFAULT {}", format_default_for_sql(dialect, &column.data_type, &default_value)));
+        } else if default_changed {
+            // User cleared the default — explicitly drop it.
+            parts.push("DEFAULT NULL".to_string());
+        }
+        statements.push(format!("ALTER TABLE {table} MODIFY ({});", parts.join(" ")));
     }
     if clean(&column.comment) != original_comment(column) {
         let comment_value =
@@ -936,14 +1060,16 @@ fn build_sqlserver_existing_column_sql(
             ));
         }
         if !default_value.is_empty() {
-            let short_table = table.split('.').last().unwrap_or(table).trim_matches(|c: char| c == '[' || c == ']');
+            let short_table =
+                table.split('.').next_back().unwrap_or(table).trim_matches(|c: char| c == '[' || c == ']');
             let constraint_name = format!(
                 "DF_{short_table}_{col_name}",
                 short_table = short_table,
                 col_name = current_name.trim_matches(|c: char| c == '[' || c == ']')
             );
             statements.push(format!(
-                "ALTER TABLE {table} ADD CONSTRAINT [{constraint_name}] DEFAULT {default_value} FOR {};",
+                "ALTER TABLE {table} ADD CONSTRAINT [{constraint_name}] DEFAULT {} FOR {};",
+                format_default_for_sql(StructureDialect::SqlServer, &column.data_type, &default_value),
                 quote_ident(dialect, &current_name)
             ));
         }
@@ -993,8 +1119,11 @@ fn build_h2_existing_column_sql(table: &str, column: &EditableStructureColumn) -
     }
     if normalize_default(Some(&column.default_value)) != original_default(column) {
         let default_value = normalize_default(Some(&column.default_value));
-        let action =
-            if default_value.is_empty() { "DROP DEFAULT".to_string() } else { format!("SET DEFAULT {default_value}") };
+        let action = if default_value.is_empty() {
+            "DROP DEFAULT".to_string()
+        } else {
+            format!("SET DEFAULT {}", format_default_for_sql(StructureDialect::H2, &column.data_type, &default_value))
+        };
         statements.push(format!(
             "ALTER TABLE {table} ALTER COLUMN {} {action};",
             quote_ident(StructureDialect::H2, &current_name)
@@ -1035,8 +1164,9 @@ fn build_clickhouse_existing_column_sql(
     {
         let default_value = normalize_default(Some(&column.default_value));
         if !default_value.is_empty() {
+            let default_sql = format_default_for_sql(StructureDialect::ClickHouse, &column.data_type, &default_value);
             statements.push(format!(
-                "ALTER TABLE {table} MODIFY COLUMN {} {next_type} DEFAULT {default_value}{position_clause};",
+                "ALTER TABLE {table} MODIFY COLUMN {} {next_type} DEFAULT {default_sql}{position_clause};",
                 quote_ident(StructureDialect::ClickHouse, &current_name)
             ));
         } else if !original_default(column).is_empty() {
@@ -1242,7 +1372,7 @@ fn column_definition(dialect: StructureDialect, column: &EditableStructureColumn
     }
     let default_value = normalize_default(Some(&column.default_value));
     if !default_value.is_empty() {
-        parts.push(format!("DEFAULT {default_value}"));
+        parts.push(format!("DEFAULT {}", format_default_for_sql(dialect, &column.data_type, &default_value)));
     }
     if let Some(on_update) = column.extra.as_ref().and_then(|e| e.on_update_current_timestamp).filter(|v| *v) {
         if on_update && dialect == StructureDialect::Mysql {
@@ -1388,7 +1518,7 @@ fn column_position_clause(dialect: StructureDialect, columns: &[&EditableStructu
     if index == 0 {
         return " FIRST".to_string();
     }
-    format!(" AFTER {}", quote_ident(dialect, &columns.get(index - 1).map(|column| column.name.as_str()).unwrap_or("")))
+    format!(" AFTER {}", quote_ident(dialect, columns.get(index - 1).map(|column| column.name.as_str()).unwrap_or("")))
 }
 
 fn mysql_column_position_changed(columns: &[&EditableStructureColumn], index: usize) -> bool {
@@ -1496,6 +1626,83 @@ fn quote_string(value: &str) -> String {
 
 fn clean(value: &str) -> String {
     value.trim().to_string()
+}
+
+fn is_temporal_type_for_default(dialect: StructureDialect, base_type: &str) -> bool {
+    let normalized = base_type.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+    match dialect {
+        StructureDialect::Mysql => matches!(normalized.as_str(), "date" | "datetime" | "timestamp" | "time" | "year"),
+        StructureDialect::Postgres => {
+            matches!(
+                normalized.as_str(),
+                "date"
+                    | "time"
+                    | "time without time zone"
+                    | "time with time zone"
+                    | "timestamp"
+                    | "timestamp without time zone"
+                    | "timestamp with time zone"
+                    | "interval"
+                    | "timetz"
+                    | "timestamptz"
+            ) || normalized.starts_with("interval ")
+        }
+        StructureDialect::SqlServer => matches!(
+            normalized.as_str(),
+            "date" | "time" | "datetime" | "datetime2" | "smalldatetime" | "datetimeoffset"
+        ),
+        StructureDialect::Oracle => matches!(
+            normalized.as_str(),
+            "date"
+                | "timestamp"
+                | "timestamp with time zone"
+                | "timestamp with local time zone"
+                | "interval year to month"
+                | "interval day to second"
+        ),
+        StructureDialect::H2 => {
+            matches!(
+                normalized.as_str(),
+                "date"
+                    | "time"
+                    | "time without time zone"
+                    | "time with time zone"
+                    | "timestamp"
+                    | "timestamp without time zone"
+                    | "timestamp with time zone"
+            ) || normalized.starts_with("interval ")
+        }
+        StructureDialect::ClickHouse => {
+            matches!(normalized.as_str(), "date" | "date32" | "datetime" | "datetime64")
+        }
+        StructureDialect::Sqlite => {
+            matches!(normalized.as_str(), "date" | "datetime" | "timestamp" | "time")
+        }
+        _ => false,
+    }
+}
+
+fn is_temporal_expression(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains('(') || trimmed.contains(')') {
+        return true;
+    }
+    trimmed.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
+}
+
+fn format_default_for_sql(dialect: StructureDialect, data_type: &str, default_value: &str) -> String {
+    if default_value.is_empty() {
+        return String::new();
+    }
+    let base_type = data_type.split('(').next().unwrap_or(data_type).trim();
+    if is_temporal_type_for_default(dialect, base_type) && !is_temporal_expression(default_value) {
+        quote_string(default_value)
+    } else {
+        default_value.to_string()
+    }
 }
 
 fn normalize_default(value: Option<&String>) -> String {
@@ -1845,6 +2052,34 @@ mod tests {
         assert_eq!(
             result.warnings,
             vec!["SQLite cannot safely alter existing column \"name\" without rebuilding the table."]
+        );
+    }
+
+    #[test]
+    fn builds_rqlite_changes_with_sqlite_dialect() {
+        let mut email = column("email");
+        email.data_type = "text".to_string();
+        email.is_nullable = false;
+        let mut email_index = index("idx_users_email", &["email"]);
+        email_index.filter = "email IS NOT NULL".to_string();
+
+        let result = build_table_structure_change_sql(TableStructureSqlOptions {
+            database_type: Some(DatabaseType::Rqlite),
+            schema: None,
+            table_name: "users".to_string(),
+            columns: vec![email],
+            indexes: vec![email_index],
+            table_comment: None,
+            original_table_comment: None,
+        });
+
+        assert_eq!(result.warnings, Vec::<String>::new());
+        assert_eq!(
+            result.statements,
+            vec![
+                "ALTER TABLE \"users\" ADD COLUMN \"email\" text NOT NULL;",
+                "CREATE INDEX \"idx_users_email\" ON \"users\" (\"email\") WHERE email IS NOT NULL;",
+            ]
         );
     }
 
@@ -2314,5 +2549,177 @@ mod tests {
 
         assert_eq!(result.warnings, Vec::<String>::new());
         assert!(result.statements[0].contains("IDENTITY(100, 5)"));
+    }
+
+    #[test]
+    fn mysql_quotes_datetime_literal_default() {
+        let mut col = column("created_at");
+        col.data_type = "datetime".to_string();
+        col.default_value = "2024-01-01 00:00:00".to_string();
+
+        let result = build_create_table_sql(TableStructureSqlOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: "events".to_string(),
+            columns: vec![col],
+            indexes: Vec::new(),
+            table_comment: None,
+            original_table_comment: None,
+        });
+
+        assert_eq!(result.warnings, Vec::<String>::new());
+        assert!(result.statements[0].contains("DEFAULT '2024-01-01 00:00:00'"));
+    }
+
+    #[test]
+    fn mysql_does_not_quote_current_timestamp() {
+        let mut col = column("updated_at");
+        col.data_type = "timestamp".to_string();
+        col.default_value = "CURRENT_TIMESTAMP".to_string();
+
+        let result = build_create_table_sql(TableStructureSqlOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: "events".to_string(),
+            columns: vec![col],
+            indexes: Vec::new(),
+            table_comment: None,
+            original_table_comment: None,
+        });
+
+        assert_eq!(result.warnings, Vec::<String>::new());
+        assert!(result.statements[0].contains("DEFAULT CURRENT_TIMESTAMP"));
+        assert!(!result.statements[0].contains("DEFAULT 'CURRENT_TIMESTAMP'"));
+    }
+
+    #[test]
+    fn mysql_does_not_quote_temporal_function_with_parens() {
+        let mut col = column("created_at");
+        col.data_type = "datetime".to_string();
+        col.default_value = "NOW()".to_string();
+
+        let result = build_create_table_sql(TableStructureSqlOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: "events".to_string(),
+            columns: vec![col],
+            indexes: Vec::new(),
+            table_comment: None,
+            original_table_comment: None,
+        });
+
+        assert_eq!(result.warnings, Vec::<String>::new());
+        assert!(result.statements[0].contains("DEFAULT NOW()"));
+    }
+
+    #[test]
+    fn mysql_date_literal_default_is_quoted() {
+        let mut col = column("birth_date");
+        col.data_type = "date".to_string();
+        col.default_value = "2000-01-01".to_string();
+
+        let result = build_create_table_sql(TableStructureSqlOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: "users".to_string(),
+            columns: vec![col],
+            indexes: Vec::new(),
+            table_comment: None,
+            original_table_comment: None,
+        });
+
+        assert_eq!(result.warnings, Vec::<String>::new());
+        assert!(result.statements[0].contains("DEFAULT '2000-01-01'"));
+    }
+
+    #[test]
+    fn mysql_time_literal_default_is_quoted() {
+        let mut col = column("start_time");
+        col.data_type = "time".to_string();
+        col.default_value = "09:00:00".to_string();
+
+        let result = build_create_table_sql(TableStructureSqlOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: "shifts".to_string(),
+            columns: vec![col],
+            indexes: Vec::new(),
+            table_comment: None,
+            original_table_comment: None,
+        });
+
+        assert_eq!(result.warnings, Vec::<String>::new());
+        assert!(result.statements[0].contains("DEFAULT '09:00:00'"));
+    }
+
+    #[test]
+    fn non_temporal_types_are_not_quoted() {
+        let mut col = column("score");
+        col.data_type = "int".to_string();
+        col.default_value = "0".to_string();
+
+        let result = build_create_table_sql(TableStructureSqlOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: "games".to_string(),
+            columns: vec![col],
+            indexes: Vec::new(),
+            table_comment: None,
+            original_table_comment: None,
+        });
+
+        assert_eq!(result.warnings, Vec::<String>::new());
+        assert!(result.statements[0].contains("DEFAULT 0"));
+        assert!(!result.statements[0].contains("DEFAULT '0'"));
+    }
+
+    #[test]
+    fn postgres_timestamp_literal_is_quoted() {
+        let mut col = column("logged_at");
+        col.data_type = "timestamp".to_string();
+        col.default_value = "2024-06-01 12:00:00".to_string();
+        col.original = Some(ColumnInfo {
+            name: "logged_at".to_string(),
+            data_type: "timestamp".to_string(),
+            is_nullable: true,
+            column_default: None,
+            is_primary_key: false,
+            extra: None,
+            comment: Some(String::new()),
+        });
+
+        let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+            database_type: Some(DatabaseType::Postgres),
+            schema: Some("public".to_string()),
+            table_name: "events".to_string(),
+            column: col,
+        });
+
+        assert!(result.statements.iter().any(|s| s.contains("SET DEFAULT '2024-06-01 12:00:00'")));
+    }
+
+    #[test]
+    fn mysql_single_column_alter_quotes_datetime_literal() {
+        let mut col = column("created_at");
+        col.data_type = "datetime".to_string();
+        col.default_value = "2024-01-01 00:00:00".to_string();
+        col.original = Some(ColumnInfo {
+            name: "created_at".to_string(),
+            data_type: "datetime".to_string(),
+            is_nullable: true,
+            column_default: None,
+            is_primary_key: false,
+            extra: None,
+            comment: Some(String::new()),
+        });
+
+        let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: "events".to_string(),
+            column: col,
+        });
+
+        assert!(result.statements.iter().any(|s| s.contains("DEFAULT '2024-01-01 00:00:00'")));
     }
 }

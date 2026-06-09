@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
-import { pathToFileURL } from "node:url";
 import {
   buildSchemaContext,
   createBackend,
@@ -9,8 +8,8 @@ import {
   evaluateSqlSafety,
   formatSchemaContext,
   getDbxDiagnostics,
+  isMainModule,
   postBridge,
-  sqlSafetyFromEnv,
   type Backend,
   type DbxDiagnostics,
   type SqlSafetyOptions,
@@ -25,6 +24,7 @@ export interface CliResult {
 
 interface RunOptions {
   backend?: Backend;
+  backendFactory?: (env?: NodeJS.ProcessEnv) => Promise<Backend>;
   env?: NodeJS.ProcessEnv;
   diagnostics?: () => Promise<DbxDiagnostics>;
 }
@@ -57,6 +57,7 @@ class CliError extends Error {
 
 export async function runCli(argv: string[], options: RunOptions = {}): Promise<CliResult> {
   const env = options.env ?? process.env;
+  let ownedBackend: Backend | undefined;
 
   try {
     const flags = parseFlags(argv);
@@ -70,7 +71,8 @@ export async function runCli(argv: string[], options: RunOptions = {}): Promise<
       return ok(`${usage()}\n`);
     }
 
-    const backend = options.backend ?? (await createBackend(env));
+    const backendFactory = options.backendFactory ?? createBackend;
+    const backend = options.backend ?? (ownedBackend = await backendFactory(env));
 
     if (args[0] === "doctor") {
       ensureArgCount(args, 1, "dbx doctor");
@@ -174,7 +176,7 @@ export async function runCli(argv: string[], options: RunOptions = {}): Promise<
       }
       const sqlArg = usesDefaultConnection ? args[1] : args[2];
       const sql = flags.file ? await readFile(flags.file, "utf-8") : required(sqlArg, "SQL string or --file is required.");
-      const envSafety = sqlSafetyFromEnv(env);
+      const envSafety = sqlSafetyFromCliEnv(env);
       if (flags.allowDangerous && !flags.allowWrites && !envSafety.allowWrites) {
         throw new CliError("INVALID_OPTION", "--allow-dangerous-sql requires --allow-writes.");
       }
@@ -243,6 +245,8 @@ export async function runCli(argv: string[], options: RunOptions = {}): Promise<
           : "ERROR";
     const wantsJson = argv.includes("--json");
     return fail(code, message, wantsJson);
+  } finally {
+    await ownedBackend?.close?.().catch(() => {});
   }
 }
 
@@ -329,6 +333,19 @@ function parseDurationMs(value: string, option: string): number {
   return amount * 60_000;
 }
 
+function parseBooleanEnv(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true";
+}
+
+function sqlSafetyFromCliEnv(env: NodeJS.ProcessEnv): Required<Pick<SqlSafetyOptions, "allowWrites" | "allowDangerous">> {
+  return {
+    allowWrites: parseBooleanEnv(env.DBX_MCP_ALLOW_WRITES),
+    allowDangerous: parseBooleanEnv(env.DBX_MCP_ALLOW_DANGEROUS_SQL),
+  };
+}
+
 function splitCsv(value: string | undefined): string[] {
   return (value ?? "")
     .split(",")
@@ -406,7 +423,7 @@ async function main() {
   process.exitCode = result.exitCode;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url, process.argv[1])) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;

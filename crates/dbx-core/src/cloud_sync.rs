@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ai::AiConfig;
-use crate::models::connection::ConnectionConfig;
+use crate::models::connection::{ConnectionConfig, TransportLayerConfig};
 use crate::saved_sql::SavedSqlLibrary;
 use crate::storage::{DesktopSettings, Storage};
 
@@ -24,6 +24,8 @@ const SECRET_KEYS: &[&str] = &[
     "redis_sentinel_password",
     "connection_string",
 ];
+const SSH_TUNNEL_SECRET_PREFIX: &str = "ssh_tunnels.";
+const TRANSPORT_LAYER_SECRET_PREFIX: &str = "transport_layers.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -300,9 +302,17 @@ impl WebDavClient {
 
 fn scrub_connection_secrets(config: &mut ConnectionConfig) {
     config.password.clear();
-    config.ssh_password.clear();
-    config.ssh_key_passphrase.clear();
-    config.proxy_password.clear();
+    for layer in &mut config.transport_layers {
+        match layer {
+            TransportLayerConfig::Ssh(ssh) => {
+                ssh.password.clear();
+                ssh.key_passphrase.clear();
+            }
+            TransportLayerConfig::Proxy(proxy) => {
+                proxy.password.clear();
+            }
+        }
+    }
     config.redis_sentinel_password.clear();
     config.connection_string = None;
 }
@@ -322,9 +332,32 @@ async fn build_sensitive_payload(
     let mut connection_secrets = Vec::new();
     for config in connections {
         push_secret(&mut connection_secrets, &config.id, "password", &config.password);
-        push_secret(&mut connection_secrets, &config.id, "ssh_password", &config.ssh_password);
-        push_secret(&mut connection_secrets, &config.id, "ssh_key_passphrase", &config.ssh_key_passphrase);
-        push_secret(&mut connection_secrets, &config.id, "proxy_password", &config.proxy_password);
+        for (index, layer) in config.transport_layers.iter().enumerate() {
+            match layer {
+                TransportLayerConfig::Ssh(ssh) => {
+                    push_secret(
+                        &mut connection_secrets,
+                        &config.id,
+                        &transport_layer_ssh_password_key(index, layer),
+                        &ssh.password,
+                    );
+                    push_secret(
+                        &mut connection_secrets,
+                        &config.id,
+                        &transport_layer_ssh_key_passphrase_key(index, layer),
+                        &ssh.key_passphrase,
+                    );
+                }
+                TransportLayerConfig::Proxy(proxy) => {
+                    push_secret(
+                        &mut connection_secrets,
+                        &config.id,
+                        &transport_layer_proxy_password_key(index, layer),
+                        &proxy.password,
+                    );
+                }
+            }
+        }
         push_secret(&mut connection_secrets, &config.id, "redis_sentinel_password", &config.redis_sentinel_password);
         if let Some(connection_string) = &config.connection_string {
             push_secret(&mut connection_secrets, &config.id, "connection_string", connection_string);
@@ -347,7 +380,10 @@ fn push_secret(secrets: &mut Vec<ConnectionSecretSnapshot>, connection_id: &str,
 
 async fn apply_sensitive_payload(storage: &Storage, payload: &SensitiveSyncPayload) -> Result<(), String> {
     for secret in &payload.connection_secrets {
-        if !SECRET_KEYS.contains(&secret.key.as_str()) {
+        if !SECRET_KEYS.contains(&secret.key.as_str())
+            && !secret.key.starts_with(SSH_TUNNEL_SECRET_PREFIX)
+            && !secret.key.starts_with(TRANSPORT_LAYER_SECRET_PREFIX)
+        {
             continue;
         }
         storage.set_secret(&secret.connection_id, &secret.key, &secret.secret).await?;
@@ -363,8 +399,40 @@ async fn clear_connection_secrets(storage: &Storage, connections: &[ConnectionCo
         for key in SECRET_KEYS {
             storage.delete_secret(&config.id, key).await?;
         }
+        for (index, layer) in config.transport_layers.iter().enumerate() {
+            match layer {
+                TransportLayerConfig::Ssh(_) => {
+                    storage.delete_secret(&config.id, &transport_layer_ssh_password_key(index, layer)).await?;
+                    storage.delete_secret(&config.id, &transport_layer_ssh_key_passphrase_key(index, layer)).await?;
+                }
+                TransportLayerConfig::Proxy(_) => {
+                    storage.delete_secret(&config.id, &transport_layer_proxy_password_key(index, layer)).await?;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn transport_layer_secret_segment(index: usize, layer: &TransportLayerConfig) -> String {
+    let id = layer.id().trim();
+    if id.is_empty() {
+        index.to_string()
+    } else {
+        id.to_string()
+    }
+}
+
+fn transport_layer_ssh_password_key(index: usize, layer: &TransportLayerConfig) -> String {
+    format!("{}{}.ssh_password", TRANSPORT_LAYER_SECRET_PREFIX, transport_layer_secret_segment(index, layer))
+}
+
+fn transport_layer_ssh_key_passphrase_key(index: usize, layer: &TransportLayerConfig) -> String {
+    format!("{}{}.ssh_key_passphrase", TRANSPORT_LAYER_SECRET_PREFIX, transport_layer_secret_segment(index, layer))
+}
+
+fn transport_layer_proxy_password_key(index: usize, layer: &TransportLayerConfig) -> String {
+    format!("{}{}.proxy_password", TRANSPORT_LAYER_SECRET_PREFIX, transport_layer_secret_segment(index, layer))
 }
 
 fn encrypt_sensitive_payload(payload: &SensitiveSyncPayload, passphrase: &str) -> Result<EncryptedSecretsBlob, String> {
@@ -462,7 +530,7 @@ mod tests {
         decrypt_sensitive_payload, encrypt_sensitive_payload, normalized_remote_path, parent_collection_paths,
         scrub_connection_secrets, ConnectionSecretSnapshot, SensitiveSyncPayload,
     };
-    use crate::models::connection::{ConnectionConfig, DatabaseType, ProxyType};
+    use crate::models::connection::{ConnectionConfig, DatabaseType, TransportLayerConfig};
 
     #[test]
     fn normalizes_empty_remote_path_to_default() {
@@ -493,25 +561,26 @@ mod tests {
             visible_databases: None,
             attached_databases: Vec::new(),
             color: None,
-            ssh_enabled: false,
-            ssh_host: String::new(),
-            ssh_port: 22,
-            ssh_user: String::new(),
-            ssh_password: "ssh".to_string(),
-            ssh_key_path: String::new(),
-            ssh_key_passphrase: "key".to_string(),
-            ssh_expose_lan: false,
-            ssh_connect_timeout_secs: 5,
+            transport_layers: vec![TransportLayerConfig::Ssh(crate::models::connection::SshTunnelConfig {
+                id: "hop-1".to_string(),
+                name: String::new(),
+                enabled: true,
+                host: "bastion".to_string(),
+                port: 22,
+                user: "user".to_string(),
+                password: "hop-password".to_string(),
+                key_path: String::new(),
+                key_passphrase: "hop-passphrase".to_string(),
+                connect_timeout_secs: 5,
+                expose_lan: false,
+            })],
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
-            proxy_enabled: false,
-            proxy_type: ProxyType::Socks5,
-            proxy_host: String::new(),
-            proxy_port: 1080,
-            proxy_username: String::new(),
-            proxy_password: "proxy".to_string(),
+            idle_timeout_secs: 60,
             ssl: false,
             ca_cert_path: String::new(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
             sysdba: false,
             oracle_connection_type: None,
             connection_string: Some("postgres://secret".to_string()),
@@ -522,6 +591,7 @@ mod tests {
             redis_sentinel_password: "sentinel".to_string(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
@@ -529,9 +599,13 @@ mod tests {
         };
         scrub_connection_secrets(&mut config);
         assert!(config.password.is_empty());
-        assert!(config.ssh_password.is_empty());
-        assert!(config.ssh_key_passphrase.is_empty());
-        assert!(config.proxy_password.is_empty());
+        match &config.transport_layers[0] {
+            TransportLayerConfig::Ssh(ssh) => {
+                assert!(ssh.password.is_empty());
+                assert!(ssh.key_passphrase.is_empty());
+            }
+            TransportLayerConfig::Proxy(_) => panic!("expected ssh layer"),
+        }
         assert!(config.redis_sentinel_password.is_empty());
         assert!(config.connection_string.is_none());
     }
@@ -539,17 +613,25 @@ mod tests {
     #[test]
     fn encrypted_sensitive_payload_round_trips() {
         let payload = SensitiveSyncPayload {
-            connection_secrets: vec![ConnectionSecretSnapshot {
-                connection_id: "c1".to_string(),
-                key: "password".to_string(),
-                secret: "secret".to_string(),
-            }],
+            connection_secrets: vec![
+                ConnectionSecretSnapshot {
+                    connection_id: "c1".to_string(),
+                    key: "password".to_string(),
+                    secret: "secret".to_string(),
+                },
+                ConnectionSecretSnapshot {
+                    connection_id: "c1".to_string(),
+                    key: "transport_layers.hop-1.ssh_password".to_string(),
+                    secret: "hop-secret".to_string(),
+                },
+            ],
             ai_config: None,
         };
         let encrypted = encrypt_sensitive_payload(&payload, "sync-pass").unwrap();
         assert_ne!(encrypted.ciphertext, "secret");
         let decrypted = decrypt_sensitive_payload(&encrypted, "sync-pass").unwrap();
         assert_eq!(decrypted.connection_secrets[0].secret, "secret");
+        assert_eq!(decrypted.connection_secrets[1].secret, "hop-secret");
     }
 
     #[test]

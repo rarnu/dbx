@@ -13,17 +13,18 @@ import {
   Save,
   FolderOpen,
   Layers,
-} from "lucide-vue-next";
+} from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
+import TruncatedTextTooltip from "@/components/ui/TruncatedTextTooltip.vue";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
 import { useSchemaOptions } from "@/composables/useSchemaOptions";
 import { connectionIconType } from "@/lib/connectionPresentation";
-import { isDefaultDatabase } from "@/lib/defaultDatabase";
+import { formatDatabaseLabel, isDefaultDatabase } from "@/lib/defaultDatabase";
 import { connectionDisplayName } from "@/lib/tabPresentation";
 import { isSingleDatabase } from "@/lib/databaseCapabilities";
 import { hexToRgba } from "@/lib/color";
@@ -33,12 +34,14 @@ const props = defineProps<{
   activeTab: QueryTab;
   activeConnection?: ConnectionConfig;
   executableSql: string;
+  explainMode?: string;
 }>();
 
 const emit = defineEmits<{
   execute: [];
   cancel: [];
   explain: [];
+  "update:explainMode": [mode: "explain" | "autotrace"];
   formatSql: [];
   saveSql: [];
   openSql: [];
@@ -64,12 +67,17 @@ const activeDatabaseValue = computed(() => props.activeTab.database || "");
 const activeConnectionValue = computed(() => props.activeConnection?.id || "");
 const activeSchemaValue = computed(() => props.activeTab.schema || "");
 const isSingleDb = computed(() => isSingleDatabase(props.activeConnection?.db_type));
+const hasDefaultDatabaseOption = computed(() => activeDatabaseOptions.value.includes(""));
 const schemaDatabaseKey = computed(() => props.activeTab.database || (isSingleDb.value ? "_" : ""));
 const saveTooltip = computed(() => (props.activeTab.objectSource ? t("objects.saveSource") : t("toolbar.saveSql")));
 
 const showSchemaSelector = computed(() => {
   const connection = props.activeConnection;
-  return connection && isSchemaAware(connection.id) && (props.activeTab.database || isSingleDb.value);
+  return (
+    connection &&
+    isSchemaAware(connection.id) &&
+    (props.activeTab.database || isSingleDb.value || hasDefaultDatabaseOption.value)
+  );
 });
 
 const activeSchemaOptions = computed(() => {
@@ -80,7 +88,7 @@ const activeSchemaOptions = computed(() => {
 
 watchEffect(() => {
   const connection = props.activeConnection;
-  if (connection && showSchemaSelector.value && schemaDatabaseKey.value) {
+  if (connection && showSchemaSelector.value) {
     loadSchemaOptions(connection.id, schemaDatabaseKey.value).catch(() => {});
   }
 });
@@ -96,9 +104,10 @@ const toolbarStyle = computed(() => {
 });
 
 function databaseDisplayName(database: string): string {
-  const connection = props.activeConnection;
-  if (connection?.db_type === "redis" && database !== "") return `db${database}`;
-  return database || t("editor.noDatabase");
+  return formatDatabaseLabel(props.activeConnection, database, {
+    defaultDatabase: t("editor.defaultDatabase"),
+    noDatabase: t("editor.noDatabase"),
+  });
 }
 
 function connectionById(connectionId: string): ConnectionConfig | undefined {
@@ -159,6 +168,22 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
           activeTab.isExplaining ? t("toolbar.stopExplain") : t("toolbar.explainPlan")
         }}</TooltipContent>
       </Tooltip>
+      <!-- Autotrace toggle (only for DM) -->
+      <Button
+        v-if="activeConnection?.db_type === 'dameng'"
+        variant="ghost"
+        size="icon"
+        class="h-6 w-6"
+        :class="
+          props.explainMode === 'autotrace'
+            ? 'text-green-600 bg-green-100 dark:text-green-300 dark:bg-green-900/30'
+            : 'text-muted-foreground/50'
+        "
+        :disabled="activeTab.isExecuting"
+        @click="emit('update:explainMode', props.explainMode === 'autotrace' ? 'explain' : 'autotrace')"
+      >
+        <span class="font-bold" style="font-size: 9px">A</span>
+      </Button>
       <Tooltip>
         <TooltipTrigger as-child>
           <Button
@@ -230,7 +255,7 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
           <template #option-label="{ option, label }">
             <div class="flex min-w-0 items-center gap-2">
               <DatabaseIcon :db-type="connectionIconType(connectionById(option))" class="h-3.5 w-3.5 shrink-0" />
-              <span class="truncate">{{ label }}</span>
+              <TruncatedTextTooltip :text="label" class="min-w-0 flex-1" side="left" :side-offset="8" />
             </div>
           </template>
         </SearchableSelect>
@@ -254,7 +279,11 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
               if (open && activeConnection) loadDatabaseOptions(activeConnection.id).catch(() => {});
             }
           "
-        />
+        >
+          <template #option-label="{ label }">
+            <TruncatedTextTooltip :text="label" class="min-w-0 flex-1" side="left" :side-offset="8" />
+          </template>
+        </SearchableSelect>
         <Button
           v-if="activeDatabaseValue"
           variant="ghost"

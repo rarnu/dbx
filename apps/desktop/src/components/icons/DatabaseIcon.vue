@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { Database } from "lucide-vue-next";
+import { Database } from "@lucide/vue";
 
 const props = defineProps<{
   dbType: string;
@@ -11,6 +11,7 @@ const assetIcons: Record<string, string> = {
   postgres: "postgres",
   postgresql: "postgres",
   sqlite: "sqlite",
+  rqlite: "rqlite.png",
   redis: "redis",
   mongodb: "mongodb",
   clickhouse: "clickhouse",
@@ -20,15 +21,19 @@ const assetIcons: Record<string, string> = {
   elasticsearch: "elasticsearch",
   oracle: "oracle",
   "oracle-10g": "oracle",
+  "oracle-legacy": "oracle",
   oracle_10g: "oracle",
+  oracle_legacy: "oracle",
   sqlserver: "sqlserver",
   access: "access.png",
   oceanbase: "oceanbase",
   opengauss: "opengauss",
   gaussdb: "gaussdb",
+  kwdb: "kwdb",
   kingbase: "kingbase",
   highgo: "highgo.png",
   goldendb: "goldendb.png",
+  databend: "databend",
   vastbase: "vastbase.png",
   yashandb: "yashandb.png",
   snowflake: "snowflake",
@@ -59,9 +64,14 @@ const assetIcons: Record<string, string> = {
   firebird: "firebird.webp",
   exasol: "exasol.webp",
   gbase: "gbase.webp",
+  gbase8s: "gbase.webp",
   tdsql: "tdsql.webp",
   polardb: "polardb.webp",
   greatsql: "greatsql.webp",
+  xugu: "xugu.png",
+  iotdb: "iotdb",
+  etcd: "etcd",
+  iris: "iris.png",
 };
 
 const letterIcons: Record<string, { letter: string; color: string }> = {};

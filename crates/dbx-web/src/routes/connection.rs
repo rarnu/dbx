@@ -22,6 +22,13 @@ pub struct DisconnectRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CloseDatabaseConnectionRequest {
+    pub connection_id: String,
+    pub database: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SaveConnectionsRequest {
     pub configs: Vec<ConnectionConfig>,
 }
@@ -71,6 +78,24 @@ pub async fn connect_db(
     Ok(Json(connection_id))
 }
 
+pub async fn connection_final_proxy_port(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<ConnectRequest>,
+) -> Result<Json<u16>, AppError> {
+    let runtime_config = body.config.canonicalized();
+    if !runtime_config.has_effective_transport_layers() {
+        return Err(AppError("Connection has no configured transport layers".to_string()));
+    }
+
+    let app = &state.app;
+    let connection_id = runtime_config.id.clone();
+    let db_config = dbx_core::connection::metadata_connection_config(&runtime_config);
+    app.configs.write().await.insert(connection_id.clone(), runtime_config);
+
+    let (_, port) = app.connection_host_port(&connection_id, &db_config).await.map_err(AppError)?;
+    Ok(Json(port))
+}
+
 pub async fn disconnect_db(
     State(state): State<Arc<WebState>>,
     Json(body): Json<DisconnectRequest>,
@@ -86,10 +111,21 @@ pub async fn disconnect_db(
     }
     drop(connections);
 
-    app.tunnels.stop_tunnel(&body.connection_id).await;
-    app.proxy_tunnels.stop_tunnel(&body.connection_id).await;
+    app.reset_connection_transport(&body.connection_id).await;
+    if body.connection_id.starts_with("__visible_draft_") {
+        app.configs.write().await.remove(&body.connection_id);
+    }
 
     Ok(Json(()))
+}
+
+pub async fn close_database_connection(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<CloseDatabaseConnectionRequest>,
+) -> Result<Json<bool>, AppError> {
+    let database = body.database.trim();
+    let database = if database.is_empty() { None } else { Some(database) };
+    state.app.close_database_pool(&body.connection_id, database).await.map(Json).map_err(AppError)
 }
 
 pub async fn save_connections(
@@ -121,7 +157,7 @@ mod tests {
     use axum::extract::State;
     use axum::Json;
     use dbx_core::connection::{AppState, PoolKind};
-    use dbx_core::models::connection::{ConnectionConfig, DatabaseType, ProxyType};
+    use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
     use dbx_core::storage::Storage;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -143,25 +179,14 @@ mod tests {
             visible_databases: None,
             attached_databases: Vec::new(),
             color: None,
-            ssh_enabled: false,
-            ssh_host: String::new(),
-            ssh_port: 22,
-            ssh_user: String::new(),
-            ssh_password: String::new(),
-            ssh_key_path: String::new(),
-            ssh_key_passphrase: String::new(),
-            ssh_expose_lan: false,
-            ssh_connect_timeout_secs: dbx_core::models::connection::default_ssh_connect_timeout_secs(),
+            transport_layers: Vec::new(),
             connect_timeout_secs: dbx_core::models::connection::default_connect_timeout_secs(),
             query_timeout_secs: dbx_core::models::connection::default_query_timeout_secs(),
-            proxy_enabled: false,
-            proxy_type: ProxyType::Socks5,
-            proxy_host: String::new(),
-            proxy_port: 1080,
-            proxy_username: String::new(),
-            proxy_password: String::new(),
+            idle_timeout_secs: dbx_core::models::connection::default_idle_timeout_secs(),
             ssl: false,
             ca_cert_path: String::new(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
             sysdba: false,
             oracle_connection_type: None,
             connection_string: None,
@@ -172,6 +197,7 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
@@ -190,7 +216,9 @@ mod tests {
             password_hash: RwLock::new(None),
             sessions: RwLock::new(HashSet::new()),
             sse_channels: RwLock::new(HashMap::new()),
+            sql_file_executions: RwLock::new(HashMap::new()),
             login_rate_limit: Mutex::new(LoginRateLimit { fail_count: 0, locked_until: None }),
+            export_files: RwLock::new(HashMap::new()),
         });
         (state, dir)
     }
@@ -261,6 +289,28 @@ mod tests {
 
         let configs = state.app.configs.read().await;
         assert!(configs.contains_key("conn"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn disconnect_db_removes_visible_database_draft_config() {
+        let (state, dir) = test_web_state().await;
+        let conn_path = dir.join("draft.db");
+        let draft_id = "__visible_draft_test";
+        std::fs::File::create(&conn_path).unwrap();
+
+        {
+            let mut configs = state.app.configs.write().await;
+            configs.insert(draft_id.to_string(), sqlite_config(draft_id, &conn_path.to_string_lossy()));
+        }
+
+        let result =
+            disconnect_db(State(state.clone()), Json(DisconnectRequest { connection_id: draft_id.to_string() })).await;
+        assert!(result.is_ok());
+
+        let configs = state.app.configs.read().await;
+        assert!(!configs.contains_key(draft_id));
 
         let _ = std::fs::remove_dir_all(dir);
     }

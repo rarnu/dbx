@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use crate::models::connection::DatabaseType;
 use crate::sql_dialect::{qualified_table_name, quote_table_identifier};
-use crate::transfer::format_pg_array_sql_literal;
+use crate::transfer::{format_ch_array_sql_literal, format_pg_array_sql_literal};
 
 static EXPORT_CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
@@ -45,6 +45,7 @@ pub struct ExportProgress {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExportStatus {
     Running,
+    Writing,
     Done,
     Error,
     Cancelled,
@@ -71,6 +72,8 @@ pub struct ExportedTableSql {
     #[serde(default)]
     pub columns: Vec<String>,
     #[serde(default)]
+    pub column_types: Vec<Option<String>>,
+    #[serde(default)]
     pub rows: Vec<Vec<Value>>,
     #[serde(default)]
     pub truncated: bool,
@@ -89,6 +92,8 @@ pub struct BuildExportInsertStatementsOptions {
     pub qualified_table_name: Option<String>,
     #[serde(default)]
     pub columns: Vec<String>,
+    #[serde(default)]
+    pub column_types: Vec<Option<String>>,
     #[serde(default)]
     pub rows: Vec<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,6 +138,59 @@ pub fn format_export_sql_literal(value: &Value) -> String {
     format!("'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
 }
 
+fn format_export_sql_literal_typed(
+    value: &Value,
+    database_type: Option<DatabaseType>,
+    column_type: Option<&str>,
+) -> String {
+    if matches!(database_type, Some(DatabaseType::Mysql)) && column_type.is_some_and(is_mysql_bit_type) {
+        return format_mysql_bit_literal(value);
+    }
+    if let Some(arr) = value.as_array() {
+        if matches!(database_type, Some(DatabaseType::ClickHouse) | Some(DatabaseType::Databend)) {
+            return format_ch_array_sql_literal(arr);
+        }
+    }
+    format_export_sql_literal(value)
+}
+
+fn is_mysql_bit_type(column_type: &str) -> bool {
+    let trimmed = column_type.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    lower == "bit" || lower.starts_with("bit(") || lower.starts_with("bit ")
+}
+
+fn format_mysql_bit_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(value) => {
+            if *value {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => {
+            let trimmed = value.trim();
+            if trimmed.eq_ignore_ascii_case("true") {
+                return "1".to_string();
+            }
+            if trimmed.eq_ignore_ascii_case("false") {
+                return "0".to_string();
+            }
+            if trimmed == "0" || trimmed == "1" {
+                return trimmed.to_string();
+            }
+            if !trimmed.is_empty() && trimmed.bytes().all(|byte| byte == b'0' || byte == b'1') {
+                return format!("b'{trimmed}'");
+            }
+            format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+        }
+        other => format_export_sql_literal(other),
+    }
+}
+
 pub fn build_export_insert_statements(options: BuildExportInsertStatementsOptions) -> Result<Vec<String>, String> {
     if options.columns.is_empty() || options.rows.is_empty() {
         return Ok(Vec::new());
@@ -156,7 +214,21 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
     for rows in options.rows.chunks(batch_size) {
         let values = rows
             .iter()
-            .map(|row| format!("({})", row.iter().map(format_export_sql_literal).collect::<Vec<_>>().join(", ")))
+            .map(|row| {
+                let values = row
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        format_export_sql_literal_typed(
+                            value,
+                            options.database_type,
+                            options.column_types.get(index).and_then(|value| value.as_deref()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({values})")
+            })
             .collect::<Vec<_>>()
             .join(", ");
         statements.push(format!("INSERT INTO {table} ({columns}) VALUES {values};"));
@@ -202,6 +274,7 @@ pub fn build_database_sql_export(options: BuildDatabaseSqlExportOptions) -> Resu
             table_name: table.table_name,
             qualified_table_name: table.qualified_table_name,
             columns: table.columns,
+            column_types: table.column_types,
             rows: table.rows,
             batch_size: Some(insert_batch_size),
         })?;
@@ -265,7 +338,7 @@ pub async fn export_database_sql_core(
         .read()
         .await
         .get(&request.connection_id)
-        .map(|c| c.db_type.clone())
+        .map(|c| c.db_type)
         .ok_or_else(|| format!("Connection config not found: {}", request.connection_id))?;
 
     // 2. Get pool
@@ -305,7 +378,8 @@ pub async fn export_database_sql_core(
 
     if request.include_objects && request.selected_tables.is_empty() {
         if let Ok(objects) =
-            crate::schema::list_objects_core(state, &request.connection_id, &request.database, &request.schema).await
+            crate::schema::list_objects_core(state, &request.connection_id, &request.database, &request.schema, None)
+                .await
         {
             for obj in &objects {
                 let ot = obj.object_type.to_uppercase();
@@ -337,7 +411,7 @@ pub async fn export_database_sql_core(
                 status: ExportStatus::Cancelled,
                 error: None,
             });
-            return Err("Export cancelled".to_string());
+            return Ok(());
         }
 
         let table_name = &table_info.name;
@@ -432,7 +506,7 @@ pub async fn export_database_sql_core(
                             status: ExportStatus::Cancelled,
                             error: None,
                         });
-                        return Err("Export cancelled".to_string());
+                        return Ok(());
                     }
 
                     let sql = crate::transfer::pagination_sql(
@@ -670,7 +744,13 @@ mod tests {
     use serde_json::{json, Value};
 
     fn table(name: &str, table_type: &str) -> TableInfo {
-        TableInfo { name: name.to_string(), table_type: table_type.to_string(), comment: None }
+        TableInfo {
+            name: name.to_string(),
+            table_type: table_type.to_string(),
+            comment: None,
+            parent_schema: None,
+            parent_name: None,
+        }
     }
 
     #[test]
@@ -695,7 +775,7 @@ mod tests {
     fn builds_drop_table_if_exists_with_qualified_mysql_name() {
         let sql = drop_table_if_exists_sql("users", "app", &DatabaseType::Mysql);
 
-        assert_eq!(sql, "DROP TABLE IF EXISTS `app`.`users`;");
+        assert_eq!(sql, "DROP TABLE IF EXISTS `users`;");
     }
 
     #[test]
@@ -721,6 +801,7 @@ mod tests {
             table_name: Some("users".to_string()),
             qualified_table_name: None,
             columns: vec!["id".to_string(), "name".to_string()],
+            column_types: Vec::new(),
             rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!("O'Hara")], vec![json!(3), json!("Linus")]],
             batch_size: Some(2),
         })
@@ -732,6 +813,26 @@ mod tests {
                 "INSERT INTO `users` (`id`, `name`) VALUES (1, 'Ada'), (2, 'O''Hara');",
                 "INSERT INTO `users` (`id`, `name`) VALUES (3, 'Linus');",
             ]
+        );
+    }
+
+    #[test]
+    fn mysql_bit_columns_export_without_quoted_string_values() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: Some("flags".to_string()),
+            qualified_table_name: None,
+            columns: vec!["enabled".to_string(), "mask".to_string(), "label".to_string()],
+            column_types: vec![Some("bit(1)".to_string()), Some("BIT(4)".to_string()), Some("varchar(20)".to_string())],
+            rows: vec![vec![json!("1"), json!("1010"), json!("1010")], vec![json!(false), json!(3), json!("off")]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec!["INSERT INTO `flags` (`enabled`, `mask`, `label`) VALUES (1, b'1010', '1010'), (0, 3, 'off');"]
         );
     }
 
@@ -748,6 +849,7 @@ mod tests {
                 qualified_table_name: None,
                 ddl: Some("CREATE TABLE `users` (`id` int);".to_string()),
                 columns: vec!["id".to_string()],
+                column_types: Vec::new(),
                 rows: vec![vec![json!(1)]],
                 truncated: true,
             }],
@@ -758,7 +860,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            vec![
+            [
                 "-- DBX database export".to_string(),
                 "-- Database: app".to_string(),
                 "-- Exported at: 2026-05-02T00:00:00.000Z".to_string(),

@@ -1,12 +1,20 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { test } from "vitest";
 import {
   canEditTableStructure,
   getTableStructureCapabilities,
 } from "../../apps/desktop/src/lib/tableStructureCapabilities.ts";
 
+test("sqlite-family and duckdb do not support table comments", () => {
+  for (const dbType of ["sqlite", "rqlite", "duckdb"] as const) {
+    const caps = getTableStructureCapabilities(dbType);
+    assert.equal(caps.comment, false, `${dbType} should not support comments`);
+    assert.equal(caps.createTable, true, `${dbType} should still support creating tables`);
+  }
+});
+
 test("postgres-like databases expose safe structure editing capabilities", () => {
-  for (const dbType of ["postgres", "gaussdb", "opengauss", "highgo", "vastbase", "kingbase"] as const) {
+  for (const dbType of ["postgres", "gaussdb", "kwdb", "opengauss", "highgo", "vastbase", "kingbase"] as const) {
     const caps = getTableStructureCapabilities(dbType);
     assert.equal(caps.dialect, "postgres", `${dbType} should reuse postgres DDL`);
     assert.equal(caps.createTable, true, `${dbType} should create tables`);
@@ -65,6 +73,7 @@ test("oracle-like databases expose oracle-compatible structure editing capabilit
     assert.equal(caps.createIndex, true);
     assert.equal(caps.dropIndex, true);
     assert.equal(caps.rebuildIndex, true);
+    assert.equal(caps.reorderColumn, false);
     assert.equal(canEditTableStructure(dbType), true);
   }
 });

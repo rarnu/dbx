@@ -53,6 +53,7 @@ pub struct ExecuteBatchRequest {
     pub database: String,
     pub statements: Vec<String>,
     pub schema: Option<String>,
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -150,6 +151,12 @@ pub struct BuildTableAdminSqlRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BuildDropTableChildObjectSqlRequest {
+    pub options: dbx_core::db_admin_sql::DropTableChildObjectSqlOptions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BuildDatabaseNameSqlRequest {
     pub options: dbx_core::db_admin_sql::DatabaseNameSqlOptions,
 }
@@ -188,6 +195,12 @@ pub struct BuildViewDdlRequest {
 #[serde(rename_all = "camelCase")]
 pub struct BuildTableStructureSqlRequest {
     pub options: dbx_core::table_structure_sql::TableStructureSqlOptions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildSingleColumnAlterSqlRequest {
+    pub options: dbx_core::table_structure_sql::SingleColumnAlterSqlOptions,
 }
 
 #[derive(Deserialize)]
@@ -256,7 +269,7 @@ pub async fn execute_query(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let execution_id = req.execution_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let registered = state.app.running_queries.register(execution_id);
+    let registered = state.app.running_queries.register(execution_id.clone());
     let cancel_token = registered.token();
 
     let result = dbx_core::query::execute_sql_statement_with_options(
@@ -273,6 +286,7 @@ pub async fn execute_query(
             result_session_id: req.result_session_id,
             client_session_id: req.client_session_id,
             timeout_secs: req.timeout_secs,
+            execution_id: Some(execution_id),
         },
     )
     .await
@@ -288,7 +302,7 @@ pub async fn execute_multi(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let execution_id = req.execution_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let registered = state.app.running_queries.register(execution_id);
+    let registered = state.app.running_queries.register(execution_id.clone());
     let cancel_token = registered.token();
 
     let result = dbx_core::query::execute_multi_core_with_options(
@@ -305,6 +319,7 @@ pub async fn execute_multi(
             result_session_id: req.result_session_id,
             client_session_id: req.client_session_id,
             timeout_secs: req.timeout_secs,
+            execution_id: Some(execution_id),
         },
     )
     .await
@@ -324,6 +339,7 @@ pub async fn execute_batch(
         &req.database,
         &req.statements,
         req.schema.as_deref(),
+        req.timeout_secs,
     )
     .await
     .map_err(AppError)?;
@@ -387,6 +403,7 @@ pub async fn execute_script(
         &req.database,
         &statements,
         req.schema.as_deref(),
+        None,
     )
     .await
     .map_err(AppError)?;
@@ -443,6 +460,74 @@ pub async fn build_explain_sql(
     Json(dbx_core::query_execution_sql::build_explain_sql(req.options))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetExplainInfoRequest {
+    pub connection_id: String,
+    pub database: Option<String>,
+    pub schema: Option<String>,
+    pub sql: String,
+    pub mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildCreateUserSqlRequest {
+    pub username: String,
+    pub password: String,
+    pub tablespace: String,
+}
+
+pub async fn get_explain_info(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<GetExplainInfoRequest>,
+) -> Result<Json<String>, AppError> {
+    let client = {
+        let connections = state.app.connections.read().await;
+        let pool = connections.get(&req.connection_id).ok_or_else(|| AppError("Connection not found".to_string()))?;
+        match pool {
+            dbx_core::connection::PoolKind::Agent(client) => client.clone(),
+            _ => return Err(AppError("Connection is not an agent-based connection".to_string())),
+        }
+    };
+
+    let config = {
+        let configs = state.app.configs.read().await;
+        configs.get(&req.connection_id).cloned()
+    };
+    let config = config.ok_or_else(|| AppError("Connection config not found".to_string()))?;
+    let timeout_secs = config.query_timeout_secs;
+
+    let mut client = client.lock().await;
+    let mode = req.mode.unwrap_or_else(|| "explain".to_string());
+    if mode.eq_ignore_ascii_case("autotrace") && !dbx_core::query_execution_sql::is_safe_dameng_autotrace_sql(&req.sql)
+    {
+        return Err(AppError("unsafe".to_string()));
+    }
+    let params = serde_json::json!({
+        "sql": req.sql,
+        "database": req.database.unwrap_or_default(),
+        "schema": req.schema.unwrap_or_default(),
+        "timeoutSecs": timeout_secs as i64,
+        "mode": mode,
+    });
+
+    let result: Result<serde_json::Value, String> = client.get_explain_info::<serde_json::Value>(params).await;
+    match result {
+        Ok(serde_json::Value::String(s)) => Ok(Json(s)),
+        Ok(serde_json::Value::Object(obj)) => {
+            let plan = obj.get("plan").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Ok(Json(plan))
+        }
+        Ok(val) => Err(AppError(format!("Unexpected result type from getExplainInfo: {:?}", val))),
+        Err(e) => Err(AppError(e)),
+    }
+}
+
+pub async fn build_create_user_sql(Json(req): Json<BuildCreateUserSqlRequest>) -> Result<Json<String>, AppError> {
+    Ok(Json(dbx_core::db_admin_sql::build_create_user_sql(&req.username, &req.password, &req.tablespace)))
+}
+
 pub async fn build_dropped_file_preview_sql(
     Json(req): Json<BuildDroppedFilePreviewSqlRequest>,
 ) -> Json<Option<String>> {
@@ -481,6 +566,12 @@ pub async fn build_drop_object_sql(Json(req): Json<BuildDropObjectSqlRequest>) -
 
 pub async fn build_drop_table_sql(Json(req): Json<BuildTableAdminSqlRequest>) -> Json<String> {
     Json(dbx_core::db_admin_sql::build_drop_table_sql(req.options))
+}
+
+pub async fn build_drop_table_child_object_sql(
+    Json(req): Json<BuildDropTableChildObjectSqlRequest>,
+) -> Result<Json<String>, AppError> {
+    dbx_core::db_admin_sql::build_drop_table_child_object_sql(req.options).map(Json).map_err(AppError)
 }
 
 pub async fn build_empty_table_sql(Json(req): Json<BuildTableAdminSqlRequest>) -> Json<String> {
@@ -541,6 +632,12 @@ pub async fn build_create_table_sql(
     Json(req): Json<BuildTableStructureSqlRequest>,
 ) -> Json<dbx_core::table_structure_sql::TableStructureSqlResult> {
     Json(dbx_core::table_structure_sql::build_create_table_sql(req.options))
+}
+
+pub async fn build_single_column_alter_sql(
+    Json(req): Json<BuildSingleColumnAlterSqlRequest>,
+) -> Json<dbx_core::table_structure_sql::TableStructureSqlResult> {
+    Json(dbx_core::table_structure_sql::build_single_column_alter_sql(req.options))
 }
 
 pub async fn analyze_editable_query_editability(

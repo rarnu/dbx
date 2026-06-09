@@ -2,6 +2,7 @@ export type DatabaseType =
   | "mysql"
   | "postgres"
   | "sqlite"
+  | "rqlite"
   | "redis"
   | "duckdb"
   | "clickhouse"
@@ -11,6 +12,7 @@ export type DatabaseType =
   | "elasticsearch"
   | "doris"
   | "starrocks"
+  | "databend"
   | "redshift"
   | "dameng"
   | "gaussdb"
@@ -18,6 +20,7 @@ export type DatabaseType =
   | "highgo"
   | "vastbase"
   | "goldendb"
+  | "kwdb"
   | "yashandb"
   | "databricks"
   | "saphana"
@@ -41,6 +44,10 @@ export type DatabaseType =
   | "kylin"
   | "sundb"
   | "tdengine"
+  | "xugu"
+  | "iotdb"
+  | "etcd"
+  | "iris"
   | "jdbc";
 
 export interface SqlSnippet {
@@ -65,25 +72,14 @@ export interface ConnectionConfig {
   visible_databases?: string[];
   attached_databases?: AttachedDatabaseConfig[];
   color?: string;
-  ssh_enabled?: boolean;
-  ssh_host?: string;
-  ssh_port?: number;
-  ssh_user?: string;
-  ssh_password?: string;
-  ssh_key_path?: string;
-  ssh_key_passphrase?: string;
-  ssh_expose_lan?: boolean;
-  ssh_connect_timeout_secs?: number;
+  transport_layers?: TransportLayerConfig[];
   connect_timeout_secs?: number;
   query_timeout_secs?: number;
-  proxy_enabled?: boolean;
-  proxy_type?: "socks5" | "http";
-  proxy_host?: string;
-  proxy_port?: number;
-  proxy_username?: string;
-  proxy_password?: string;
+  idle_timeout_secs?: number;
   ssl?: boolean;
   ca_cert_path?: string;
+  client_cert_path?: string;
+  client_key_path?: string;
   sysdba?: boolean;
   oracle_connection_type?: "service_name" | "sid";
   connection_string?: string;
@@ -96,7 +92,35 @@ export interface ConnectionConfig {
   redis_sentinel_password?: string;
   redis_sentinel_tls?: boolean;
   redis_cluster_nodes?: string;
+  etcd_endpoints?: string;
   one_time?: boolean;
+}
+
+export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig);
+
+export interface SshTunnelConfig {
+  id: string;
+  name?: string;
+  enabled?: boolean;
+  host: string;
+  port: number;
+  user: string;
+  password?: string;
+  key_path?: string;
+  key_passphrase?: string;
+  connect_timeout_secs?: number;
+  expose_lan?: boolean;
+}
+
+export interface ProxyTunnelConfig {
+  id: string;
+  name?: string;
+  enabled?: boolean;
+  proxy_type?: "socks5" | "http";
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
 }
 
 export interface AttachedDatabaseConfig {
@@ -151,9 +175,11 @@ export interface TableInfo {
   name: string;
   table_type: string;
   comment?: string | null;
+  parent_schema?: string | null;
+  parent_name?: string | null;
 }
 
-export type DatabaseObjectType = "TABLE" | "VIEW" | "PROCEDURE" | "FUNCTION";
+export type DatabaseObjectType = "TABLE" | "VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
 
 export interface ObjectInfo {
   name: string;
@@ -162,9 +188,11 @@ export interface ObjectInfo {
   comment?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+  parent_schema?: string | null;
+  parent_name?: string | null;
 }
 
-export type ObjectSourceKind = "VIEW" | "PROCEDURE" | "FUNCTION";
+export type ObjectSourceKind = "VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
 
 export interface ObjectSource {
   name: string;
@@ -200,6 +228,7 @@ export interface IndexInfo {
 export interface ForeignKeyInfo {
   name: string;
   column: string;
+  ref_schema?: string | null;
   ref_table: string;
   ref_column: string;
 }
@@ -212,6 +241,17 @@ export interface TriggerInfo {
 
 export interface QueryResult {
   columns: string[];
+  /**
+   * Database type name for each column, parallel to `columns`. Optional and may
+   * be shorter/empty when a driver cannot supply types (schemaless stores,
+   * fallback query paths, older backends). Consumers must tolerate gaps.
+   */
+  column_types?: string[];
+  /**
+   * Sortable for each column. Parallel to `columns`. Optional and may
+   * be shorter/empty when a driver cannot supply sortable information.
+   */
+  column_sortables?: boolean[];
   rows: (string | number | boolean | null)[][];
   affected_rows: number;
   execution_time_ms: number;
@@ -254,6 +294,9 @@ export type TreeNodeType =
   | "view"
   | "procedure"
   | "function"
+  | "sequence"
+  | "package"
+  | "package-body"
   | "group-columns"
   | "group-indexes"
   | "group-fkeys"
@@ -262,7 +305,11 @@ export type TreeNodeType =
   | "group-views"
   | "group-procedures"
   | "group-functions"
+  | "group-sequences"
+  | "group-packages"
+  | "group-partitions"
   | "object-browser"
+  | "user-admin"
   | "saved-sql-root"
   | "saved-sql-folder"
   | "saved-sql-file"
@@ -271,6 +318,7 @@ export type TreeNodeType =
   | "fkey"
   | "trigger"
   | "redis-db"
+  | "etcd-root"
   | "mongo-db"
   | "mongo-collection";
 
@@ -314,6 +362,7 @@ export interface TreeNode {
 export interface QueryTab {
   id: string;
   title: string;
+  customTitle?: boolean;
   connectionId: string;
   database: string;
   schema?: string;
@@ -322,12 +371,20 @@ export interface QueryTab {
   lastExecutedSql?: string;
   resultBaseSql?: string;
   resultSortedSql?: string;
+  resultSortColumn?: string;
+  resultSortColumnIndex?: number;
+  resultSortDirection?: "asc" | "desc";
+  orderByInput?: string;
   resultPageSql?: string;
   resultPageLimit?: number;
   resultPageOffset?: number;
   resultCountSql?: string;
   resultTotalRowCount?: number;
+  resultTotalRowCountLoading?: boolean;
   resultSessionId?: string;
+  resultAccessedAt?: number;
+  resultCacheKey?: string;
+  resultCacheState?: "memory" | "disk" | "missing";
   pinned?: boolean;
   result?: QueryResult;
   results?: QueryResult[];
@@ -338,10 +395,19 @@ export interface QueryTab {
   lastExplainedSql?: string;
   isExecuting: boolean;
   isCancelling?: boolean;
+  queryExecutionStartedAt?: number;
+  editorViewport?: {
+    scrollTop: number;
+    scrollLeft: number;
+  };
+  editorSelection?: {
+    anchor: number;
+    head: number;
+  };
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  mode: "data" | "query" | "redis" | "mongo" | "objects" | "structure";
+  mode: "data" | "query" | "redis" | "mongo" | "etcd" | "objects" | "structure" | "users";
   structureTableName?: string;
   objectBrowser?: {
     schema?: string;
@@ -360,11 +426,14 @@ export interface QueryTab {
   };
   queryAnalysis?: {
     schema?: string;
+    schemaQuoted?: boolean;
     tableName: string;
+    tableNameQuoted?: boolean;
     tableAlias?: string;
     selectStar: boolean;
     columns: {
       sourceName?: string;
+      sourceNameQuoted?: boolean;
       resultName: string;
       expression: string;
     }[];

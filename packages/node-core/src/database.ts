@@ -1,10 +1,11 @@
-import type { ConnectionConfig } from "./connections.js";
+import type { ConnectionConfig, ProxyTunnelConfig } from "./connections.js";
 import { createServer, connect as netConnect, type Server, type Socket } from "node:net";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir, platform } from "node:os";
 import Database from "better-sqlite3";
 import { sqlSafetyFromEnv } from "./sql-safety.js";
+import { isDirectQueryType } from "./diagnostics.js";
 
 export interface TableInfo {
   name: string;
@@ -41,8 +42,19 @@ interface PoolEntry {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface RqliteResult {
+  columns?: string[];
+  values?: unknown[][];
+  rows_affected?: number;
+  error?: string;
+}
+
+interface RqliteResponse {
+  results?: RqliteResult[];
+}
+
 const pools = new Map<string, PoolEntry>();
-const proxyTunnels = new Map<string, { server: Server; port: number }>();
+const proxyTunnels = new Map<string, { server: Server; port: number; sockets: Set<Socket> }>();
 
 function poolKey(config: ConnectionConfig): string {
   return `${config.id}:${config.database || ""}`;
@@ -50,6 +62,7 @@ function poolKey(config: ConnectionConfig): string {
 
 function evictPool(key: string, entry: PoolEntry) {
   pools.delete(key);
+  clearTimeout(entry.timer);
   if (entry.type === "pg") {
     (entry.pool as import("pg").Pool).end().catch(() => {});
   } else {
@@ -60,6 +73,33 @@ function evictPool(key: string, entry: PoolEntry) {
 function resetIdleTimer(key: string, entry: PoolEntry) {
   clearTimeout(entry.timer);
   entry.timer = setTimeout(() => evictPool(key, entry), IDLE_TIMEOUT_MS);
+}
+
+export async function closeDatabaseResources(): Promise<void> {
+  const poolEntries = [...pools.entries()];
+  pools.clear();
+  await Promise.all(
+    poolEntries.map(async ([, entry]) => {
+      clearTimeout(entry.timer);
+      if (entry.type === "pg") {
+        await (entry.pool as import("pg").Pool).end().catch(() => {});
+      } else {
+        await (entry.pool as import("mysql2/promise").Pool).end().catch(() => {});
+      }
+    }),
+  );
+
+  const tunnels = [...proxyTunnels.values()];
+  proxyTunnels.clear();
+  await Promise.all(
+    tunnels.map(
+      ({ server, sockets }) =>
+        new Promise<void>((resolve) => {
+          for (const socket of sockets) socket.destroy();
+          server.close(() => resolve());
+        }),
+    ),
+  );
 }
 
 async function getPgPool(config: ConnectionConfig): Promise<import("pg").Pool> {
@@ -107,14 +147,26 @@ async function getMysqlPool(config: ConnectionConfig): Promise<import("mysql2/pr
   return pool;
 }
 
+type ProxyLayer = { type: "proxy" } & ProxyTunnelConfig;
+
+function firstProxyLayer(config: ConnectionConfig): ProxyLayer | undefined {
+  return config.transport_layers?.find((layer): layer is ProxyLayer => layer.type === "proxy" && layer.enabled !== false && !!layer.host);
+}
+
 async function connectionEndpoint(config: ConnectionConfig): Promise<{ host: string; port: number }> {
-  if (!config.proxy_enabled || !config.proxy_host) return { host: config.host, port: config.port };
+  const proxy = firstProxyLayer(config);
+  if (!proxy) return { host: config.host, port: config.port };
   const existing = proxyTunnels.get(config.id);
   if (existing) return { host: "127.0.0.1", port: existing.port };
 
+  const sockets = new Set<Socket>();
   const server = createServer((inbound) => {
-    connectViaProxy(config)
+    sockets.add(inbound);
+    inbound.once("close", () => sockets.delete(inbound));
+    connectViaProxy(config, proxy)
       .then((outbound) => {
+        sockets.add(outbound);
+        outbound.once("close", () => sockets.delete(outbound));
         inbound.pipe(outbound);
         outbound.pipe(inbound);
       })
@@ -128,7 +180,7 @@ async function connectionEndpoint(config: ConnectionConfig): Promise<{ host: str
       else reject(new Error("Failed to bind proxy tunnel"));
     });
   });
-  proxyTunnels.set(config.id, { server, port });
+  proxyTunnels.set(config.id, { server, port, sockets });
   return { host: "127.0.0.1", port };
 }
 
@@ -142,25 +194,25 @@ function buildConnectionUrl(config: ConnectionConfig, endpoint: { host: string; 
   return `postgres://${encodeURIComponent(config.username)}:${encodeURIComponent(config.password)}@${endpoint.host}:${endpoint.port}/${db}${suffix}`;
 }
 
-function connectViaProxy(config: ConnectionConfig): Promise<Socket> {
+function connectViaProxy(config: ConnectionConfig, proxy: ProxyLayer): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    const socket = netConnect(config.proxy_port || 1080, config.proxy_host || "127.0.0.1");
+    const socket = netConnect(proxy.port || 1080, proxy.host || "127.0.0.1");
     socket.once("error", reject);
     socket.once("connect", () => {
-      if ((config.proxy_type || "socks5") === "http") {
-        httpConnect(socket, config, resolve, reject);
+      if ((proxy.proxy_type || "socks5") === "http") {
+        httpConnect(socket, config, proxy, resolve, reject);
       } else {
-        socks5Connect(socket, config, resolve, reject);
+        socks5Connect(socket, config, proxy, resolve, reject);
       }
     });
   });
 }
 
-function httpConnect(socket: Socket, config: ConnectionConfig, resolve: (socket: Socket) => void, reject: (err: Error) => void) {
+function httpConnect(socket: Socket, config: ConnectionConfig, proxy: ProxyLayer, resolve: (socket: Socket) => void, reject: (err: Error) => void) {
   const target = `${config.host}:${config.port}`;
   const lines = [`CONNECT ${target} HTTP/1.1`, `Host: ${target}`];
-  if (config.proxy_username || config.proxy_password) {
-    const token = Buffer.from(`${config.proxy_username || ""}:${config.proxy_password || ""}`).toString("base64");
+  if (proxy.username || proxy.password) {
+    const token = Buffer.from(`${proxy.username || ""}:${proxy.password || ""}`).toString("base64");
     lines.push(`Proxy-Authorization: Basic ${token}`);
   }
   socket.write(`${lines.join("\r\n")}\r\n\r\n`);
@@ -182,8 +234,8 @@ function httpConnect(socket: Socket, config: ConnectionConfig, resolve: (socket:
   });
 }
 
-function socks5Connect(socket: Socket, config: ConnectionConfig, resolve: (socket: Socket) => void, reject: (err: Error) => void) {
-  const wantsAuth = !!(config.proxy_username || config.proxy_password);
+function socks5Connect(socket: Socket, config: ConnectionConfig, proxy: ProxyLayer, resolve: (socket: Socket) => void, reject: (err: Error) => void) {
+  const wantsAuth = !!(proxy.username || proxy.password);
   socket.write(Buffer.from(wantsAuth ? [0x05, 0x02, 0x00, 0x02] : [0x05, 0x01, 0x00]));
   socket.once("data", (method) => {
     if (method.length < 2 || method[0] !== 0x05) {
@@ -192,8 +244,8 @@ function socks5Connect(socket: Socket, config: ConnectionConfig, resolve: (socke
       return;
     }
     if (method[1] === 0x02) {
-      const user = Buffer.from(config.proxy_username || "");
-      const pass = Buffer.from(config.proxy_password || "");
+      const user = Buffer.from(proxy.username || "");
+      const pass = Buffer.from(proxy.password || "");
       socket.write(Buffer.concat([Buffer.from([0x01, user.length]), user, Buffer.from([pass.length]), pass]));
       socket.once("data", (auth) => {
         if (auth.length < 2 || auth[1] !== 0x00) {
@@ -233,20 +285,6 @@ function portBytes(port: number): Buffer {
 
 function isMysqlType(dbType: string): boolean {
   return dbType === "mysql" || dbType === "doris" || dbType === "starrocks";
-}
-
-function isDirectType(dbType: string): boolean {
-  switch (dbType) {
-    case "postgres":
-    case "redshift":
-    case "mysql":
-    case "doris":
-    case "starrocks":
-    case "sqlite":
-      return true;
-    default:
-      return false;
-  }
 }
 
 interface BridgeQueryResult {
@@ -378,6 +416,7 @@ async function mysqlQuery(config: ConnectionConfig, sql: string, params?: unknow
 
 async function query(config: ConnectionConfig, sql: string, params?: unknown[], options?: QueryOptions): Promise<QueryResult> {
   if (config.db_type === "sqlite") return sqliteQuery(config, sql, options);
+  if (config.db_type === "rqlite") return rqliteQuery(config, sql, options);
   if (isMysqlType(config.db_type)) return mysqlQuery(config, sql, params, options);
   return pgQuery(config, sql, params, options);
 }
@@ -411,6 +450,47 @@ function sqliteQuery(config: ConnectionConfig, sql: string, options?: QueryOptio
   }
 }
 
+async function rqliteQuery(config: ConnectionConfig, sql: string, options?: QueryOptions): Promise<QueryResult> {
+  const isReader = /^\s*(?:--[^\n]*\n|\s|\/\*[\s\S]*?\*\/)*(select|pragma|explain|with)\b/i.test(sql);
+  const endpoint = isReader ? "/db/query" : "/db/execute";
+  const result = await rqliteRequest(config, endpoint, sql);
+  if (isReader) {
+    const columns = result.columns ?? [];
+    const rows = (result.values ?? []).slice(0, resolveMaxRows(options)).map((row) => {
+      const record: Record<string, unknown> = {};
+      columns.forEach((column, index) => {
+        record[column] = row[index];
+      });
+      return record;
+    });
+    return { columns, rows, row_count: rows.length };
+  }
+  return { columns: [], rows: [], row_count: result.rows_affected ?? 0 };
+}
+
+async function rqliteRequest(config: ConnectionConfig, endpoint: "/db/query" | "/db/execute", sql: string): Promise<RqliteResult> {
+  const { host, port } = await connectionEndpoint(config);
+  const scheme = config.ssl ? "https" : "http";
+  const params = (config.url_params || "").trim().replace(/^\?/, "");
+  const url = `${scheme}://${host}:${port}${endpoint}${params ? `?${params}` : ""}`;
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (config.username) {
+    headers.authorization = `Basic ${Buffer.from(`${config.username}:${config.password || ""}`).toString("base64")}`;
+  }
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify([sql]),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`rqlite error (${response.status}): ${text}`);
+  const payload = JSON.parse(text) as RqliteResponse;
+  const result = payload.results?.[0];
+  if (!result) throw new Error("rqlite returned no result");
+  if (result.error) throw new Error(`rqlite error: ${result.error}`);
+  return result;
+}
+
 export async function executeQuery(config: ConnectionConfig, sql: string, options?: QueryOptions): Promise<QueryResult> {
   if (config.db_type === "mongodb") {
     const find = parseMongoFindCommand(sql);
@@ -433,6 +513,14 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
       );
       return mongoDocumentsToQueryResult(result.documents.slice(0, resolveMaxRows(options)), result.total);
     }
+    const getIndexes = parseMongoGetIndexesCommand(sql);
+    if (getIndexes) {
+      const result = await withTimeout(
+        mongoAggregateDocuments(config, getIndexes.collection, '[{"$indexStats":{}}]', resolveMaxRows(options)),
+        resolveTimeoutMs(options),
+      );
+      return mongoDocumentsToQueryResult(result.documents.slice(0, resolveMaxRows(options)), result.total);
+    }
     const write = parseMongoWriteCommand(sql);
     if (write) {
       const safety = evaluateMongoWriteSafety(write, sqlSafetyFromEnv());
@@ -441,10 +529,10 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
       return { columns: [], rows: [], row_count: affected };
     }
     throw new Error(
-      "Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.projects.countDocuments({}), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})",
+      "Use MongoDB shell-style commands, for example: db.projects.find({}).limit(100), db.projects.countDocuments({}), db.projects.getIndexes(), db.projects.insertOne({...}), db.projects.updateOne({...}, {$set: {...}}), or db.projects.deleteOne({...})",
     );
   }
-  if (isDirectType(config.db_type)) {
+  if (isDirectQueryType(config.db_type)) {
     return query(config, sql, undefined, options);
   }
   const result = await withTimeout(bridgeDataRequest<BridgeQueryResult>("/data/execute-query", {
@@ -464,14 +552,14 @@ export async function listTables(config: ConnectionConfig, schema?: string): Pro
     });
     return collections.map((name) => ({ name, type: "COLLECTION" }));
   }
-  if (config.db_type === "sqlite") {
+  if (config.db_type === "sqlite" || config.db_type === "rqlite") {
     const result = await query(
       config,
       `SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name`,
     );
     return result.rows.map((r) => ({ name: String(r.name || ""), type: String(r.type || "table") }));
   }
-  if (!isDirectType(config.db_type)) {
+  if (!isDirectQueryType(config.db_type)) {
     const tables = await bridgeDataRequest<BridgeTableInfo[]>("/data/list-tables", {
       connection_name: config.name,
       database: config.database || "",
@@ -497,7 +585,7 @@ export async function describeTable(config: ConnectionConfig, table: string, sch
     const result = await mongoFindDocuments(config, table, 0, 20, "{}");
     return inferMongoColumns(result.documents);
   }
-  if (config.db_type === "sqlite") {
+  if (config.db_type === "sqlite" || config.db_type === "rqlite") {
     const result = await query(config, `PRAGMA table_info(${quoteSqliteIdentifier(table)})`);
     return result.rows.map((r) => ({
       name: String(r.name || ""),
@@ -508,7 +596,7 @@ export async function describeTable(config: ConnectionConfig, table: string, sch
       comment: null,
     }));
   }
-  if (!isDirectType(config.db_type)) {
+  if (!isDirectQueryType(config.db_type)) {
     const columns = await bridgeDataRequest<BridgeColumnInfo[]>("/data/describe-table", {
       connection_name: config.name,
       database: config.database || "",
@@ -678,6 +766,10 @@ interface MongoAggregateCommand {
   pipeline: string;
 }
 
+interface MongoGetIndexesCommand {
+  collection: string;
+}
+
 export type MongoWriteCommand =
   | { kind: "insert"; collection: string; docsJson: string }
   | { kind: "update"; collection: string; filter: string; update: string; many: boolean }
@@ -730,6 +822,15 @@ export function parseMongoAggregateCommand(input: string): MongoAggregateCommand
   const pipeline = normalizeJsonArgument(args[0]);
   if (!pipeline) return null;
   return Array.isArray(JSON.parse(pipeline)) ? { collection: target.collection, pipeline } : null;
+}
+
+export function parseMongoGetIndexesCommand(input: string): MongoGetIndexesCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  const target = parseCollectionMethodTarget(source, "getIndexes");
+  if (!target) return null;
+  const args = parseMethodArgs(source, target.methodCallIndex);
+  if (!args || args.some((arg) => arg.trim())) return null;
+  return { collection: target.collection };
 }
 
 export function mongoAggregateWriteStage(pipelineJson: string): "$out" | "$merge" | null {
@@ -862,13 +963,107 @@ function readChainedIntegerArgument(chain: string, method: string, fallback: num
 }
 
 function normalizeJsonArgument(arg: string): string | null {
-  const value = (arg.trim() || "{}").replace(/ObjectId\s*\(\s*["']([^"']+)["']\s*\)/g, '{"$oid":"$1"}');
+  const value = quoteUnquotedObjectKeys(
+    convertSingleQuotedStrings((arg.trim() || "{}").replace(/ObjectId\s*\(\s*["']([^"']+)["']\s*\)/g, '{"$oid":"$1"}')),
+  );
   try {
     JSON.parse(value);
     return value;
   } catch {
     return null;
   }
+}
+
+function convertSingleQuotedStrings(source: string): string {
+  let result = "";
+  let copiedUntil = 0;
+  let quote: string | null = null;
+  let start = 0;
+  let value = "";
+  let escaped = false;
+
+  for (let i = 0; i < source.length; i += 1) {
+    const char = source[i];
+    if (!quote) {
+      if (char === "'") {
+        quote = char;
+        start = i;
+        value = "";
+        escaped = false;
+      } else if (char === '"') {
+        quote = char;
+      }
+      continue;
+    }
+
+    if (quote === '"') {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quote = null;
+      continue;
+    }
+
+    if (escaped) {
+      value += char;
+      escaped = false;
+    } else if (char === "\\") {
+      escaped = true;
+    } else if (char === "'") {
+      result += source.slice(copiedUntil, start) + JSON.stringify(value);
+      copiedUntil = i + 1;
+      quote = null;
+    } else {
+      value += char;
+    }
+  }
+
+  return quote === "'" ? source : result + source.slice(copiedUntil);
+}
+
+function quoteUnquotedObjectKeys(source: string): string {
+  let result = "";
+  let quote: string | null = null;
+  let escaped = false;
+
+  for (let i = 0; i < source.length; i += 1) {
+    const char = source[i];
+    if (quote) {
+      result += char;
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = null;
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quote = char;
+      result += char;
+      continue;
+    }
+
+    if (/[A-Za-z_$]/.test(char) && shouldQuoteObjectKey(source, i)) {
+      let end = i + 1;
+      while (/[\w$]/.test(source[end] || "")) end += 1;
+      result += `"${source.slice(i, end)}"`;
+      i = end - 1;
+      continue;
+    }
+
+    result += char;
+  }
+
+  return result;
+}
+
+function shouldQuoteObjectKey(source: string, index: number): boolean {
+  let before = index - 1;
+  while (/\s/.test(source[before] || "")) before -= 1;
+  if (source[before] !== "{" && source[before] !== ",") return false;
+
+  let after = index + 1;
+  while (/[\w$]/.test(source[after] || "")) after += 1;
+  while (/\s/.test(source[after] || "")) after += 1;
+  return source[after] === ":";
 }
 
 function isEmptyJsonObject(json: string): boolean {

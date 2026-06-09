@@ -122,11 +122,13 @@ pub fn build_routine_rename_object_source_statements(
 pub fn build_executable_object_source_statements(input: EditableObjectSourceSqlInput) -> Result<Vec<String>, String> {
     let source = input.source.trim();
     if input.database_type == DatabaseType::SqlServer {
-        return Ok(vec![replace_sqlserver_create_with_alter(source)]);
+        return Ok(vec![replace_sqlserver_create_with_create_or_alter(source)]);
     }
 
-    if matches!(input.database_type, DatabaseType::Postgres | DatabaseType::Gaussdb)
-        && input.object_type == ObjectSourceKind::View
+    if matches!(
+        input.database_type,
+        DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::Kwdb | DatabaseType::OpenGauss
+    ) && input.object_type == ObjectSourceKind::View
     {
         return Ok(vec![format!(
             "CREATE OR REPLACE VIEW {} AS\n{}",
@@ -211,6 +213,8 @@ fn is_postgres_like(database_type: DatabaseType) -> bool {
         DatabaseType::Postgres
             | DatabaseType::Redshift
             | DatabaseType::Gaussdb
+            | DatabaseType::Kwdb
+            | DatabaseType::OpenGauss
             | DatabaseType::Kingbase
             | DatabaseType::Highgo
             | DatabaseType::Vastbase
@@ -230,6 +234,9 @@ fn object_type_keyword(object_type: &ObjectSourceKind) -> &'static str {
         ObjectSourceKind::View => "VIEW",
         ObjectSourceKind::Procedure => "PROCEDURE",
         ObjectSourceKind::Function => "FUNCTION",
+        ObjectSourceKind::Sequence => "SEQUENCE",
+        ObjectSourceKind::Package => "PACKAGE",
+        ObjectSourceKind::PackageBody => "PACKAGE BODY",
     }
 }
 
@@ -364,8 +371,11 @@ fn routine_name_changed(source_name: &str, saved_name: &str) -> bool {
     !source_name.eq_ignore_ascii_case(saved_name)
 }
 
-fn replace_sqlserver_create_with_alter(source: &str) -> String {
-    Regex::new(r"(?i)^CREATE\s+(?:OR\s+ALTER\s+)?").unwrap().replace(source, "ALTER ").to_string()
+fn replace_sqlserver_create_with_create_or_alter(source: &str) -> String {
+    Regex::new(r"(?i)^(?:CREATE\s+(?:OR\s+ALTER\s+)?|ALTER\s+)")
+        .unwrap()
+        .replace(source, "CREATE OR ALTER ")
+        .to_string()
 }
 
 fn parse_object_source_kind(value: &str) -> Option<ObjectSourceKind> {
@@ -375,6 +385,12 @@ fn parse_object_source_kind(value: &str) -> Option<ObjectSourceKind> {
         Some(ObjectSourceKind::Procedure)
     } else if value.eq_ignore_ascii_case("FUNCTION") {
         Some(ObjectSourceKind::Function)
+    } else if value.eq_ignore_ascii_case("SEQUENCE") {
+        Some(ObjectSourceKind::Sequence)
+    } else if value.eq_ignore_ascii_case("PACKAGE") {
+        Some(ObjectSourceKind::Package)
+    } else if value.eq_ignore_ascii_case("PACKAGE BODY") || value.eq_ignore_ascii_case("PACKAGE_BODY") {
+        Some(ObjectSourceKind::PackageBody)
     } else {
         None
     }
@@ -395,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlserver_edited_source_saves_as_alter() {
+    fn sqlserver_edited_source_saves_as_create_or_alter() {
         let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
             database_type: DatabaseType::SqlServer,
             object_type: ObjectSourceKind::Procedure,
@@ -404,7 +420,20 @@ mod tests {
             source: "CREATE PROCEDURE dbo.usp_demo AS SELECT 1;".to_string(),
         })
         .unwrap();
-        assert_eq!(sql, "ALTER PROCEDURE dbo.usp_demo AS SELECT 1;");
+        assert_eq!(sql, "CREATE OR ALTER PROCEDURE dbo.usp_demo AS SELECT 1;");
+    }
+
+    #[test]
+    fn sqlserver_alter_source_saves_as_create_or_alter() {
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::SqlServer,
+            object_type: ObjectSourceKind::Procedure,
+            schema: Some("dbo".to_string()),
+            name: "usp_demo".to_string(),
+            source: "ALTER PROCEDURE dbo.usp_demo AS SELECT 1;".to_string(),
+        })
+        .unwrap();
+        assert_eq!(sql, "CREATE OR ALTER PROCEDURE dbo.usp_demo AS SELECT 1;");
     }
 
     #[test]
@@ -421,6 +450,24 @@ mod tests {
             sql,
             "CREATE OR REPLACE VIEW \"public\".\"active users\" AS\nSELECT id, name FROM users WHERE active;"
         );
+    }
+
+    #[test]
+    fn postgres_compatible_view_body_opens_as_create_or_replace_view() {
+        for database_type in [DatabaseType::OpenGauss, DatabaseType::Kwdb] {
+            let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+                database_type,
+                object_type: ObjectSourceKind::View,
+                schema: Some("public".to_string()),
+                name: "active users".to_string(),
+                source: " SELECT id, name FROM users WHERE active ".to_string(),
+            })
+            .unwrap();
+            assert_eq!(
+                sql,
+                "CREATE OR REPLACE VIEW \"public\".\"active users\" AS\nSELECT id, name FROM users WHERE active;"
+            );
+        }
     }
 
     #[test]
@@ -460,6 +507,20 @@ mod tests {
         });
 
         assert_eq!(sql, "CREATE VIEW `reporting`.`active_users` AS\nSELECT id FROM users;");
+    }
+
+    #[test]
+    fn oracle_package_source_saves_as_single_create_or_replace_statement() {
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Oracle,
+            object_type: ObjectSourceKind::PackageBody,
+            schema: Some("HR".to_string()),
+            name: "PAYROLL".to_string(),
+            source: "CREATE OR REPLACE PACKAGE BODY PAYROLL AS\nEND PAYROLL;".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(sql, "CREATE OR REPLACE PACKAGE BODY PAYROLL AS\nEND PAYROLL;");
     }
 
     #[test]

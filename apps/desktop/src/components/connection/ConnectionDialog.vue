@@ -9,41 +9,100 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import type { ConnectionConfig, DatabaseType, JdbcDriverInfo } from "@/types/database";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import type {
+  ConnectionConfig,
+  DatabaseType,
+  JdbcDriverInfo,
+  ProxyTunnelConfig,
+  SshTunnelConfig,
+  TransportLayerConfig,
+} from "@/types/database";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import * as api from "@/lib/api";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
-import { applyParsedConnectionUrl, parseConnectionUrl } from "@/lib/connectionUrl";
+import { applyParsedConnectionUrl, normalizeMongoConnectionString, parseConnectionUrl } from "@/lib/connectionUrl";
 import type { ConnectionDeepLinkDraft } from "@/lib/connectionDeepLink";
 import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connectionPresentation";
+import {
+  h2ConnectionModeForConfig,
+  h2FileJdbcUrl,
+  h2FilePathFromJdbcUrl,
+  type H2ConnectionMode,
+} from "@/lib/h2Connection";
 import { mongodbAuthFailureHint, mongoUrlParam, setMongoUrlParam } from "@/lib/mongoConnectionOptions";
 import { copyToClipboard } from "@/lib/clipboard";
 import { showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
 import {
   ArrowLeft,
+  ArrowDown,
+  ArrowUp,
+  CheckSquare,
   ChevronRight,
   Copy,
   ExternalLink,
   FilePlus2,
   FolderOpen,
+  GripVertical,
   Grid3X3,
   KeyRound,
   Link2,
   List,
+  ListFilter,
+  Loader2,
+  Pipette,
+  Plus,
   Search,
   ShieldCheck,
-} from "lucide-vue-next";
+  Square,
+  Trash2,
+} from "@lucide/vue";
+import {
+  buildDraftVisibleDatabasesConnectionId,
+  connectionCanChooseVisibleDatabases,
+  initialVisibleDatabaseSelection,
+  visibleDatabaseSelectionIsStale,
+} from "@/lib/connectionVisibleDatabases";
+import {
+  canSaveVisibleDatabaseSelection,
+  filterDatabaseNamesForConnection,
+  isSystemDatabaseName,
+  normalizeVisibleDatabaseSelection,
+} from "@/lib/visibleDatabases";
 
 type DbOption = { value: string; label: string };
 type DbCategory = { key: string; title: string; options: DbOption[] };
 type DialogStep = "select" | "config";
 type DbPickerView = "icon" | "list";
-type ConfigTab = "connection" | "advanced" | "tls" | "ssh" | "proxy";
+type ConfigTab = "connection" | "advanced" | "tls" | "transport";
+
+type LegacyTransportFields = {
+  ssh_enabled?: boolean;
+  ssh_host?: string;
+  ssh_port?: number;
+  ssh_user?: string;
+  ssh_password?: string;
+  ssh_key_path?: string;
+  ssh_key_passphrase?: string;
+  ssh_expose_lan?: boolean;
+  ssh_connect_timeout_secs?: number;
+  ssh_tunnels?: SshTunnelConfig[];
+  proxy_enabled?: boolean;
+  proxy_type?: "socks5" | "http";
+  proxy_host?: string;
+  proxy_port?: number;
+  proxy_username?: string;
+  proxy_password?: string;
+};
+type LegacyConnectionConfig = ConnectionConfig & LegacyTransportFields;
+type ConnectionForm = Omit<ConnectionConfig, "id">;
 
 const { t } = useI18n();
 const { toast } = useToast();
+const settingsStore = useSettingsStore();
 const open = defineModel<boolean>("open", { default: false });
 const isDesktop = isTauriRuntime();
 
@@ -64,9 +123,16 @@ const isTesting = ref(false);
 const isSaving = ref(false);
 const testResult = ref<{ ok: boolean; message: string } | null>(null);
 const editingId = ref<string | null>(null);
+const showVisibleDatabasesDialog = ref(false);
+const isLoadingVisibleDatabases = ref(false);
+const visibleDatabaseNames = ref<string[]>([]);
+const visibleDatabaseSelection = ref<Set<string>>(new Set());
+const visibleDatabaseSearchText = ref("");
+const visibleDatabaseError = ref("");
+const visibleDatabaseShowSystem = ref(false);
 let testRunId = 0;
 
-const defaultForm = (): Omit<ConnectionConfig, "id"> => ({
+const defaultForm = (): ConnectionForm => ({
   name: "",
   db_type: "mysql",
   driver_profile: "mysql",
@@ -78,25 +144,15 @@ const defaultForm = (): Omit<ConnectionConfig, "id"> => ({
   password: "",
   database: undefined,
   color: "",
-  ssh_enabled: false,
-  ssh_host: "",
-  ssh_port: 22,
-  ssh_user: "",
-  ssh_password: "",
-  ssh_key_path: "",
-  ssh_key_passphrase: "",
-  ssh_expose_lan: false,
-  ssh_connect_timeout_secs: 5,
+  transport_layers: [],
   connect_timeout_secs: 5,
   query_timeout_secs: 30,
-  proxy_enabled: false,
-  proxy_type: "socks5",
-  proxy_host: "",
-  proxy_port: 1080,
-  proxy_username: "",
-  proxy_password: "",
+  idle_timeout_secs: 60,
   ssl: false,
   ca_cert_path: "",
+  client_cert_path: "",
+  client_key_path: "",
+  sysdba: false,
   oracle_connection_type: "service_name",
   connection_string: undefined,
   jdbc_driver_class: undefined,
@@ -108,9 +164,130 @@ const defaultForm = (): Omit<ConnectionConfig, "id"> => ({
   redis_sentinel_password: "",
   redis_sentinel_tls: false,
   redis_cluster_nodes: "",
+  etcd_endpoints: "",
+  visible_databases: undefined,
 });
 
+function defaultSshTunnel(): SshTunnelConfig {
+  return {
+    id: uuid(),
+    name: "",
+    enabled: true,
+    host: "",
+    port: 22,
+    user: "",
+    password: "",
+    key_path: "",
+    key_passphrase: "",
+    connect_timeout_secs: 5,
+    expose_lan: false,
+  };
+}
+
+function normalizeSshTunnel(hop: Partial<SshTunnelConfig>): SshTunnelConfig {
+  return {
+    id: hop.id || uuid(),
+    name: hop.name || "",
+    enabled: hop.enabled !== false,
+    host: hop.host || "",
+    port: Number(hop.port) || 22,
+    user: hop.user || "",
+    password: hop.password || "",
+    key_path: hop.key_path || "",
+    key_passphrase: hop.key_passphrase || "",
+    connect_timeout_secs: Number(hop.connect_timeout_secs) || 5,
+    expose_lan: !!hop.expose_lan,
+  };
+}
+
+function defaultProxyTunnel(): ProxyTunnelConfig {
+  return {
+    id: uuid(),
+    name: "",
+    enabled: true,
+    proxy_type: "socks5",
+    host: "",
+    port: 1080,
+    username: "",
+    password: "",
+  };
+}
+
+function normalizeProxyTunnel(layer: Partial<ProxyTunnelConfig>): ProxyTunnelConfig {
+  return {
+    id: layer.id || uuid(),
+    name: layer.name || "",
+    enabled: layer.enabled !== false,
+    proxy_type: layer.proxy_type || "socks5",
+    host: layer.host || "",
+    port: Number(layer.port) || 1080,
+    username: layer.username || "",
+    password: layer.password || "",
+  };
+}
+
+function normalizeTransportLayer(layer: Partial<TransportLayerConfig>): TransportLayerConfig {
+  if (layer.type === "proxy") {
+    return { type: "proxy", ...normalizeProxyTunnel(layer) };
+  }
+  return { type: "ssh", ...normalizeSshTunnel(layer as Partial<SshTunnelConfig>) };
+}
+
+function transportLayersForConfig(config: LegacyConnectionConfig): TransportLayerConfig[] {
+  if (config.transport_layers?.length) {
+    return config.transport_layers.map(normalizeTransportLayer);
+  }
+  const layers: TransportLayerConfig[] = sshLayersForConfig(config).map((hop) => ({ type: "ssh", ...hop }));
+  if (config.proxy_enabled || config.proxy_host || config.proxy_username || config.proxy_password) {
+    layers.push({
+      type: "proxy",
+      ...normalizeProxyTunnel({
+        id: "legacy-proxy",
+        enabled: true,
+        proxy_type: config.proxy_type || "socks5",
+        host: config.proxy_host || "",
+        port: config.proxy_port || 1080,
+        username: config.proxy_username || "",
+        password: config.proxy_password || "",
+      }),
+    });
+  }
+  return layers;
+}
+
+function sshLayersForConfig(config: LegacyConnectionConfig): SshTunnelConfig[] {
+  if (config.ssh_tunnels?.length) {
+    return config.ssh_tunnels.map(normalizeSshTunnel);
+  }
+  if (
+    config.ssh_enabled ||
+    config.ssh_host ||
+    config.ssh_user ||
+    config.ssh_password ||
+    config.ssh_key_path ||
+    config.ssh_key_passphrase
+  ) {
+    return [
+      normalizeSshTunnel({
+        id: "legacy",
+        enabled: true,
+        host: config.ssh_host || "",
+        port: config.ssh_port || 22,
+        user: config.ssh_user || "",
+        password: config.ssh_password || "",
+        key_path: config.ssh_key_path || "",
+        key_passphrase: config.ssh_key_passphrase || "",
+        connect_timeout_secs: config.ssh_connect_timeout_secs || 5,
+        expose_lan: config.ssh_expose_lan || false,
+      }),
+    ];
+  }
+  return [];
+}
+
 const form = ref(defaultForm());
+const selectedTransportLayerId = ref<string | null>(null);
+const draggedTransportLayerId = ref<string | null>(null);
 const selectedType = ref("mysql");
 const customDriverName = ref("");
 const mongoUseUrl = ref(false);
@@ -119,6 +296,8 @@ const jdbcDrivers = ref<JdbcDriverInfo[]>([]);
 const agentDrivers = ref<AgentDriverInstallState[]>([]);
 const selectedJdbcDriverPath = ref("");
 const connectionUrlInput = ref("");
+const oceanbaseSubMode = ref<"mysql" | "oracle">("mysql");
+const h2ConnectionMode = ref<H2ConnectionMode>("file");
 const dialogStep = ref<DialogStep>("select");
 const dbPickerView = ref<DbPickerView>("icon");
 const dbSearchQuery = ref("");
@@ -133,6 +312,28 @@ const colorOptions = [
   { value: "#3b82f6", class: "bg-blue-500", labelKey: "connection.colorBlue" },
   { value: "#a855f7", class: "bg-purple-500", labelKey: "connection.colorPurple" },
 ];
+
+const isPresetColor = (color: string | undefined) => colorOptions.some((c) => c.value === (color || ""));
+const customColorInput = ref("");
+const customColorOpen = ref(false);
+
+function applyCustomColor(value: string) {
+  form.value.color = value;
+  customColorInput.value = value;
+}
+
+function handlePresetClick(color: string) {
+  form.value.color = color;
+  customColorInput.value = "";
+}
+
+function handleCustomColorPicked(value: string) {
+  applyCustomColor(value);
+}
+
+function handleCustomColorInput(value: string) {
+  applyCustomColor(value);
+}
 
 const driverProfiles: Record<
   string,
@@ -157,6 +358,7 @@ const driverProfiles: Record<
   },
   redis: { type: "redis", port: 6379, user: "", label: "Redis", icon: "redis" },
   sqlite: { type: "sqlite", port: 0, user: "", label: "SQLite", icon: "sqlite" },
+  rqlite: { type: "rqlite", port: 4001, user: "", label: "RQLite", icon: "rqlite" },
   duckdb: { type: "duckdb", port: 0, user: "", label: "DuckDB", icon: "duckdb" },
   access: { type: "access", port: 0, user: "", label: "Microsoft Access", icon: "access" },
   mongodb: { type: "mongodb", port: 27017, user: "", label: "MongoDB", icon: "mongodb" },
@@ -169,6 +371,7 @@ const driverProfiles: Record<
   },
   sqlserver: { type: "sqlserver", port: 1433, user: "sa", label: "SQL Server", icon: "sqlserver" },
   oracle: { type: "oracle", port: 1521, user: "system", label: "Oracle", icon: "oracle" },
+  "oracle-legacy": { type: "oracle", port: 1521, user: "system", label: "Oracle Legacy", icon: "oracle" },
   "oracle-10g": { type: "oracle", port: 1521, user: "system", label: "Oracle 10g", icon: "oracle" },
   elasticsearch: {
     type: "elasticsearch",
@@ -188,6 +391,7 @@ const driverProfiles: Record<
     icon: "oceanbase",
   },
   goldendb: { type: "goldendb", port: 3306, user: "root", label: "GoldenDB", icon: "goldendb" },
+  databend: { type: "databend", port: 8000, user: "databend", label: "Databend", icon: "databend" },
   tdsql: { type: "mysql", port: 3306, user: "root", label: "TDSQL", icon: "tdsql" },
   polardb: { type: "mysql", port: 3306, user: "root", label: "PolarDB", icon: "polardb" },
   greatsql: { type: "mysql", port: 3306, user: "root", label: "GreatSQL", icon: "greatsql" },
@@ -198,6 +402,7 @@ const driverProfiles: Record<
   firebird: { type: "firebird", port: 3050, user: "SYSDBA", label: "Firebird", icon: "firebird" },
   exasol: { type: "exasol", port: 8563, user: "sys", label: "Exasol", icon: "exasol" },
   gbase: { type: "gbase", port: 5258, user: "gbasedbt", label: "GBase", icon: "gbase" },
+  gbase8s: { type: "gbase", port: 9088, user: "gbasedbt", label: "GBase 8s", icon: "gbase" },
   opengauss: {
     type: "opengauss",
     port: 5432,
@@ -206,6 +411,7 @@ const driverProfiles: Record<
     icon: "opengauss",
   },
   gaussdb: { type: "gaussdb", port: 5432, user: "gaussdb", label: "GaussDB", icon: "gaussdb" },
+  kwdb: { type: "kwdb", port: 26257, user: "root", label: "KWDB", icon: "kwdb" },
   kingbase: { type: "kingbase", port: 54321, user: "system", label: "KingBase", icon: "kingbase" },
   highgo: { type: "highgo", port: 5866, user: "highgo", label: "瀚高 HighGo", icon: "highgo" },
   yashandb: { type: "yashandb", port: 1688, user: "sys", label: "崖山 YashanDB", icon: "yashandb" },
@@ -256,6 +462,10 @@ const driverProfiles: Record<
   sundb: { type: "sundb", port: 22000, user: "root", label: "SunDB", icon: "sundb" },
   jdbc: { type: "jdbc", port: 0, user: "", label: "JDBC", icon: "jdbc" },
   tdengine: { type: "tdengine", port: 6041, user: "root", label: "TDengine", icon: "tdengine" },
+  xugu: { type: "xugu", port: 5138, user: "", label: "虚谷 XuguDB", icon: "xugu" },
+  iotdb: { type: "iotdb", port: 6667, user: "root", label: "Apache IoTDB", icon: "iotdb" },
+  etcd: { type: "etcd", port: 2379, user: "", label: "etcd", icon: "etcd" },
+  iris: { type: "iris", port: 1972, user: "_SYSTEM", label: "IRIS", icon: "iris" },
   custom_mysql: {
     type: "mysql",
     port: 3306,
@@ -275,8 +485,12 @@ const driverProfiles: Record<
 };
 
 function profileForConfig(config: ConnectionConfig) {
-  if (config.driver_profile && driverProfiles[config.driver_profile]) return config.driver_profile;
+  if (config.driver_profile && driverProfiles[config.driver_profile]) {
+    if (config.driver_profile === "oceanbase-oracle") return "oceanbase";
+    return config.driver_profile;
+  }
   if (config.db_type === "dameng") return "dm";
+  if (config.db_type === "oceanbase-oracle") return "oceanbase";
   return config.db_type;
 }
 
@@ -309,6 +523,12 @@ function applyProfile(val: string, preserveConnectionFields = false) {
     if (profile.type === "sqlite" || profile.type === "duckdb" || profile.type === "access") {
       form.value.host = "";
     }
+    if (profile.type === "h2") {
+      h2ConnectionMode.value = "file";
+      form.value.host = "";
+      form.value.port = 0;
+      form.value.connection_string = undefined;
+    }
     if (profile.type === "jdbc") {
       form.value.host = "";
       form.value.connection_string = "";
@@ -319,10 +539,28 @@ function applyProfile(val: string, preserveConnectionFields = false) {
   }
 }
 
+function switchOceanbaseMode(mode: "mysql" | "oracle") {
+  oceanbaseSubMode.value = mode;
+  if (mode === "mysql") {
+    applyProfile("oceanbase", false);
+  } else {
+    applyProfile("oceanbase-oracle", false);
+    selectedType.value = "oceanbase";
+  }
+  resetTestState();
+}
+
+function switchGbaseProfile(profile: "gbase" | "gbase8s") {
+  applyProfile(profile, false);
+  selectedType.value = "gbase";
+  resetTestState();
+}
+
 watch(
   () => props.editConfig,
   (config) => {
     if (config) {
+      const legacyConfig = config as LegacyConnectionConfig;
       const profile = profileForConfig(config);
       editingId.value = config.id;
       const profileConfig = driverProfiles[profile];
@@ -332,31 +570,21 @@ watch(
         driver_profile: profile,
         driver_label: config.driver_label || driverProfiles[profile]?.label || config.db_type,
         url_params: config.url_params || "",
-        host: config.host,
+        host: config.db_type === "h2" ? config.host || h2FilePathFromJdbcUrl(config.connection_string) : config.host,
         port: profile === "tdengine" && (config.port === 0 || config.port === 6030) ? 6041 : config.port,
         username: config.username,
         password: config.password,
         database: config.database,
         color: config.color || "",
-        ssh_enabled: config.ssh_enabled || false,
-        ssh_host: config.ssh_host || "",
-        ssh_port: config.ssh_port || 22,
-        ssh_user: config.ssh_user || "",
-        ssh_password: config.ssh_password || "",
-        ssh_key_path: config.ssh_key_path || "",
-        ssh_key_passphrase: config.ssh_key_passphrase || "",
-        ssh_expose_lan: config.ssh_expose_lan || false,
-        ssh_connect_timeout_secs: config.ssh_connect_timeout_secs || 5,
+        transport_layers: transportLayersForConfig(legacyConfig),
         connect_timeout_secs: config.connect_timeout_secs || 5,
         query_timeout_secs: config.query_timeout_secs ?? 30,
-        proxy_enabled: config.proxy_enabled || false,
-        proxy_type: config.proxy_type || "socks5",
-        proxy_host: config.proxy_host || "",
-        proxy_port: config.proxy_port || 1080,
-        proxy_username: config.proxy_username || "",
-        proxy_password: config.proxy_password || "",
+        idle_timeout_secs: config.idle_timeout_secs ?? 60,
         ssl: config.ssl || false,
         ca_cert_path: config.ca_cert_path || "",
+        client_cert_path: config.client_cert_path || "",
+        client_key_path: config.client_key_path || "",
+        sysdba: config.sysdba || isOracleSysUser(config),
         oracle_connection_type: config.oracle_connection_type || "service_name",
         connection_string: config.connection_string,
         jdbc_driver_class: config.jdbc_driver_class,
@@ -368,8 +596,19 @@ watch(
         redis_sentinel_password: config.redis_sentinel_password || "",
         redis_sentinel_tls: config.redis_sentinel_tls || false,
         redis_cluster_nodes: config.redis_cluster_nodes || "",
+        etcd_endpoints: config.etcd_endpoints || "",
+        visible_databases: config.visible_databases,
       };
+      h2ConnectionMode.value = h2ConnectionModeForConfig(config);
+      customColorInput.value = config.color || "";
+      selectedTransportLayerId.value = form.value.transport_layers?.[0]?.id || null;
       selectedType.value = profile;
+      if (profile === "oceanbase") {
+        oceanbaseSubMode.value = config.driver_profile === "oceanbase-oracle" ? "oracle" : "mysql";
+      }
+      if (profile === "gbase8s") {
+        selectedType.value = "gbase";
+      }
       mongoUseUrl.value = !!config.connection_string;
       jdbcDriverPathsInput.value = (config.jdbc_driver_paths || []).join("\n");
       customDriverName.value = isCustomCompatibleProfile() ? config.driver_label || "" : "";
@@ -378,8 +617,11 @@ watch(
     } else {
       editingId.value = null;
       form.value = defaultForm();
+      selectedTransportLayerId.value = null;
       selectedType.value = "mysql";
       customDriverName.value = "";
+      oceanbaseSubMode.value = "mysql";
+      h2ConnectionMode.value = "file";
       dialogStep.value = "select";
       configTab.value = "connection";
     }
@@ -406,9 +648,34 @@ const databasePlaceholder = computed(() => {
   return t("connection.databasePlaceholderWithDefault", { database: fallback });
 });
 
+const transportLayers = computed(() => form.value.transport_layers || []);
+const selectedTransportLayer = computed(() => {
+  const layers = transportLayers.value;
+  return layers.find((layer) => layer.id === selectedTransportLayerId.value) || layers[0] || null;
+});
+const selectedSshLayer = computed(() =>
+  selectedTransportLayer.value?.type === "ssh" ? selectedTransportLayer.value : null,
+);
+const selectedProxyLayer = computed(() =>
+  selectedTransportLayer.value?.type === "proxy" ? selectedTransportLayer.value : null,
+);
+const transportPathSegments = computed(() => {
+  const layers = transportLayers.value.filter((layer) => layer.enabled !== false);
+  return [
+    "DBX",
+    ...layers.map((layer, index) => {
+      const fallback = layer.type === "proxy" ? `Proxy ${index + 1}` : `SSH ${index + 1}`;
+      return layer.name?.trim() || layer.host?.trim() || fallback;
+    }),
+    form.value.host || "Database",
+  ];
+});
+
 function defaultDatabaseForProfile() {
   if (form.value.db_type === "redshift") return "dev";
   if (form.value.db_type === "gaussdb") return "postgres";
+  if (form.value.db_type === "kwdb") return "defaultdb";
+  if (form.value.db_type === "databend") return "default";
   if (selectedType.value === "cockroachdb") return "defaultdb";
   if (form.value.db_type === "highgo") return "highgo";
   if (form.value.db_type === "yashandb") return "yasdb";
@@ -416,6 +683,7 @@ function defaultDatabaseForProfile() {
     return "postgres";
   if (form.value.db_type === "sqlserver") return "master";
   if (form.value.db_type === "oracle") return "ORCL";
+  if (form.value.db_type === "h2" && h2ConnectionMode.value === "tcp") return "test";
   return "";
 }
 
@@ -425,10 +693,31 @@ function onDbTypeChange(val: string) {
   resetTestState();
 }
 
+function switchH2ConnectionMode(mode: H2ConnectionMode) {
+  h2ConnectionMode.value = mode;
+  if (mode === "file") {
+    form.value.host = h2FilePathFromJdbcUrl(form.value.connection_string) || "";
+    form.value.port = 0;
+  } else {
+    form.value.host =
+      form.value.host.trim() && !isH2FileJdbcUrlLikePath(form.value.host) ? form.value.host : "127.0.0.1";
+    form.value.port = form.value.port || 9092;
+    if (form.value.connection_string && h2FilePathFromJdbcUrl(form.value.connection_string)) {
+      form.value.connection_string = undefined;
+    }
+  }
+  resetTestState();
+}
+
+function isH2FileJdbcUrlLikePath(value: string): boolean {
+  return /\.(mv|h2)\.db$/i.test(value.trim()) || value.includes("/") || value.includes("\\");
+}
+
 const iconTypeMap: Record<string, string> = {
   mysql: "mysql",
   postgres: "postgres",
   sqlite: "sqlite",
+  rqlite: "rqlite",
   access: "access",
   redis: "redis",
   mongodb: "mongodb",
@@ -436,6 +725,7 @@ const iconTypeMap: Record<string, string> = {
   clickhouse: "clickhouse",
   sqlserver: "sqlserver",
   oracle: "oracle",
+  "oracle-legacy": "oracle",
   "oracle-10g": "oracle",
   elasticsearch: "elasticsearch",
   mariadb: "mariadb",
@@ -443,6 +733,7 @@ const iconTypeMap: Record<string, string> = {
   oceanbase: "oceanbase",
   "oceanbase-oracle": "oceanbase",
   goldendb: "goldendb",
+  databend: "databend",
   tdsql: "tdsql",
   polardb: "polardb",
   greatsql: "greatsql",
@@ -455,6 +746,7 @@ const iconTypeMap: Record<string, string> = {
   gbase: "gbase",
   opengauss: "opengauss",
   gaussdb: "gaussdb",
+  kwdb: "kwdb",
   kingbase: "kingbase",
   highgo: "highgo",
   yashandb: "yashandb",
@@ -465,6 +757,9 @@ const iconTypeMap: Record<string, string> = {
   redshift: "redshift",
   cockroachdb: "cockroachdb",
   tdengine: "tdengine",
+  xugu: "xugu",
+  iotdb: "iotdb",
+  etcd: "etcd",
   dm: "dm",
   h2: "h2",
   snowflake: "snowflake",
@@ -472,6 +767,7 @@ const iconTypeMap: Record<string, string> = {
   hive: "hive",
   db2: "db2",
   informix: "informix",
+  iris: "iris",
   neo4j: "neo4j",
   cassandra: "cassandra",
   bigquery: "bigquery",
@@ -486,6 +782,7 @@ const dbOptions = [
   { value: "mysql", label: "MySQL" },
   { value: "postgres", label: "PostgreSQL" },
   { value: "sqlite", label: "SQLite" },
+  { value: "rqlite", label: "RQLite" },
   { value: "access", label: "Microsoft Access" },
   { value: "redis", label: "Redis" },
   { value: "mongodb", label: "MongoDB" },
@@ -497,10 +794,11 @@ const dbOptions = [
   { value: "mariadb", label: "MariaDB" },
   { value: "dm", label: "DM (Dameng)" },
   { value: "gaussdb", label: "GaussDB" },
+  { value: "kwdb", label: "KWDB" },
   { value: "tidb", label: "TiDB" },
   { value: "oceanbase", label: "OceanBase" },
-  { value: "oceanbase-oracle", label: "OceanBase Oracle Mode" },
   { value: "goldendb", label: "GoldenDB" },
+  { value: "databend", label: "Databend" },
   { value: "tdsql", label: "TDSQL" },
   { value: "polardb", label: "PolarDB" },
   { value: "greatsql", label: "GreatSQL" },
@@ -533,6 +831,10 @@ const dbOptions = [
   { value: "bigquery", label: "BigQuery" },
   { value: "kylin", label: "Kylin" },
   { value: "sundb", label: "SunDB" },
+  { value: "xugu", label: "虚谷 XuguDB" },
+  { value: "iotdb", label: "Apache IoTDB" },
+  { value: "etcd", label: "etcd" },
+  { value: "iris", label: "IRIS" },
   { value: "jdbc", label: "JDBC" },
   { value: "custom_mysql", label: "Custom (MySQL)" },
   { value: "custom_postgres", label: "Custom (PostgreSQL)" },
@@ -562,21 +864,38 @@ const filteredDbCategories = computed<DbCategory[]>(() => {
 const hasDbPickerResults = computed(() => filteredDbCategories.value.some((category) => category.options.length > 0));
 const selectedDbIcon = computed(() => iconTypeMap[selectedType.value] || selectedProfile().icon || selectedType.value);
 const isJdbcConnection = computed(() => form.value.db_type === "jdbc");
+const isH2FileMode = computed(() => form.value.db_type === "h2" && h2ConnectionMode.value === "file");
+const usesLocalFilePathInput = computed(
+  () =>
+    form.value.db_type === "sqlite" ||
+    form.value.db_type === "duckdb" ||
+    form.value.db_type === "access" ||
+    isH2FileMode.value,
+);
 
 const connectionUrlPlaceholder = computed(() => getUrlPlaceholder(form.value.db_type));
 const filePathPlaceholder = computed(() => {
   if (form.value.db_type === "duckdb") return "/path/to/database.duckdb or :memory:";
   if (form.value.db_type === "access") return "/path/to/database.accdb";
+  if (form.value.db_type === "h2") return "/path/to/database.mv.db";
   return "/path/to/database.db or :memory:";
 });
 const supportsMemoryDatabasePath = computed(() => form.value.db_type === "sqlite" || form.value.db_type === "duckdb");
+const sqliteExtensionPaths = computed({
+  get: () => sqliteExtensionPathsFromParams(form.value.url_params),
+  set: (value: string) => {
+    form.value.url_params = setSqliteExtensionPaths(form.value.url_params, value);
+  },
+});
 const tlsCapableDatabaseTypes = new Set<DatabaseType>([
   "mysql",
   "postgres",
   "redshift",
   "gaussdb",
+  "kwdb",
   "opengauss",
   "redis",
+  "etcd",
   "clickhouse",
   "elasticsearch",
 ]);
@@ -607,7 +926,7 @@ const mysqlClientKeyPath = computed({
     form.value.url_params = setUrlParam(next, "ssl-key", value);
   },
 });
-const nativePostgresTlsDatabaseTypes = new Set<DatabaseType>(["postgres", "redshift", "gaussdb", "opengauss"]);
+const nativePostgresTlsDatabaseTypes = new Set<DatabaseType>(["postgres", "redshift", "gaussdb", "kwdb", "opengauss"]);
 const supportsPostgresTlsOptions = computed(() => nativePostgresTlsDatabaseTypes.has(form.value.db_type));
 const postgresTlsMode = computed({
   get: () => {
@@ -638,16 +957,60 @@ const postgresClientKeyPath = computed({
     form.value.url_params = setUrlParam(form.value.url_params, "sslkey", value);
   },
 });
-const canUseSsh = computed(() => form.value.db_type !== "sqlite" && form.value.db_type !== "access");
-const canUseProxy = computed(
-  () => form.value.db_type !== "sqlite" && form.value.db_type !== "duckdb" && form.value.db_type !== "access",
+const redisTlsInsecure = computed({
+  get: () => getUrlParam(form.value.url_params, "insecure").toLowerCase() === "true",
+  set: (value: boolean) => {
+    form.value.url_params = setUrlParam(form.value.url_params, "insecure", value ? "true" : "");
+  },
+});
+const etcdEndpointsLines = computed({
+  get: () => form.value.etcd_endpoints || "",
+  set: (value: string) => {
+    form.value.etcd_endpoints = normalizeEndpointLines(value);
+  },
+});
+const canUseTransportLayers = computed(
+  () => form.value.db_type !== "sqlite" && form.value.db_type !== "access" && !isH2FileMode.value,
 );
 const shouldShowAgentDriverInstallHint = computed(() =>
-  showAgentDriverInstallHint(form.value.db_type, agentDrivers.value, selectedType.value),
+  showAgentDriverInstallHint(form.value.db_type, agentDrivers.value, form.value.driver_profile),
 );
+const canChooseVisibleDatabases = computed(() => connectionCanChooseVisibleDatabases(form.value));
+const hasVisibleDatabaseFilter = computed(() => Array.isArray(form.value.visible_databases));
+const visibleDatabaseSummary = computed(() => {
+  const configured = form.value.visible_databases;
+  if (!Array.isArray(configured)) return t("visibleDatabases.showAll");
+  return t("visibleDatabases.selectedCount", { selected: configured.length, total: visibleDatabaseNames.value.length });
+});
+const listedVisibleDatabaseNames = computed(() => {
+  const connection = connectionConfigSnapshotForVisibleDatabases();
+  if (visibleDatabaseShowSystem.value) return visibleDatabaseNames.value;
+  return filterDatabaseNamesForConnection(visibleDatabaseNames.value, connection);
+});
+const filteredVisibleDatabaseNames = computed(() => {
+  const query = visibleDatabaseSearchText.value.trim().toLowerCase();
+  if (!query) return listedVisibleDatabaseNames.value;
+  return listedVisibleDatabaseNames.value.filter((name) => name.toLowerCase().includes(query));
+});
+const visibleDatabaseSelectedCount = computed(() => visibleDatabaseSelection.value.size);
+const visibleDatabaseTotalCount = computed(() => listedVisibleDatabaseNames.value.length);
+const visibleDatabaseCanSave = computed(() => canSaveVisibleDatabaseSelection([...visibleDatabaseSelection.value]));
+const visibleDatabaseHasSystemDatabases = computed(() => {
+  const connection = connectionConfigSnapshotForVisibleDatabases();
+  return visibleDatabaseNames.value.some((database) => isSystemDatabaseName(connection.db_type, database));
+});
 const testResultMessage = computed(() => {
   if (!testResult.value) return "";
   return testResult.value.ok ? t("connection.testSuccess") : testResult.value.message;
+});
+const hasRequiredConnectionTarget = computed(() => {
+  if (isH2FileMode.value) return !!(form.value.host.trim() || h2FilePathFromJdbcUrl(form.value.connection_string));
+  return !!(
+    form.value.host ||
+    (mongoUseUrl.value && form.value.connection_string) ||
+    (form.value.db_type === "jdbc" && form.value.connection_string) ||
+    connectionUrlInput.value.trim()
+  );
 });
 const mongoAuthDatabase = computed({
   get: () => mongoUrlParam(form.value.url_params, "authSource"),
@@ -735,25 +1098,36 @@ function generateConnectionName(): string {
 }
 
 function connectionConfigForSubmit(id: string): ConnectionConfig {
-  const config: ConnectionConfig = { ...form.value, id };
+  const config = { ...form.value, id } as LegacyConnectionConfig;
   if (!config.name?.trim()) {
     config.name = generateConnectionName();
   }
-  const sshTimeout = Number(config.ssh_connect_timeout_secs);
-  config.ssh_connect_timeout_secs = Number.isFinite(sshTimeout) && sshTimeout > 0 ? sshTimeout : 5;
+  config.transport_layers = (config.transport_layers || []).map(normalizeTransportLayer);
+  config.transport_layers = config.transport_layers.map((layer) => {
+    if (layer.type !== "ssh") return layer;
+    const normalized = normalizeSshTunnel(layer);
+    const timeout = Number(normalized.connect_timeout_secs);
+    normalized.connect_timeout_secs = Number.isFinite(timeout) && timeout > 0 ? timeout : 5;
+    return { type: "ssh", ...normalized };
+  });
+  validateTransportLayers(config);
   const connectTimeout = Number(config.connect_timeout_secs);
   config.connect_timeout_secs = Number.isFinite(connectTimeout) && connectTimeout > 0 ? connectTimeout : 5;
   const queryTimeout = Number(config.query_timeout_secs);
   config.query_timeout_secs = Number.isFinite(queryTimeout) && queryTimeout >= 0 ? queryTimeout : 30;
-  const proxyPort = Number(config.proxy_port);
-  config.proxy_port = Number.isFinite(proxyPort) && proxyPort > 0 ? proxyPort : 1080;
+  const idleTimeout = Number(config.idle_timeout_secs);
+  config.idle_timeout_secs = Number.isFinite(idleTimeout) && idleTimeout >= 0 ? idleTimeout : 60;
   if (!config.one_time) config.one_time = undefined;
   if (config.db_type === "mongodb" && !mongoUseUrl.value) {
     config.connection_string = undefined;
+  } else if (config.db_type === "mongodb") {
+    config.connection_string = normalizeMongoConnectionString(config.connection_string?.trim() || "");
   }
   if (config.db_type !== "oracle") {
+    config.sysdba = undefined;
     config.oracle_connection_type = undefined;
   } else {
+    config.sysdba = !!config.sysdba || isOracleSysUser(config);
     config.oracle_connection_type = config.oracle_connection_type || "service_name";
   }
   if (config.db_type !== "redis") {
@@ -795,7 +1169,25 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
     config.redis_sentinel_tls = undefined;
     config.redis_cluster_nodes = undefined;
   }
-  if (config.db_type !== "mysql" && config.db_type !== "clickhouse") {
+  if (config.db_type === "etcd") {
+    config.etcd_endpoints = normalizeEndpointLines(config.etcd_endpoints || "");
+    const firstEndpoint = firstEtcdEndpoint(config.etcd_endpoints);
+    if (firstEndpoint) {
+      config.host = firstEndpoint.host;
+      config.port = firstEndpoint.port;
+      config.ssl = firstEndpoint.scheme === "https" || !!config.ssl;
+    }
+    config.client_cert_path = config.client_cert_path?.trim() || "";
+    config.client_key_path = config.client_key_path?.trim() || "";
+    if ((config.client_cert_path && !config.client_key_path) || (!config.client_cert_path && config.client_key_path)) {
+      throw new Error(t("connection.etcdClientCertPairRequired"));
+    }
+  } else {
+    config.etcd_endpoints = undefined;
+    config.client_cert_path = undefined;
+    config.client_key_path = undefined;
+  }
+  if (config.db_type !== "mysql" && config.db_type !== "clickhouse" && config.db_type !== "etcd") {
     config.ca_cert_path = undefined;
   } else {
     config.ca_cert_path = config.ca_cert_path?.trim() || "";
@@ -810,12 +1202,84 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
       .map((path) => path.trim())
       .filter(Boolean);
   }
-  return config;
+  if (config.db_type === "h2") {
+    if (h2ConnectionMode.value === "file") {
+      const filePath = config.host?.trim() || h2FilePathFromJdbcUrl(config.connection_string);
+      if (!filePath) {
+        throw new Error(t("connection.h2FilePathRequired"));
+      }
+      config.host = filePath;
+      config.port = 0;
+      config.connection_string = h2FileJdbcUrl(filePath);
+      config.transport_layers = [];
+    } else {
+      config.host = config.host?.trim() || "127.0.0.1";
+      config.port = Number(config.port) || 9092;
+      if (h2FilePathFromJdbcUrl(config.connection_string)) {
+        config.connection_string = undefined;
+      } else {
+        config.connection_string = config.connection_string?.trim() || undefined;
+      }
+    }
+  }
+  const legacy = config as LegacyConnectionConfig;
+  delete legacy.ssh_enabled;
+  delete legacy.ssh_host;
+  delete legacy.ssh_port;
+  delete legacy.ssh_user;
+  delete legacy.ssh_password;
+  delete legacy.ssh_key_path;
+  delete legacy.ssh_key_passphrase;
+  delete legacy.ssh_expose_lan;
+  delete legacy.ssh_connect_timeout_secs;
+  delete legacy.ssh_tunnels;
+  delete legacy.proxy_enabled;
+  delete legacy.proxy_type;
+  delete legacy.proxy_host;
+  delete legacy.proxy_port;
+  delete legacy.proxy_username;
+  delete legacy.proxy_password;
+  config.visible_databases =
+    Array.isArray(config.visible_databases) && config.visible_databases.length > 0
+      ? config.visible_databases
+      : undefined;
+  return config as ConnectionConfig;
+}
+
+function connectionConfigSnapshotForVisibleDatabases(): ConnectionConfig {
+  return {
+    ...(form.value as ConnectionConfig),
+    id: editingId.value || "draft",
+    visible_databases: form.value.visible_databases,
+  };
 }
 
 function getUrlParam(params: string | undefined, key: string): string {
   const parsed = new URLSearchParams((params || "").trim().replace(/^\?/, ""));
   return parsed.get(key) || "";
+}
+
+function sqliteExtensionPathsFromParams(params: string | undefined): string {
+  const parsed = new URLSearchParams((params || "").trim().replace(/^\?/, ""));
+  return [
+    ...parsed.getAll("sqlite_extension"),
+    ...parsed.getAll("sqlite_extensions").flatMap((value) => value.split(/\r?\n/)),
+  ]
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function setSqliteExtensionPaths(params: string | undefined, paths: string): string {
+  const parsed = new URLSearchParams((params || "").trim().replace(/^\?/, ""));
+  parsed.delete("sqlite_extension");
+  parsed.delete("sqlite_extensions");
+  paths
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .forEach((value) => parsed.append("sqlite_extension", value));
+  return parsed.toString();
 }
 
 function setUrlParam(params: string | undefined, key: string, value: string): string {
@@ -908,6 +1372,10 @@ function normalizeRedisClusterNodes(value: string): string {
 }
 
 function normalizeRedisNodeList(value: string): string {
+  return normalizeEndpointLines(value);
+}
+
+function normalizeEndpointLines(value: string): string {
   return value
     .split(/[\n,;]+/)
     .map((node) => node.trim())
@@ -954,10 +1422,133 @@ function parseRedisEndpoint(value: string, defaultPort: number): { host: string;
   return { host: endpoint, port: defaultPort };
 }
 
+function firstEtcdEndpoint(value?: string): { scheme?: string; host: string; port: number } | null {
+  const first = normalizeEndpointLines(value || "")
+    .split("\n")
+    .find(Boolean);
+  if (!first) return null;
+  return parseEtcdEndpoint(first);
+}
+
+function parseEtcdEndpoint(value: string): { scheme?: string; host: string; port: number } {
+  const trimmed = value.trim().replace(/^.*@/, "");
+  const schemeMatch = trimmed.match(/^(https?):\/\//i);
+  const scheme = schemeMatch?.[1].toLowerCase();
+  const endpoint = trimmed.replace(/^https?:\/\//i, "").replace(/[/?#].*$/, "");
+  if (endpoint.startsWith("[")) {
+    const end = endpoint.indexOf("]");
+    if (end > 0) {
+      const host = endpoint.slice(1, end);
+      const portText = endpoint.slice(end + 1).replace(/^:/, "");
+      const port = Number(portText);
+      return { scheme, host, port: Number.isFinite(port) && port > 0 ? port : 2379 };
+    }
+  }
+  const parts = endpoint.split(":");
+  if (parts.length === 2) {
+    const port = Number(parts[1]);
+    return { scheme, host: parts[0], port: Number.isFinite(port) && port > 0 ? port : 2379 };
+  }
+  return { scheme, host: endpoint, port: 2379 };
+}
+
+function isOracleSysUser(config: Pick<ConnectionConfig, "db_type" | "username">): boolean {
+  return config.db_type === "oracle" && config.username.trim().toLowerCase() === "sys";
+}
+
 function resetTestState() {
   testRunId += 1;
   isTesting.value = false;
   testResult.value = null;
+}
+
+function resetVisibleDatabaseDraftState() {
+  showVisibleDatabasesDialog.value = false;
+  isLoadingVisibleDatabases.value = false;
+  visibleDatabaseNames.value = [];
+  visibleDatabaseSelection.value = new Set();
+  visibleDatabaseSearchText.value = "";
+  visibleDatabaseError.value = "";
+  visibleDatabaseShowSystem.value = false;
+}
+
+async function openVisibleDatabasesPicker() {
+  if (!ensureConnectionHostResolvedFromUrl()) return;
+  if (!canChooseVisibleDatabases.value || isLoadingVisibleDatabases.value) return;
+
+  isLoadingVisibleDatabases.value = true;
+  visibleDatabaseError.value = "";
+  visibleDatabaseSearchText.value = "";
+  const draftId = buildDraftVisibleDatabasesConnectionId(uuid());
+  const draftConfig = {
+    ...connectionConfigForSubmit(draftId),
+    id: draftId,
+    one_time: true,
+  };
+
+  try {
+    await api.connectDb(draftConfig);
+    const names = await loadVisibleDatabaseNames(draftId, draftConfig);
+    visibleDatabaseNames.value = names;
+    const initialSelection = initialVisibleDatabaseSelection(names, form.value.visible_databases, draftConfig);
+    visibleDatabaseSelection.value = new Set(initialSelection);
+    visibleDatabaseShowSystem.value = initialSelection.some((database) =>
+      isSystemDatabaseName(draftConfig.db_type, database),
+    );
+    showVisibleDatabasesDialog.value = true;
+  } catch (e: any) {
+    visibleDatabaseNames.value = [];
+    visibleDatabaseSelection.value = new Set();
+    visibleDatabaseError.value = mongodbAuthFailureHint(String(e?.message || e));
+    testResult.value = { ok: false, message: visibleDatabaseError.value };
+  } finally {
+    await api.disconnectDb(draftId).catch(() => undefined);
+    isLoadingVisibleDatabases.value = false;
+  }
+}
+
+async function loadVisibleDatabaseNames(connectionId: string, config: ConnectionConfig): Promise<string[]> {
+  if (config.db_type === "oracle" || config.db_type === "dameng") {
+    return api.listSchemas(connectionId, config.database || "");
+  }
+  if (config.db_type === "redis") {
+    return (await api.redisListDatabases(connectionId)).map((database) => String(database.db));
+  }
+  if (config.db_type === "mongodb") {
+    return api.mongoListDatabases(connectionId);
+  }
+  return (await api.listDatabases(connectionId)).map((database) => database.name);
+}
+
+function toggleVisibleDatabase(database: string) {
+  const next = new Set(visibleDatabaseSelection.value);
+  if (next.has(database)) next.delete(database);
+  else next.add(database);
+  visibleDatabaseSelection.value = next;
+}
+
+function selectAllVisibleDatabases() {
+  visibleDatabaseSelection.value = new Set(listedVisibleDatabaseNames.value);
+}
+
+function clearVisibleDatabaseSelection() {
+  visibleDatabaseSelection.value = new Set();
+}
+
+function showAllVisibleDatabases() {
+  form.value.visible_databases = undefined;
+  visibleDatabaseSelection.value = new Set();
+  visibleDatabaseNames.value = [];
+  showVisibleDatabasesDialog.value = false;
+}
+
+function saveVisibleDatabaseSelection() {
+  if (!visibleDatabaseCanSave.value) return;
+  form.value.visible_databases = normalizeVisibleDatabaseSelection(
+    [...visibleDatabaseSelection.value],
+    visibleDatabaseNames.value,
+  );
+  showVisibleDatabasesDialog.value = false;
 }
 
 function applyConnectionUrl() {
@@ -979,9 +1570,12 @@ async function copyTestResult() {
 function resetForm() {
   editingId.value = null;
   form.value = defaultForm();
+  selectedTransportLayerId.value = null;
+  draggedTransportLayerId.value = null;
   selectedType.value = "mysql";
   customDriverName.value = "";
   mongoUseUrl.value = false;
+  oceanbaseSubMode.value = "mysql";
   jdbcDriverPathsInput.value = "";
   selectedJdbcDriverPath.value = "";
   connectionUrlInput.value = "";
@@ -989,6 +1583,7 @@ function resetForm() {
   dbPickerView.value = "icon";
   dbSearchQuery.value = "";
   configTab.value = "connection";
+  resetVisibleDatabaseDraftState();
   resetTestState();
 }
 
@@ -1041,6 +1636,13 @@ function applyConnectionPrefill(draft: ConnectionDeepLinkDraft) {
     one_time: draft.oneTime || undefined,
   };
   selectedType.value = draft.driverProfile;
+  if (draft.driverProfile === "oceanbase-oracle") {
+    oceanbaseSubMode.value = "oracle";
+    selectedType.value = "oceanbase";
+  }
+  if (draft.driverProfile === "gbase8s") {
+    selectedType.value = "gbase";
+  }
   customDriverName.value = isCustomCompatibleProfile() ? draft.driverLabel : "";
   mongoUseUrl.value = !!draft.useMongoUrl;
   if (draft.name?.trim()) {
@@ -1081,14 +1683,31 @@ watch(
   },
 );
 
-watch(canUseSsh, (value) => {
-  if (!value && configTab.value === "ssh") {
-    configTab.value = "connection";
-  }
+watch([() => form.value.db_type, () => form.value.username], () => {
+  if (isOracleSysUser(form.value)) form.value.sysdba = true;
 });
 
-watch(canUseProxy, (value) => {
-  if (!value && configTab.value === "proxy") {
+watch(
+  () => connectionConfigSnapshotForVisibleDatabases(),
+  (current, previous) => {
+    if (!previous || !form.value.visible_databases?.length) return;
+    if (!visibleDatabaseSelectionIsStale(previous, current)) return;
+    form.value.visible_databases = undefined;
+    visibleDatabaseNames.value = [];
+    visibleDatabaseSelection.value = new Set();
+  },
+);
+
+watch(visibleDatabaseShowSystem, (show) => {
+  if (show) return;
+  const connection = connectionConfigSnapshotForVisibleDatabases();
+  visibleDatabaseSelection.value = new Set(
+    [...visibleDatabaseSelection.value].filter((database) => !isSystemDatabaseName(connection.db_type, database)),
+  );
+});
+
+watch(canUseTransportLayers, (value) => {
+  if (!value && configTab.value === "transport") {
     configTab.value = "connection";
   }
 });
@@ -1098,6 +1717,109 @@ watch(supportsTlsToggle, (value) => {
     configTab.value = "connection";
   }
 });
+
+function ensureSelectedTransportLayer() {
+  if (
+    !selectedTransportLayerId.value ||
+    !transportLayers.value.some((layer) => layer.id === selectedTransportLayerId.value)
+  ) {
+    selectedTransportLayerId.value = transportLayers.value[0]?.id || null;
+  }
+}
+
+function addSshTunnel() {
+  const next: TransportLayerConfig = { type: "ssh", ...defaultSshTunnel() };
+  next.name = t("connection.sshHopDefaultName", { index: transportLayers.value.length + 1 });
+  form.value.transport_layers = [...transportLayers.value, next];
+  selectedTransportLayerId.value = next.id;
+  resetTestState();
+}
+
+function addProxyTunnel() {
+  const next: TransportLayerConfig = { type: "proxy", ...defaultProxyTunnel() };
+  next.name = `Proxy ${transportLayers.value.length + 1}`;
+  form.value.transport_layers = [...transportLayers.value, next];
+  selectedTransportLayerId.value = next.id;
+  resetTestState();
+}
+
+function duplicateTransportLayer(layer: TransportLayerConfig) {
+  const next = normalizeTransportLayer({ ...layer, id: uuid(), name: layer.name ? `${layer.name} copy` : "" });
+  form.value.transport_layers = [...transportLayers.value, next];
+  selectedTransportLayerId.value = next.id;
+  resetTestState();
+}
+
+function removeTransportLayer(id: string) {
+  form.value.transport_layers = transportLayers.value.filter((layer) => layer.id !== id);
+  ensureSelectedTransportLayer();
+  resetTestState();
+}
+
+function moveTransportLayer(id: string, direction: -1 | 1) {
+  const layers = [...transportLayers.value];
+  const index = layers.findIndex((layer) => layer.id === id);
+  const target = index + direction;
+  if (index < 0 || target < 0 || target >= layers.length) return;
+  [layers[index], layers[target]] = [layers[target], layers[index]];
+  form.value.transport_layers = layers;
+  resetTestState();
+}
+
+function dropTransportLayer(targetId: string) {
+  const sourceId = draggedTransportLayerId.value;
+  draggedTransportLayerId.value = null;
+  if (!sourceId || sourceId === targetId) return;
+  const layers = [...transportLayers.value];
+  const sourceIndex = layers.findIndex((layer) => layer.id === sourceId);
+  const targetIndex = layers.findIndex((layer) => layer.id === targetId);
+  if (sourceIndex < 0 || targetIndex < 0) return;
+  const [source] = layers.splice(sourceIndex, 1);
+  layers.splice(targetIndex, 0, source);
+  form.value.transport_layers = layers;
+  resetTestState();
+}
+
+function changeSelectedTransportLayerType(type: "ssh" | "proxy") {
+  const selected = selectedTransportLayer.value;
+  if (!selected || selected.type === type) return;
+  const replacement: TransportLayerConfig =
+    type === "proxy"
+      ? { type: "proxy", ...defaultProxyTunnel(), id: selected.id, name: selected.name }
+      : { type: "ssh", ...defaultSshTunnel(), id: selected.id, name: selected.name };
+  form.value.transport_layers = transportLayers.value.map((layer) => (layer.id === selected.id ? replacement : layer));
+  resetTestState();
+}
+
+function updateSelectedProxyType(value: unknown) {
+  const layer = selectedProxyLayer.value;
+  if (!layer) return;
+  layer.proxy_type = value === "http" ? "http" : "socks5";
+  resetTestState();
+}
+
+function validateTransportLayers(config: LegacyConnectionConfig) {
+  const layers = config.transport_layers || [];
+  layers.forEach((layer, index) => {
+    if (layer.enabled === false) return;
+    const label = layer.name?.trim() || t("connection.sshHopDefaultName", { index: index + 1 });
+    if (!layer.host?.trim()) throw new Error(t("connection.sshHopInvalidHost", { hop: label }));
+    const port = Number(layer.port);
+    if (!Number.isFinite(port) || port < 1 || port > 65535) {
+      throw new Error(t("connection.sshHopInvalidPort", { hop: label }));
+    }
+    if (layer.type === "ssh") {
+      if (!layer.user?.trim()) throw new Error(t("connection.sshHopInvalidUser", { hop: label }));
+      if (!layer.password?.trim() && !layer.key_path?.trim()) {
+        throw new Error(t("connection.sshHopInvalidAuth", { hop: label }));
+      }
+      const timeout = Number(layer.connect_timeout_secs);
+      if (!Number.isFinite(timeout) || timeout < 1 || timeout > 300) {
+        throw new Error(t("connection.sshHopInvalidTimeout", { hop: label }));
+      }
+    }
+  });
+}
 
 async function save() {
   if (!ensureConnectionHostResolvedFromUrl()) return;
@@ -1143,7 +1865,7 @@ watch([() => editingId.value, () => open.value], () => {
   dialogTitle.value = editingId.value ? t("connection.editTitle") : t("connection.title");
 });
 
-async function browseSshKeyPath() {
+async function browseSshKeyPath(target?: SshTunnelConfig | null) {
   if (isTauriRuntime()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const selected = await open({
@@ -1151,7 +1873,9 @@ async function browseSshKeyPath() {
       multiple: false,
     });
     if (selected && typeof selected === "string") {
-      form.value.ssh_key_path = selected;
+      if (target) {
+        target.key_path = selected;
+      }
     }
   }
 }
@@ -1219,6 +1943,34 @@ async function browsePostgresTlsFile(target: "root" | "cert" | "key") {
   }
 }
 
+async function browseEtcdTlsFile(target: "ca" | "cert" | "key") {
+  if (isTauriRuntime()) {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      title:
+        target === "ca"
+          ? t("connection.etcdCaCertBrowse")
+          : target === "cert"
+            ? t("connection.etcdClientCertBrowse")
+            : t("connection.etcdClientKeyBrowse"),
+      multiple: false,
+      filters: [
+        { name: "PEM", extensions: ["pem", "crt", "cer", "key"] },
+        { name: "All Files", extensions: ["*"] },
+      ],
+    });
+    if (selected && typeof selected === "string") {
+      if (target === "ca") {
+        form.value.ca_cert_path = selected;
+      } else if (target === "cert") {
+        form.value.client_cert_path = selected;
+      } else {
+        form.value.client_key_path = selected;
+      }
+    }
+  }
+}
+
 async function browseDbFilePath() {
   if (isTauriRuntime()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
@@ -1227,7 +1979,9 @@ async function browseDbFilePath() {
         ? [{ name: "DuckDB", extensions: ["duckdb", "db"] }]
         : form.value.db_type === "access"
           ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }]
-          : [{ name: "SQLite", extensions: ["db", "sqlite", "sqlite3"] }];
+          : form.value.db_type === "h2"
+            ? [{ name: "H2", extensions: ["db"] }]
+            : [{ name: "SQLite", extensions: ["db", "sqlite", "sqlite3"] }];
     const selected = await open({
       title: "Select Database File",
       multiple: false,
@@ -1235,6 +1989,32 @@ async function browseDbFilePath() {
     });
     if (selected && typeof selected === "string") {
       form.value.host = selected;
+    }
+  }
+}
+
+async function browseSqliteExtensionPath() {
+  if (isTauriRuntime()) {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      title: t("connection.sqliteExtensionBrowse"),
+      multiple: true,
+      filters: [
+        { name: "SQLite Extension", extensions: ["dylib", "so", "dll"] },
+        { name: "All Files", extensions: ["*"] },
+      ],
+    });
+    const selectedPaths = Array.isArray(selected)
+      ? selected
+      : selected && typeof selected === "string"
+        ? [selected]
+        : [];
+    if (selectedPaths.length) {
+      const existing = sqliteExtensionPaths.value
+        .split(/\r?\n/)
+        .map((path) => path.trim())
+        .filter(Boolean);
+      sqliteExtensionPaths.value = [...existing, ...selectedPaths].join("\n");
     }
   }
 }
@@ -1290,6 +2070,7 @@ async function loadJdbcDrivers() {
 async function loadAgentDrivers() {
   try {
     agentDrivers.value = await api.listInstalledAgentsLocal();
+    if (!settingsStore.editorSettings.updateNotificationsEnabled) return;
     api
       .listInstalledAgents()
       .then((drivers) => {
@@ -1448,8 +2229,9 @@ function openExternalUrl(url: string) {
               <TabsList>
                 <TabsTrigger value="connection">{{ t("connection.basicTab") }}</TabsTrigger>
                 <TabsTrigger v-if="supportsTlsToggle" value="tls">{{ t("connection.tlsTab") }}</TabsTrigger>
-                <TabsTrigger v-if="canUseSsh" value="ssh">{{ t("connection.sshTunnel") }}</TabsTrigger>
-                <TabsTrigger v-if="canUseProxy" value="proxy">{{ t("connection.proxy") }}</TabsTrigger>
+                <TabsTrigger v-if="canUseTransportLayers" value="transport">{{
+                  t("connection.sshTunnel")
+                }}</TabsTrigger>
                 <TabsTrigger value="advanced">{{ t("connection.advancedTab") }}</TabsTrigger>
               </TabsList>
             </div>
@@ -1501,6 +2283,47 @@ function openExternalUrl(url: string) {
                   </button>
                 </div>
 
+                <!-- OceanBase mode toggle -->
+                <div v-if="selectedType === 'oceanbase'" class="grid grid-cols-4 items-center gap-4">
+                  <Label class="text-right text-xs">{{ t("connection.mode") }}</Label>
+                  <div class="col-span-3 flex gap-2">
+                    <Button
+                      size="sm"
+                      :variant="oceanbaseSubMode === 'mysql' ? 'default' : 'outline'"
+                      @click="switchOceanbaseMode('mysql')"
+                    >
+                      {{ t("connection.oceanbaseMySQLMode") }}
+                    </Button>
+                    <Button
+                      size="sm"
+                      :variant="oceanbaseSubMode === 'oracle' ? 'default' : 'outline'"
+                      @click="switchOceanbaseMode('oracle')"
+                    >
+                      {{ t("connection.oceanbaseOracleMode") }}
+                    </Button>
+                  </div>
+                </div>
+
+                <div v-if="selectedType === 'gbase'" class="grid grid-cols-4 items-center gap-4">
+                  <Label class="text-right text-xs">{{ t("connection.version") }}</Label>
+                  <div class="col-span-3 flex gap-2">
+                    <Button
+                      size="sm"
+                      :variant="form.driver_profile === 'gbase8s' ? 'outline' : 'default'"
+                      @click="switchGbaseProfile('gbase')"
+                    >
+                      GBase
+                    </Button>
+                    <Button
+                      size="sm"
+                      :variant="form.driver_profile === 'gbase8s' ? 'default' : 'outline'"
+                      @click="switchGbaseProfile('gbase8s')"
+                    >
+                      GBase 8s
+                    </Button>
+                  </div>
+                </div>
+
                 <div v-if="isCustomCompatibleProfile()" class="grid grid-cols-4 items-center gap-4">
                   <Label class="text-right">{{ t("connection.driverName") }}</Label>
                   <Input
@@ -1523,8 +2346,65 @@ function openExternalUrl(url: string) {
                         form.color === color.value ? 'ring-2 ring-ring ring-offset-2' : 'border-border',
                       ]"
                       :title="t(color.labelKey)"
-                      @click="form.color = color.value"
+                      @click="handlePresetClick(color.value)"
                     />
+                    <Popover v-model:open="customColorOpen">
+                      <PopoverTrigger as-child>
+                        <button
+                          type="button"
+                          class="h-6 w-6 rounded-full border flex items-center justify-center hover:scale-105 transition"
+                          :class="[
+                            !isPresetColor(form.color) && form.color
+                              ? 'border-border ring-2 ring-ring ring-offset-2'
+                              : 'border-dashed border-border',
+                          ]"
+                          :style="!isPresetColor(form.color) && form.color ? { backgroundColor: form.color } : {}"
+                          :title="t('connection.colorCustom')"
+                        >
+                          <Pipette
+                            class="h-3.5 w-3.5"
+                            :class="!isPresetColor(form.color) && form.color ? 'text-white' : 'text-muted-foreground'"
+                          />
+                        </button>
+                      </PopoverTrigger>
+                      <PopoverContent class="w-auto p-2">
+                        <div class="flex items-center gap-2">
+                          <input
+                            type="color"
+                            :value="form.color"
+                            @input="handleCustomColorPicked(($event.target as HTMLInputElement).value)"
+                            class="h-6 w-6 cursor-pointer rounded border-0 p-0"
+                          />
+                          <Input
+                            type="text"
+                            :value="customColorInput || form.color"
+                            @input="handleCustomColorInput(($event.target as HTMLInputElement).value)"
+                            class="w-28 h-7 text-xs font-mono"
+                            :placeholder="'#ff0000 或 rgba(…)'"
+                          />
+                        </div>
+                      </PopoverContent>
+                    </Popover>
+                  </div>
+                </div>
+
+                <div v-if="form.db_type === 'h2'" class="grid grid-cols-4 items-center gap-4">
+                  <Label class="text-right text-xs">{{ t("connection.mode") }}</Label>
+                  <div class="col-span-3 flex gap-2">
+                    <Button
+                      size="sm"
+                      :variant="h2ConnectionMode === 'file' ? 'default' : 'outline'"
+                      @click="switchH2ConnectionMode('file')"
+                    >
+                      {{ t("connection.h2FileMode") }}
+                    </Button>
+                    <Button
+                      size="sm"
+                      :variant="h2ConnectionMode === 'tcp' ? 'default' : 'outline'"
+                      @click="switchH2ConnectionMode('tcp')"
+                    >
+                      {{ t("connection.h2TcpMode") }}
+                    </Button>
                   </div>
                 </div>
 
@@ -1611,9 +2491,7 @@ function openExternalUrl(url: string) {
                 </template>
 
                 <!-- Local database files: file path only -->
-                <template
-                  v-else-if="form.db_type === 'sqlite' || form.db_type === 'duckdb' || form.db_type === 'access'"
-                >
+                <template v-else-if="usesLocalFilePathInput">
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right">{{ t("connection.filePath") }}</Label>
                     <div class="col-span-3 space-y-1">
@@ -1646,6 +2524,45 @@ function openExternalUrl(url: string) {
                       </p>
                     </div>
                   </div>
+                  <div v-if="form.db_type === 'sqlite'" class="grid grid-cols-4 items-start gap-4">
+                    <Label class="text-right mt-2">{{ t("connection.sqliteExtensions") }}</Label>
+                    <div class="col-span-3 space-y-1">
+                      <div class="flex items-start gap-1">
+                        <textarea
+                          v-model="sqliteExtensionPaths"
+                          class="flex min-h-[76px] flex-1 rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                          :placeholder="t('connection.sqliteExtensionsPlaceholder')"
+                          spellcheck="false"
+                        />
+                        <Tooltip v-if="isDesktop">
+                          <TooltipTrigger as-child>
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              class="h-9 w-9 shrink-0"
+                              @click="browseSqliteExtensionPath"
+                            >
+                              <FolderOpen class="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{{ t("connection.sqliteExtensionBrowse") }}</TooltipContent>
+                        </Tooltip>
+                      </div>
+                      <p class="text-xs text-muted-foreground">
+                        {{ t("connection.sqliteExtensionsHint") }}
+                      </p>
+                    </div>
+                  </div>
+                  <template v-if="form.db_type === 'h2'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">{{ t("connection.user") }}</Label>
+                      <Input v-model="form.username" class="col-span-3" placeholder="sa" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">{{ t("connection.password") }}</Label>
+                      <Input v-model="form.password" type="password" class="col-span-3" />
+                    </div>
+                  </template>
                 </template>
 
                 <!-- Redis: host, port, user, password, ssl -->
@@ -1743,6 +2660,37 @@ function openExternalUrl(url: string) {
                   </div>
                 </template>
 
+                <!-- etcd: endpoints, user, password, TLS -->
+                <template v-else-if="form.db_type === 'etcd'">
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">{{ t("connection.host") }}</Label>
+                    <Input v-model="form.host" class="col-span-2" />
+                    <Input v-model.number="form.port" type="number" class="col-span-1" />
+                  </div>
+                  <div class="grid grid-cols-4 items-start gap-4">
+                    <Label class="text-right mt-2">{{ t("connection.etcdEndpoints") }}</Label>
+                    <div class="col-span-3 space-y-1">
+                      <textarea
+                        v-model="etcdEndpointsLines"
+                        class="flex min-h-[76px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        placeholder="http://127.0.0.1:2379&#10;https://etcd-2:2379"
+                        spellcheck="false"
+                      />
+                      <p class="text-xs text-muted-foreground">
+                        {{ t("connection.etcdEndpointsHint") }}
+                      </p>
+                    </div>
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">{{ t("connection.user") }}</Label>
+                    <Input v-model="form.username" class="col-span-3" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">{{ t("connection.password") }}</Label>
+                    <Input v-model="form.password" type="password" class="col-span-3" />
+                  </div>
+                </template>
+
                 <!-- MongoDB: URL or form -->
                 <template v-else-if="form.db_type === 'mongodb'">
                   <div class="grid grid-cols-4 items-center gap-4">
@@ -1770,7 +2718,14 @@ function openExternalUrl(url: string) {
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label class="text-right">{{ t("connection.host") }}</Label>
                       <Input v-model="form.host" class="col-span-2" />
-                      <Input v-model.number="form.port" type="number" class="col-span-1" />
+                      <Input v-model.number="form.port" type="number" class="col-span-1" :disabled="form.ssl" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <span />
+                      <label class="col-span-3 flex items-center gap-2 text-sm">
+                        <input type="checkbox" v-model="form.ssl" class="mr-0" />
+                        <span>SRV (MongoDB Atlas)</span>
+                      </label>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label class="text-right">{{ t("connection.user") }}</Label>
@@ -1850,7 +2805,7 @@ function openExternalUrl(url: string) {
                   </div>
 
                   <div v-if="form.db_type === 'oracle'" class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">连接方式</Label>
+                    <Label class="text-right text-xs">{{ t("connection.mode") }}</Label>
                     <div
                       class="col-span-3 grid h-8 grid-cols-2 overflow-hidden rounded-md border border-input bg-muted/30 p-0.5"
                     >
@@ -1865,7 +2820,7 @@ function openExternalUrl(url: string) {
                         :aria-pressed="form.oracle_connection_type !== 'sid'"
                         @click="form.oracle_connection_type = 'service_name'"
                       >
-                        服务名
+                        {{ t("connection.serviceNameOnly") }}
                       </button>
                       <button
                         type="button"
@@ -1886,25 +2841,29 @@ function openExternalUrl(url: string) {
                   <div v-if="shouldShowAgentDriverInstallHint" class="grid grid-cols-4 items-center gap-4">
                     <span />
                     <p class="col-span-3 text-xs text-muted-foreground">
-                      需要在顶部导航栏「<a
+                      {{ t("connection.driverInstallHintPrefix")
+                      }}<a
                         class="underline cursor-pointer text-primary hover:text-primary/80"
                         @click="emit('openDriverStore')"
-                        >驱动管理</a
-                      >」中安装对应的驱动才能连接。
+                        >{{ t("toolbar.driverManager") }}</a
+                      >{{ t("connection.driverInstallHintSuffix") }}
                     </p>
                   </div>
 
                   <div v-if="form.db_type === 'oracle'" class="grid grid-cols-4 items-center gap-4">
-                    <Label class="text-right text-xs">版本</Label>
+                    <Label class="text-right text-xs">{{ t("connection.version") }}</Label>
                     <Select
-                      :model-value="selectedType === 'oracle-10g' ? 'oracle-10g' : 'oracle'"
+                      :model-value="
+                        selectedType === 'oracle-legacy' || selectedType === 'oracle-10g' ? selectedType : 'oracle'
+                      "
                       @update:model-value="(val) => applyProfile(String(val), true)"
                     >
                       <SelectTrigger class="col-span-3 h-8 text-sm">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="oracle">Oracle 11g+</SelectItem>
+                        <SelectItem value="oracle">Oracle 19c+</SelectItem>
+                        <SelectItem value="oracle-legacy">Oracle 11g-19c</SelectItem>
                         <SelectItem value="oracle-10g">Oracle 10g</SelectItem>
                       </SelectContent>
                     </Select>
@@ -1913,28 +2872,12 @@ function openExternalUrl(url: string) {
                   <div v-if="form.db_type === 'oracle'" class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right text-xs">SYSDBA</Label>
                     <label class="col-span-3 flex items-center gap-2 cursor-pointer">
-                      <input type="checkbox" v-model="form.sysdba" class="mr-0" />
+                      <input type="checkbox" v-model="form.sysdba" class="mr-0" :disabled="isOracleSysUser(form)" />
                       <span class="text-xs text-muted-foreground">as SYSDBA</span>
                     </label>
                   </div>
 
-                  <div
-                    v-if="
-                      form.db_type === 'mysql' ||
-                      form.db_type === 'postgres' ||
-                      form.db_type === 'redshift' ||
-                      form.db_type === 'informix' ||
-                      form.db_type === 'kingbase' ||
-                      form.db_type === 'highgo' ||
-                      form.db_type === 'yashandb' ||
-                      form.db_type === 'vastbase' ||
-                      form.db_type === 'goldendb' ||
-                      form.db_type === 'clickhouse' ||
-                      form.db_type === 'saphana' ||
-                      form.db_type === 'bigquery'
-                    "
-                    class="grid grid-cols-4 items-center gap-4"
-                  >
+                  <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right">{{ t("connection.urlParams") }}</Label>
                     <Input
                       v-model="form.url_params"
@@ -1970,6 +2913,103 @@ function openExternalUrl(url: string) {
                     <span class="text-xs text-muted-foreground">{{ t("connection.sslEnable") }}</span>
                   </label>
                 </div>
+
+                <div v-if="form.db_type === 'redis'" class="grid grid-cols-4 items-start gap-4">
+                  <Label class="text-right text-xs">{{ t("connection.redisTlsInsecure") }}</Label>
+                  <label class="col-span-3 flex items-start gap-2 cursor-pointer">
+                    <input type="checkbox" v-model="redisTlsInsecure" class="mr-0 mt-0.5" :disabled="!form.ssl" />
+                    <span class="text-xs leading-5 text-muted-foreground">
+                      {{ t("connection.redisTlsInsecureHint") }}
+                    </span>
+                  </label>
+                </div>
+
+                <template v-if="form.db_type === 'etcd'">
+                  <div class="grid grid-cols-4 items-start gap-4">
+                    <Label class="pt-2 text-right text-xs">
+                      <span class="inline-flex items-center justify-end gap-1">
+                        <ShieldCheck class="h-3.5 w-3.5" />
+                        {{ t("connection.caCertPath") }}
+                      </span>
+                    </Label>
+                    <div class="col-span-3 space-y-2">
+                      <div class="flex items-center gap-1">
+                        <Input
+                          v-model="form.ca_cert_path"
+                          class="flex-1"
+                          :placeholder="t('connection.etcdCaCertPlaceholder')"
+                        />
+                        <Tooltip v-if="isDesktop">
+                          <TooltipTrigger as-child>
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              class="h-9 w-9 shrink-0"
+                              @click="browseEtcdTlsFile('ca')"
+                            >
+                              <FolderOpen class="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{{ t("connection.etcdCaCertBrowse") }}</TooltipContent>
+                        </Tooltip>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="grid grid-cols-4 items-start gap-4">
+                    <Label class="pt-2 text-right text-xs">
+                      <span class="inline-flex items-center justify-end gap-1">
+                        <KeyRound class="h-3.5 w-3.5" />
+                        {{ t("connection.etcdClientAuth") }}
+                      </span>
+                    </Label>
+                    <div class="col-span-3 grid gap-2">
+                      <div class="flex items-center gap-1">
+                        <Input
+                          v-model="form.client_cert_path"
+                          class="flex-1"
+                          :placeholder="t('connection.etcdClientCertPlaceholder')"
+                        />
+                        <Tooltip v-if="isDesktop">
+                          <TooltipTrigger as-child>
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              class="h-9 w-9 shrink-0"
+                              @click="browseEtcdTlsFile('cert')"
+                            >
+                              <FolderOpen class="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{{ t("connection.etcdClientCertBrowse") }}</TooltipContent>
+                        </Tooltip>
+                      </div>
+                      <div class="flex items-center gap-1">
+                        <Input
+                          v-model="form.client_key_path"
+                          class="flex-1"
+                          :placeholder="t('connection.etcdClientKeyPlaceholder')"
+                        />
+                        <Tooltip v-if="isDesktop">
+                          <TooltipTrigger as-child>
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              class="h-9 w-9 shrink-0"
+                              @click="browseEtcdTlsFile('key')"
+                            >
+                              <FolderOpen class="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{{ t("connection.etcdClientKeyBrowse") }}</TooltipContent>
+                        </Tooltip>
+                      </div>
+                      <p class="text-[11px] leading-4 text-muted-foreground">
+                        {{ t("connection.etcdClientCertHint") }}
+                      </p>
+                    </div>
+                  </div>
+                </template>
 
                 <template v-if="supportsMysqlTlsOptions">
                   <div class="grid grid-cols-4 items-center gap-4">
@@ -2249,166 +3289,295 @@ function openExternalUrl(url: string) {
                     class="col-span-3"
                   />
                 </div>
-              </div>
-            </TabsContent>
-
-            <TabsContent v-if="canUseSsh" value="ssh" class="m-0">
-              <div class="grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto">
-                <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.sshTunnel") }}</Label>
-                  <label class="col-span-3 flex items-center gap-2 cursor-pointer">
-                    <input type="checkbox" v-model="form.ssh_enabled" class="mr-0" />
-                    <span class="text-xs text-muted-foreground">{{ t("connection.sshEnable") }}</span>
-                  </label>
-                </div>
-                <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.sshHost") }}</Label>
+                <div v-show="form.db_type === 'mongodb'" class="grid grid-cols-4 items-center gap-4">
+                  <Label class="text-right text-xs">{{ t("connection.idleTimeout") }}</Label>
                   <Input
-                    v-model="form.ssh_host"
-                    class="col-span-2"
-                    placeholder="ssh.example.com"
-                    :disabled="!form.ssh_enabled"
-                  />
-                  <Input
-                    v-model.number="form.ssh_port"
+                    v-model.number="form.idle_timeout_secs"
                     type="number"
-                    class="col-span-1"
-                    :disabled="!form.ssh_enabled"
-                  />
-                </div>
-                <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.sshUser") }}</Label>
-                  <Input v-model="form.ssh_user" class="col-span-3" placeholder="root" :disabled="!form.ssh_enabled" />
-                </div>
-                <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.sshPassword") }}</Label>
-                  <Input
-                    v-model="form.ssh_password"
-                    type="password"
-                    class="col-span-3"
-                    :placeholder="t('connection.sshPasswordPlaceholder')"
-                    :disabled="!form.ssh_enabled"
-                  />
-                </div>
-                <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.sshKeyPath") }}</Label>
-                  <div class="col-span-3 flex items-center gap-1">
-                    <Input
-                      v-model="form.ssh_key_path"
-                      class="flex-1"
-                      placeholder="~/.ssh/id_rsa"
-                      :disabled="!form.ssh_enabled"
-                    />
-                    <Tooltip v-if="isDesktop">
-                      <TooltipTrigger as-child>
-                        <Button
-                          variant="outline"
-                          size="icon"
-                          class="h-9 w-9 shrink-0"
-                          :disabled="!form.ssh_enabled"
-                          @click="browseSshKeyPath"
-                        >
-                          <FolderOpen class="h-4 w-4" />
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent>{{ t("connection.sshKeyPathBrowse") }}</TooltipContent>
-                    </Tooltip>
-                  </div>
-                </div>
-                <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.sshKeyPassphrase") }}</Label>
-                  <Input
-                    v-model="form.ssh_key_passphrase"
-                    type="password"
-                    class="col-span-3"
-                    :placeholder="t('connection.sshKeyPassphrasePlaceholder')"
-                    :disabled="!form.ssh_enabled"
-                  />
-                </div>
-                <div class="grid grid-cols-4 items-center gap-4">
-                  <span />
-                  <label
-                    class="col-span-3 flex items-center gap-2"
-                    :class="form.ssh_enabled ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'"
-                  >
-                    <input type="checkbox" v-model="form.ssh_expose_lan" class="mr-0" :disabled="!form.ssh_enabled" />
-                    <span class="text-xs text-muted-foreground">{{ t("connection.sshExposeLan") }}</span>
-                  </label>
-                </div>
-                <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.sshConnectTimeout") }}</Label>
-                  <Input
-                    v-model.number="form.ssh_connect_timeout_secs"
-                    type="number"
-                    min="5"
-                    max="300"
+                    min="0"
+                    max="600"
                     step="1"
                     class="col-span-3"
-                    :disabled="!form.ssh_enabled"
                   />
                 </div>
               </div>
             </TabsContent>
 
-            <TabsContent v-if="canUseProxy" value="proxy" class="m-0">
+            <TabsContent v-if="canUseTransportLayers" value="transport" class="m-0">
               <div class="grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto">
-                <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.proxy") }}</Label>
-                  <label class="col-span-3 flex items-center gap-2 cursor-pointer">
-                    <input type="checkbox" v-model="form.proxy_enabled" class="mr-0" />
-                    <span class="text-xs text-muted-foreground">{{ t("connection.proxyEnable") }}</span>
-                  </label>
+                <div class="grid grid-cols-4 items-start gap-4">
+                  <Label class="pt-2 text-right text-xs">{{ t("connection.sshHops") }}</Label>
+                  <div class="col-span-3 grid gap-3">
+                    <div class="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
+                      <template v-for="(segment, index) in transportPathSegments" :key="`${segment}-${index}`">
+                        <span class="rounded border bg-muted/40 px-2 py-1">{{ segment }}</span>
+                        <ChevronRight v-if="index < transportPathSegments.length - 1" class="h-3 w-3" />
+                      </template>
+                    </div>
+                    <div class="grid gap-2">
+                      <button
+                        v-for="(hop, index) in transportLayers"
+                        :key="hop.id"
+                        type="button"
+                        draggable="true"
+                        class="flex min-h-10 items-center gap-2 rounded-md border px-2 text-left text-xs transition-colors"
+                        :class="
+                          hop.id === selectedTransportLayer?.id ? 'border-primary bg-primary/5' : 'hover:bg-muted/50'
+                        "
+                        @click="selectedTransportLayerId = hop.id"
+                        @dragstart="draggedTransportLayerId = hop.id"
+                        @dragover.prevent
+                        @drop="dropTransportLayer(hop.id)"
+                      >
+                        <GripVertical class="h-4 w-4 shrink-0 text-muted-foreground" />
+                        <span class="w-5 shrink-0 text-muted-foreground">{{ index + 1 }}</span>
+                        <input v-model="hop.enabled" type="checkbox" class="mr-0" @click.stop />
+                        <span class="min-w-0 flex-1 truncate">
+                          {{
+                            hop.name ||
+                            hop.host ||
+                            (hop.type === "proxy"
+                              ? `Proxy ${index + 1}`
+                              : t("connection.sshHopDefaultName", { index: index + 1 }))
+                          }}
+                        </span>
+                        <Tooltip>
+                          <TooltipTrigger as-child>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              class="h-7 w-7"
+                              :disabled="index === 0"
+                              @click.stop="moveTransportLayer(hop.id, -1)"
+                            >
+                              <ArrowUp class="h-3.5 w-3.5" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{{ t("connection.sshHopMoveUp") }}</TooltipContent>
+                        </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger as-child>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              class="h-7 w-7"
+                              :disabled="index === transportLayers.length - 1"
+                              @click.stop="moveTransportLayer(hop.id, 1)"
+                            >
+                              <ArrowDown class="h-3.5 w-3.5" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{{ t("connection.sshHopMoveDown") }}</TooltipContent>
+                        </Tooltip>
+                      </button>
+                    </div>
+                    <div class="flex items-center gap-2">
+                      <Button type="button" variant="outline" size="sm" @click="addSshTunnel">
+                        <Plus class="mr-1.5 h-3.5 w-3.5" />
+                        {{ t("connection.sshHopAdd") }}
+                      </Button>
+                      <Button type="button" variant="outline" size="sm" @click="addProxyTunnel">
+                        <Plus class="mr-1.5 h-3.5 w-3.5" />
+                        {{ t("connection.proxy") }}
+                      </Button>
+                      <Button
+                        v-if="selectedTransportLayer"
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        @click="duplicateTransportLayer(selectedTransportLayer)"
+                      >
+                        <Copy class="mr-1.5 h-3.5 w-3.5" />
+                        {{ t("connection.sshHopDuplicate") }}
+                      </Button>
+                      <Button
+                        v-if="selectedTransportLayer"
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        @click="removeTransportLayer(selectedTransportLayer.id)"
+                      >
+                        <Trash2 class="mr-1.5 h-3.5 w-3.5" />
+                        {{ t("connection.sshHopDelete") }}
+                      </Button>
+                    </div>
+                  </div>
                 </div>
-                <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.proxyType") }}</Label>
-                  <Select
-                    :model-value="form.proxy_type || 'socks5'"
-                    :disabled="!form.proxy_enabled"
-                    @update:model-value="(value: any) => (form.proxy_type = value)"
-                  >
-                    <SelectTrigger class="col-span-3 h-9">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="socks5">SOCKS5</SelectItem>
-                      <SelectItem value="http">HTTP CONNECT</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.proxyHost") }}</Label>
-                  <Input
-                    v-model="form.proxy_host"
-                    class="col-span-2"
-                    placeholder="127.0.0.1"
-                    :disabled="!form.proxy_enabled"
-                  />
-                  <Input
-                    v-model.number="form.proxy_port"
-                    type="number"
-                    class="col-span-1"
-                    :disabled="!form.proxy_enabled"
-                  />
-                </div>
-                <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.proxyUsername") }}</Label>
-                  <Input
-                    v-model="form.proxy_username"
-                    class="col-span-3"
-                    :placeholder="t('connection.proxyUsernamePlaceholder')"
-                    :disabled="!form.proxy_enabled"
-                  />
-                </div>
-                <div class="grid grid-cols-4 items-center gap-4">
-                  <Label class="text-right text-xs">{{ t("connection.proxyPassword") }}</Label>
-                  <Input
-                    v-model="form.proxy_password"
-                    type="password"
-                    class="col-span-3"
-                    :placeholder="t('connection.proxyPasswordPlaceholder')"
-                    :disabled="!form.proxy_enabled"
-                  />
-                </div>
+
+                <template v-if="selectedTransportLayer">
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right text-xs">{{ t("connection.sshHopName") }}</Label>
+                    <Input
+                      v-model="selectedTransportLayer.name"
+                      class="col-span-3"
+                      :placeholder="t('connection.sshHopNamePlaceholder')"
+                    />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right text-xs">Type</Label>
+                    <Select
+                      :model-value="selectedTransportLayer.type"
+                      @update:model-value="(value: any) => changeSelectedTransportLayerType(value)"
+                    >
+                      <SelectTrigger class="col-span-3 h-9">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="ssh">SSH</SelectItem>
+                        <SelectItem value="proxy">Proxy</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <template v-if="selectedSshLayer">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right text-xs">{{ t("connection.sshHost") }}</Label>
+                      <Input
+                        v-model="selectedSshLayer.host"
+                        class="col-span-2"
+                        placeholder="ssh.example.com"
+                        :disabled="selectedSshLayer.enabled === false"
+                      />
+                      <Input
+                        v-model.number="selectedSshLayer.port"
+                        type="number"
+                        min="1"
+                        max="65535"
+                        class="col-span-1"
+                        :disabled="selectedSshLayer.enabled === false"
+                      />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right text-xs">{{ t("connection.sshUser") }}</Label>
+                      <Input
+                        v-model="selectedSshLayer.user"
+                        class="col-span-3"
+                        placeholder="root"
+                        :disabled="selectedSshLayer.enabled === false"
+                      />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right text-xs">{{ t("connection.sshPassword") }}</Label>
+                      <Input
+                        v-model="selectedSshLayer.password"
+                        type="password"
+                        class="col-span-3"
+                        :placeholder="t('connection.sshPasswordPlaceholder')"
+                        :disabled="selectedSshLayer.enabled === false"
+                      />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right text-xs">{{ t("connection.sshKeyPath") }}</Label>
+                      <div class="col-span-3 flex items-center gap-1">
+                        <Input
+                          v-model="selectedSshLayer.key_path"
+                          class="flex-1"
+                          placeholder="~/.ssh/id_rsa"
+                          :disabled="selectedSshLayer.enabled === false"
+                        />
+                        <Tooltip v-if="isDesktop">
+                          <TooltipTrigger as-child>
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              class="h-9 w-9 shrink-0"
+                              :disabled="selectedSshLayer.enabled === false"
+                              @click="browseSshKeyPath(selectedSshLayer)"
+                            >
+                              <FolderOpen class="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{{ t("connection.sshKeyPathBrowse") }}</TooltipContent>
+                        </Tooltip>
+                      </div>
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right text-xs">{{ t("connection.sshKeyPassphrase") }}</Label>
+                      <Input
+                        v-model="selectedSshLayer.key_passphrase"
+                        type="password"
+                        class="col-span-3"
+                        :placeholder="t('connection.sshKeyPassphrasePlaceholder')"
+                        :disabled="selectedSshLayer.enabled === false"
+                      />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <span />
+                      <label class="col-span-3 flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          v-model="selectedSshLayer.expose_lan"
+                          class="mr-0"
+                          :disabled="selectedSshLayer.enabled === false"
+                        />
+                        <span class="text-xs text-muted-foreground">{{ t("connection.sshExposeLan") }}</span>
+                      </label>
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right text-xs">{{ t("connection.sshConnectTimeout") }}</Label>
+                      <Input
+                        v-model.number="selectedSshLayer.connect_timeout_secs"
+                        type="number"
+                        min="1"
+                        max="300"
+                        step="1"
+                        class="col-span-3"
+                        :disabled="selectedSshLayer.enabled === false"
+                      />
+                    </div>
+                  </template>
+                  <template v-else-if="selectedProxyLayer">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right text-xs">{{ t("connection.proxyType") }}</Label>
+                      <Select
+                        :model-value="selectedProxyLayer.proxy_type || 'socks5'"
+                        :disabled="selectedProxyLayer.enabled === false"
+                        @update:model-value="updateSelectedProxyType"
+                      >
+                        <SelectTrigger class="col-span-3 h-9">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="socks5">SOCKS5</SelectItem>
+                          <SelectItem value="http">HTTP CONNECT</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right text-xs">{{ t("connection.proxyHost") }}</Label>
+                      <Input
+                        v-model="selectedProxyLayer.host"
+                        class="col-span-2"
+                        placeholder="127.0.0.1"
+                        :disabled="selectedProxyLayer.enabled === false"
+                      />
+                      <Input
+                        v-model.number="selectedProxyLayer.port"
+                        type="number"
+                        class="col-span-1"
+                        :disabled="selectedProxyLayer.enabled === false"
+                      />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right text-xs">{{ t("connection.proxyUsername") }}</Label>
+                      <Input
+                        v-model="selectedProxyLayer.username"
+                        class="col-span-3"
+                        :placeholder="t('connection.proxyUsernamePlaceholder')"
+                        :disabled="selectedProxyLayer.enabled === false"
+                      />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right text-xs">{{ t("connection.proxyPassword") }}</Label>
+                      <Input
+                        v-model="selectedProxyLayer.password"
+                        type="password"
+                        class="col-span-3"
+                        :placeholder="t('connection.proxyPasswordPlaceholder')"
+                        :disabled="selectedProxyLayer.enabled === false"
+                      />
+                    </div>
+                  </template>
+                </template>
               </div>
             </TabsContent>
           </Tabs>
@@ -2448,20 +3617,21 @@ function openExternalUrl(url: string) {
               </Button>
             </template>
           </div>
+          <Button
+            v-if="canChooseVisibleDatabases"
+            variant="outline"
+            class="shrink-0"
+            :disabled="isTesting || isSaving || isLoadingVisibleDatabases || !hasRequiredConnectionTarget"
+            @click="openVisibleDatabasesPicker"
+          >
+            <Loader2 v-if="isLoadingVisibleDatabases" class="mr-1.5 h-4 w-4 animate-spin" />
+            <ListFilter v-else class="mr-1.5 h-4 w-4" />
+            {{ hasVisibleDatabaseFilter ? visibleDatabaseSummary : t("contextMenu.selectVisibleDatabases") }}
+          </Button>
           <Button variant="outline" class="shrink-0" :disabled="isTesting || isSaving" @click="testConnection">
             {{ isTesting ? t("connection.testing") : t("connection.test") }}
           </Button>
-          <Button
-            class="shrink-0"
-            @click="save"
-            :disabled="
-              isSaving ||
-              (!form.host &&
-                !(mongoUseUrl && form.connection_string) &&
-                !(form.db_type === 'jdbc' && form.connection_string) &&
-                !connectionUrlInput.trim())
-            "
-          >
+          <Button class="shrink-0" @click="save" :disabled="isSaving || !hasRequiredConnectionTarget">
             {{
               isSaving
                 ? t("common.loading")
@@ -2472,6 +3642,119 @@ function openExternalUrl(url: string) {
           </Button>
         </DialogFooter>
       </template>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showVisibleDatabasesDialog">
+    <DialogContent class="sm:max-w-[460px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("visibleDatabases.title") }}</DialogTitle>
+        <p class="text-sm text-muted-foreground">
+          {{ t("visibleDatabases.description", { connection: form.name || selectedProfile().label }) }}
+        </p>
+      </DialogHeader>
+
+      <div class="flex items-center gap-2 rounded-md border bg-background px-2">
+        <Search class="h-4 w-4 shrink-0 text-muted-foreground" />
+        <Input
+          v-model="visibleDatabaseSearchText"
+          :placeholder="t('visibleDatabases.searchPlaceholder')"
+          class="h-8 border-0 px-0 shadow-none focus-visible:ring-0"
+          :disabled="isLoadingVisibleDatabases || !!visibleDatabaseError"
+        />
+      </div>
+
+      <div class="flex items-center justify-between text-xs text-muted-foreground">
+        <span>
+          {{
+            t("visibleDatabases.selectedCount", {
+              selected: visibleDatabaseSelectedCount,
+              total: visibleDatabaseTotalCount,
+            })
+          }}
+        </span>
+        <div class="flex items-center gap-2">
+          <button
+            class="hover:text-foreground disabled:opacity-50"
+            :disabled="isLoadingVisibleDatabases"
+            @click="selectAllVisibleDatabases"
+          >
+            {{ t("visibleDatabases.selectAll") }}
+          </button>
+          <button
+            class="hover:text-foreground disabled:opacity-50"
+            :disabled="isLoadingVisibleDatabases"
+            @click="clearVisibleDatabaseSelection"
+          >
+            {{ t("visibleDatabases.clear") }}
+          </button>
+          <button
+            class="hover:text-foreground disabled:opacity-50"
+            :disabled="isLoadingVisibleDatabases"
+            @click="showAllVisibleDatabases"
+          >
+            {{ t("visibleDatabases.showAll") }}
+          </button>
+        </div>
+      </div>
+      <p
+        v-if="!isLoadingVisibleDatabases && !visibleDatabaseError && !visibleDatabaseCanSave"
+        class="text-xs text-destructive"
+      >
+        {{ t("visibleDatabases.emptySelection") }}
+      </p>
+
+      <label
+        v-if="visibleDatabaseHasSystemDatabases"
+        class="flex h-8 items-center gap-2 rounded-md px-1 text-xs text-muted-foreground"
+      >
+        <input
+          v-model="visibleDatabaseShowSystem"
+          type="checkbox"
+          class="h-3.5 w-3.5 accent-primary"
+          :disabled="isLoadingVisibleDatabases || !!visibleDatabaseError"
+        />
+        <span>{{ t("visibleDatabases.showSystemDatabases") }}</span>
+      </label>
+
+      <div class="h-72 overflow-y-auto rounded-md border bg-background/50 p-1">
+        <div
+          v-if="isLoadingVisibleDatabases"
+          class="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground"
+        >
+          <Loader2 class="h-4 w-4 animate-spin" />
+          {{ t("common.loading") }}
+        </div>
+        <div v-else-if="visibleDatabaseError" class="p-3 text-sm text-destructive">
+          {{ t("visibleDatabases.loadFailed", { message: visibleDatabaseError }) }}
+        </div>
+        <div v-else-if="!filteredVisibleDatabaseNames.length" class="p-3 text-sm text-muted-foreground">
+          {{ t("grid.noSearchResults") }}
+        </div>
+        <template v-else>
+          <button
+            v-for="database in filteredVisibleDatabaseNames"
+            :key="database"
+            type="button"
+            class="flex h-8 w-full min-w-0 items-center gap-2 rounded-sm px-2 text-left text-sm hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none"
+            @click="toggleVisibleDatabase(database)"
+          >
+            <CheckSquare v-if="visibleDatabaseSelection.has(database)" class="h-4 w-4 shrink-0 text-primary" />
+            <Square v-else class="h-4 w-4 shrink-0 text-muted-foreground" />
+            <span class="truncate">{{ database }}</span>
+          </button>
+        </template>
+      </div>
+
+      <DialogFooter>
+        <Button variant="outline" @click="showVisibleDatabasesDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button
+          :disabled="isLoadingVisibleDatabases || !!visibleDatabaseError || !visibleDatabaseCanSave"
+          @click="saveVisibleDatabaseSelection"
+        >
+          {{ t("visibleDatabases.save") }}
+        </Button>
+      </DialogFooter>
     </DialogContent>
   </Dialog>
 </template>

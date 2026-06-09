@@ -39,6 +39,20 @@ pub enum SqlFileStatementAction {
     Skip,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlFileImportStatementKind {
+    Execute,
+    Skip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlFileImportStatement {
+    pub kind: SqlFileImportStatementKind,
+    pub sql: String,
+    pub source_sqls: Vec<String>,
+    pub source_statement_count: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SqlParsingOptions {
     pub supports_hash_line_comments: bool,
@@ -284,7 +298,7 @@ impl SqlStatementSplitter {
         let trimmed = self.buffer.trim();
         let last_line = trimmed.rsplit('\n').next().unwrap_or(trimmed).trim();
         if parse_delimiter_command(last_line).is_some() {
-            let before = trimmed.rsplitn(2, '\n').nth(1).unwrap_or("").trim();
+            let before = trimmed.rsplit_once('\n').map(|x| x.0).unwrap_or("").trim();
             if has_executable_sql_with_options(before, self.options) {
                 statements.push(before.to_string());
             }
@@ -341,6 +355,9 @@ pub fn find_statement_at_cursor(sql: &str, cursor_pos: usize) -> String {
 }
 
 pub fn find_statement_at_cursor_for_database(sql: &str, cursor_pos: usize, db_type: DatabaseType) -> String {
+    if db_type == DatabaseType::SqlServer {
+        return find_sqlserver_statement_at_cursor(sql, cursor_pos);
+    }
     find_statement_at_cursor_with_options(sql, cursor_pos, SqlParsingOptions::for_database_type(db_type))
 }
 
@@ -592,6 +609,15 @@ fn dollar_quote_tag_at_str(sql: &str, index: usize) -> Option<String> {
 }
 
 pub fn split_sql_batches(sql: &str) -> Vec<String> {
+    let ranges = split_sql_batch_ranges(sql);
+    if ranges.is_empty() {
+        let trimmed = sql.trim();
+        return if trimmed.is_empty() { Vec::new() } else { vec![trimmed.to_string()] };
+    }
+    ranges.into_iter().map(|range| range.text).collect()
+}
+
+fn split_sql_batch_ranges(sql: &str) -> Vec<SqlStatementRange> {
     let mut batches = Vec::new();
     let mut current_start = 0;
     let lines: Vec<&str> = sql.split('\n').collect();
@@ -606,10 +632,7 @@ pub fn split_sql_batches(sql: &str) -> Vec<String> {
         if trimmed.eq_ignore_ascii_case("go")
             || trimmed.to_ascii_lowercase().starts_with("go ") && trimmed[2..].trim().is_empty()
         {
-            let batch = sql[current_start..line_start].trim();
-            if has_executable_sql(batch) {
-                batches.push(batch.to_string());
-            }
+            push_batch_range(&mut batches, sql, current_start, line_start);
             current_start = line_end.min(sql.len());
             if current_start < sql.len() && sql.as_bytes()[current_start] == b'\n' {
                 current_start += 1;
@@ -617,26 +640,93 @@ pub fn split_sql_batches(sql: &str) -> Vec<String> {
         }
     }
 
-    let trailing = sql[current_start..].trim();
-    if has_executable_sql(trailing) {
-        batches.push(trailing.to_string());
-    }
+    push_batch_range(&mut batches, sql, current_start, sql.len());
+    batches
+}
 
-    if batches.is_empty() {
-        let trimmed = sql.trim();
-        if !trimmed.is_empty() {
-            batches.push(trimmed.to_string());
+fn push_batch_range(ranges: &mut Vec<SqlStatementRange>, sql: &str, start: usize, end: usize) {
+    let Some((relative_start, relative_end)) = executable_sql_bounds(&sql[start..end], SqlParsingOptions::default())
+    else {
+        return;
+    };
+    let statement_start = start + relative_start;
+    let statement_end = start + relative_end;
+    let text = sql[statement_start..statement_end].to_string();
+    if !text.is_empty() {
+        ranges.push(SqlStatementRange { text, start: statement_start, end: statement_end });
+    }
+}
+
+fn find_sqlserver_statement_at_cursor(sql: &str, cursor_pos: usize) -> String {
+    let cursor = utf16_offset_to_byte_index(sql, cursor_pos);
+    let batches = split_sql_batch_ranges(sql);
+
+    for (idx, batch) in batches.iter().enumerate() {
+        if cursor >= batch.start && cursor <= batch.end {
+            if starts_with_sqlserver_module_ddl(&batch.text) {
+                return batch.text.clone();
+            }
+            let relative_cursor = sql[..cursor].encode_utf16().count() - sql[..batch.start].encode_utf16().count();
+            return find_statement_at_cursor_with_options(&batch.text, relative_cursor, SqlParsingOptions::default());
+        }
+
+        if cursor < batch.start {
+            if let Some(prev) = idx.checked_sub(1).and_then(|prev_idx| batches.get(prev_idx)) {
+                if starts_with_sqlserver_module_ddl(&prev.text) {
+                    return prev.text.clone();
+                }
+                let relative_cursor = prev.text.encode_utf16().count();
+                return find_statement_at_cursor_with_options(
+                    &prev.text,
+                    relative_cursor,
+                    SqlParsingOptions::default(),
+                );
+            }
+            return batch.text.clone();
         }
     }
 
-    batches
+    batches.last().map(|batch| batch.text.clone()).unwrap_or_else(|| sql.trim().to_string())
+}
+
+fn starts_with_sqlserver_module_ddl(sql: &str) -> bool {
+    let tokens = first_sql_tokens(sql, 4);
+    if tokens.len() >= 4
+        && tokens[0].eq_ignore_ascii_case("CREATE")
+        && tokens[1].eq_ignore_ascii_case("OR")
+        && tokens[2].eq_ignore_ascii_case("ALTER")
+    {
+        return is_sqlserver_module_keyword(&tokens[3]);
+    }
+
+    tokens.len() >= 2
+        && (tokens[0].eq_ignore_ascii_case("CREATE") || tokens[0].eq_ignore_ascii_case("ALTER"))
+        && is_sqlserver_module_keyword(&tokens[1])
+}
+
+fn is_sqlserver_module_keyword(token: &str) -> bool {
+    ["FUNCTION", "PROC", "PROCEDURE", "TRIGGER", "VIEW"].iter().any(|keyword| token.eq_ignore_ascii_case(keyword))
+}
+
+fn first_sql_tokens(sql: &str, limit: usize) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for token in sql.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
+        if token.is_empty() {
+            continue;
+        }
+        tokens.push(token.to_string());
+        if tokens.len() >= limit {
+            break;
+        }
+    }
+    tokens
 }
 
 fn parse_delimiter_command(line: &str) -> Option<&str> {
     let bytes = line.as_bytes();
-    let rest = if bytes.len() > 10 && bytes[..10].eq_ignore_ascii_case(b"delimiter ") {
-        Some(&line[10..])
-    } else if bytes.len() > 10 && bytes[..10].eq_ignore_ascii_case(b"delimiter\t") {
+    let rest = if bytes.len() > 10
+        && (bytes[..10].eq_ignore_ascii_case(b"delimiter ") || bytes[..10].eq_ignore_ascii_case(b"delimiter\t"))
+    {
         Some(&line[10..])
     } else {
         None
@@ -685,12 +775,368 @@ pub fn prepare_sql_file_statement(
     SqlFileStatementAction::Execute(body.to_string())
 }
 
+pub fn optimize_sql_file_import_statements(
+    statements: &[String],
+    db_type: Option<DatabaseType>,
+    driver_profile: Option<&str>,
+) -> Vec<SqlFileImportStatement> {
+    let mut optimized = Vec::new();
+    let mut pending_insert: Option<PendingInsertBatch> = None;
+
+    for statement in statements {
+        let action = db_type
+            .as_ref()
+            .map(|db_type| prepare_sql_file_statement(statement, db_type, driver_profile))
+            .unwrap_or_else(|| SqlFileStatementAction::Execute(statement.trim().to_string()));
+
+        match action {
+            SqlFileStatementAction::Skip => {
+                flush_pending_insert(&mut optimized, &mut pending_insert);
+                optimized.push(SqlFileImportStatement {
+                    kind: SqlFileImportStatementKind::Skip,
+                    sql: statement.trim().to_string(),
+                    source_sqls: vec![statement.trim().to_string()],
+                    source_statement_count: 1,
+                });
+            }
+            SqlFileStatementAction::Execute(sql) => {
+                let options = db_type.map(SqlParsingOptions::for_database_type).unwrap_or_default();
+                if let Some(insert) = parse_mergeable_insert(&sql, options) {
+                    match pending_insert.as_mut() {
+                        Some(batch) if batch.can_accept(&insert) => batch.push(insert),
+                        Some(_) => {
+                            flush_pending_insert(&mut optimized, &mut pending_insert);
+                            pending_insert = Some(PendingInsertBatch::new(insert));
+                        }
+                        None => {
+                            pending_insert = Some(PendingInsertBatch::new(insert));
+                        }
+                    }
+                } else {
+                    flush_pending_insert(&mut optimized, &mut pending_insert);
+                    optimized.push(SqlFileImportStatement {
+                        kind: SqlFileImportStatementKind::Execute,
+                        sql: sql.clone(),
+                        source_sqls: vec![sql],
+                        source_statement_count: 1,
+                    });
+                }
+            }
+        }
+    }
+
+    flush_pending_insert(&mut optimized, &mut pending_insert);
+    optimized
+}
+
+fn flush_pending_insert(optimized: &mut Vec<SqlFileImportStatement>, pending_insert: &mut Option<PendingInsertBatch>) {
+    if let Some(batch) = pending_insert.take() {
+        optimized.push(SqlFileImportStatement {
+            kind: SqlFileImportStatementKind::Execute,
+            sql: batch.to_sql(),
+            source_sqls: batch.source_sqls,
+            source_statement_count: batch.source_statement_count,
+        });
+    }
+}
+
+const SQL_FILE_INSERT_BATCH_MAX_STATEMENTS: usize = 500;
+const SQL_FILE_INSERT_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct MergeableInsert {
+    prefix: String,
+    prefix_key: String,
+    values: String,
+    sql: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingInsertBatch {
+    prefix: String,
+    prefix_key: String,
+    values: Vec<String>,
+    source_sqls: Vec<String>,
+    source_statement_count: usize,
+    byte_len: usize,
+}
+
+impl PendingInsertBatch {
+    fn new(insert: MergeableInsert) -> Self {
+        let byte_len = insert.prefix.len() + insert.values.len() + 16;
+        Self {
+            prefix: insert.prefix,
+            prefix_key: insert.prefix_key,
+            values: vec![insert.values],
+            source_sqls: vec![insert.sql],
+            source_statement_count: 1,
+            byte_len,
+        }
+    }
+
+    fn can_accept(&self, insert: &MergeableInsert) -> bool {
+        self.prefix_key == insert.prefix_key
+            && self.source_statement_count < SQL_FILE_INSERT_BATCH_MAX_STATEMENTS
+            && self.byte_len + insert.values.len() + 3 <= SQL_FILE_INSERT_BATCH_MAX_BYTES
+    }
+
+    fn push(&mut self, insert: MergeableInsert) {
+        self.byte_len += insert.values.len() + 3;
+        self.values.push(insert.values);
+        self.source_sqls.push(insert.sql);
+        self.source_statement_count += 1;
+    }
+
+    fn to_sql(&self) -> String {
+        if self.source_statement_count == 1 {
+            return self.source_sqls.first().cloned().unwrap_or_default();
+        }
+        format!("{} VALUES\n{}", self.prefix, self.values.join(",\n"))
+    }
+}
+
+fn parse_mergeable_insert(sql: &str, options: SqlParsingOptions) -> Option<MergeableInsert> {
+    let executable = leading_executable_sql_with_options(sql, options).trim().trim_end_matches(';').trim();
+    if !starts_with_keyword(executable, "insert") {
+        return None;
+    }
+
+    let (values_start, values_end) = find_top_level_values_keyword(executable)?;
+    let prefix_without_values = executable[..values_start].trim_end();
+    let values = executable[values_end..].trim();
+    let values = parse_insert_values_tail(values)?;
+
+    let prefix = prefix_without_values.to_string();
+    Some(MergeableInsert {
+        prefix_key: normalize_insert_prefix_key(&prefix),
+        prefix,
+        values,
+        sql: executable.to_string(),
+    })
+}
+
+fn find_top_level_values_keyword(sql: &str) -> Option<(usize, usize)> {
+    let mut scanner = SqlScanner::default();
+    let mut depth = 0usize;
+
+    for (idx, ch) in sql.char_indices() {
+        scanner.step(sql, idx, ch);
+        if scanner.is_masked() {
+            continue;
+        }
+
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => {
+                for keyword in ["values", "value"] {
+                    if keyword_at(sql, idx, keyword) {
+                        return Some((idx, idx + keyword.len()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn parse_insert_values_tail(tail: &str) -> Option<String> {
+    let tail = tail.trim().trim_end_matches(';').trim();
+    if tail.is_empty() {
+        return None;
+    }
+
+    let mut scanner = SqlScanner::default();
+    let mut depth = 0usize;
+    let mut saw_tuple = false;
+    let mut expecting_tuple = true;
+
+    for (idx, ch) in tail.char_indices() {
+        scanner.step(tail, idx, ch);
+        if scanner.is_masked() {
+            continue;
+        }
+
+        if expecting_tuple {
+            if ch.is_whitespace() || (saw_tuple && ch == ',') {
+                continue;
+            }
+            if ch != '(' {
+                return None;
+            }
+            expecting_tuple = false;
+            saw_tuple = true;
+            depth = 1;
+            continue;
+        }
+
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    expecting_tuple = true;
+                }
+            }
+            ',' if depth == 0 => {}
+            _ if depth == 0 && !ch.is_whitespace() => return None,
+            _ => {}
+        }
+    }
+
+    if saw_tuple && depth == 0 {
+        Some(tail.to_string())
+    } else {
+        None
+    }
+}
+
+#[derive(Default)]
+struct SqlScanner {
+    in_single_quote: bool,
+    in_double_quote: bool,
+    in_backtick: bool,
+    in_line_comment: bool,
+    in_block_comment: bool,
+    dollar_quote_tag: Option<String>,
+    previous: Option<char>,
+}
+
+impl SqlScanner {
+    fn step(&mut self, sql: &str, idx: usize, ch: char) {
+        if let Some(tag) = self.dollar_quote_tag.clone() {
+            if sql[idx..].starts_with(&tag) {
+                self.dollar_quote_tag = None;
+            }
+            self.previous = Some(ch);
+            return;
+        }
+
+        let next = next_char_at(sql, idx + ch.len_utf8());
+        if self.in_line_comment {
+            if ch == '\n' {
+                self.in_line_comment = false;
+            }
+            self.previous = Some(ch);
+            return;
+        }
+        if self.in_block_comment {
+            if self.previous == Some('*') && ch == '/' {
+                self.in_block_comment = false;
+            }
+            self.previous = Some(ch);
+            return;
+        }
+
+        if !self.in_single_quote && !self.in_double_quote && !self.in_backtick {
+            if ch == '-' && next == Some('-') {
+                self.in_line_comment = true;
+            } else if ch == '/' && next == Some('*') {
+                self.in_block_comment = true;
+            } else if let Some(tag) = dollar_quote_tag_at_str(sql, idx) {
+                self.dollar_quote_tag = Some(tag);
+            }
+        }
+
+        match ch {
+            '\'' if !self.in_double_quote && !self.in_backtick && self.previous != Some('\\') => {
+                self.in_single_quote = !self.in_single_quote;
+            }
+            '"' if !self.in_single_quote && !self.in_backtick && self.previous != Some('\\') => {
+                self.in_double_quote = !self.in_double_quote;
+            }
+            '`' if !self.in_single_quote && !self.in_double_quote => {
+                self.in_backtick = !self.in_backtick;
+            }
+            _ => {}
+        }
+        self.previous = Some(ch);
+    }
+
+    fn is_masked(&self) -> bool {
+        self.in_single_quote
+            || self.in_double_quote
+            || self.in_backtick
+            || self.in_line_comment
+            || self.in_block_comment
+            || self.dollar_quote_tag.is_some()
+    }
+}
+
+fn keyword_at(sql: &str, idx: usize, keyword: &str) -> bool {
+    let end = idx + keyword.len();
+    sql.get(idx..end).is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
+        && sql[..idx].chars().next_back().is_none_or(|ch| !is_sql_ident_char(ch))
+        && sql.get(end..).and_then(|tail| tail.chars().next()).is_none_or(|ch| !is_sql_ident_char(ch))
+}
+
+fn starts_with_keyword(sql: &str, keyword: &str) -> bool {
+    sql.get(..keyword.len()).is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
+        && sql.get(keyword.len()..).and_then(|tail| tail.chars().next()).is_none_or(|ch| !is_sql_ident_char(ch))
+}
+
+fn is_sql_ident_char(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
+}
+
+fn normalize_insert_prefix_key(prefix: &str) -> String {
+    let mut scanner = SqlScanner::default();
+    let mut key = String::with_capacity(prefix.len());
+    let mut previous_space = false;
+
+    for (idx, ch) in prefix.char_indices() {
+        scanner.step(prefix, idx, ch);
+        if scanner.in_single_quote
+            || scanner.in_double_quote
+            || scanner.in_backtick
+            || scanner.dollar_quote_tag.is_some()
+        {
+            key.push(ch);
+            previous_space = false;
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            if !previous_space {
+                key.push(' ');
+            }
+            previous_space = true;
+        } else {
+            key.push(ch.to_ascii_lowercase());
+            previous_space = false;
+        }
+    }
+
+    key.trim().to_string()
+}
+
 pub fn starts_with_executable_sql_keyword(sql: &str, keywords: &[&str]) -> bool {
     starts_with_executable_sql_keyword_with_options(sql, keywords, SqlParsingOptions::default())
 }
 
 pub fn starts_with_executable_sql_keyword_for_database(sql: &str, keywords: &[&str], db_type: DatabaseType) -> bool {
     starts_with_executable_sql_keyword_with_options(sql, keywords, SqlParsingOptions::for_database_type(db_type))
+}
+
+pub fn starts_with_duckdb_result_sql_keyword(sql: &str) -> bool {
+    starts_with_executable_sql_keyword(
+        sql,
+        &[
+            "SELECT",
+            "SHOW",
+            "DESCRIBE",
+            "EXPLAIN",
+            "WITH",
+            "PRAGMA",
+            "FROM",
+            "SUMMARIZE",
+            "SUMMARISE",
+            "PIVOT",
+            "UNPIVOT",
+        ],
+    )
 }
 
 pub fn starts_with_executable_sql_keyword_with_options(
@@ -1041,9 +1487,10 @@ mod tests {
     use crate::models::connection::DatabaseType;
 
     use super::{
-        decode_sql_file_bytes, find_statement_at_cursor_for_database, prepare_sql_file_statement, split_sql_script,
-        split_sql_statements_for_database, starts_with_executable_sql_keyword,
-        starts_with_executable_sql_keyword_for_database, SqlFileStatementAction, SqlStatementSplitter,
+        decode_sql_file_bytes, find_statement_at_cursor_for_database, optimize_sql_file_import_statements,
+        prepare_sql_file_statement, split_sql_script, split_sql_statements_for_database,
+        starts_with_executable_sql_keyword, starts_with_executable_sql_keyword_for_database, SqlFileStatementAction,
+        SqlStatementSplitter,
     };
 
     #[test]
@@ -1272,6 +1719,53 @@ mod tests {
     }
 
     #[test]
+    fn optimizes_adjacent_single_row_inserts_into_multi_row_insert() {
+        let statements = vec![
+            "INSERT INTO users (id, name) VALUES (1, 'Ada')".to_string(),
+            "insert into users (id, name) values (2, 'Linus')".to_string(),
+            "SELECT 1".to_string(),
+        ];
+
+        let optimized = optimize_sql_file_import_statements(&statements, Some(DatabaseType::Mysql), None);
+
+        assert_eq!(optimized.len(), 2);
+        assert_eq!(optimized[0].source_statement_count, 2);
+        assert_eq!(optimized[0].sql, "INSERT INTO users (id, name) VALUES\n(1, 'Ada'),\n(2, 'Linus')");
+        assert_eq!(optimized[1].sql, "SELECT 1");
+    }
+
+    #[test]
+    fn keeps_insert_batches_separate_for_different_targets_or_suffixes() {
+        let statements = vec![
+            "INSERT INTO users (id) VALUES (1)".to_string(),
+            "INSERT INTO teams (id) VALUES (1)".to_string(),
+            "INSERT INTO users (id) VALUES (2) RETURNING id".to_string(),
+        ];
+
+        let optimized = optimize_sql_file_import_statements(&statements, Some(DatabaseType::Postgres), None);
+
+        assert_eq!(optimized.len(), 3);
+        assert!(optimized.iter().all(|statement| statement.source_statement_count == 1));
+    }
+
+    #[test]
+    fn optimized_sql_file_import_keeps_skipped_mysql_dump_statements() {
+        let statements = vec![
+            "LOCK TABLES `users` WRITE".to_string(),
+            "INSERT INTO `users` VALUES (1)".to_string(),
+            "INSERT INTO `users` VALUES (2)".to_string(),
+            "UNLOCK TABLES".to_string(),
+        ];
+
+        let optimized = optimize_sql_file_import_statements(&statements, Some(DatabaseType::Mysql), None);
+
+        assert_eq!(optimized.len(), 3);
+        assert_eq!(optimized[0].kind, super::SqlFileImportStatementKind::Skip);
+        assert_eq!(optimized[1].source_statement_count, 2);
+        assert_eq!(optimized[2].kind, super::SqlFileImportStatementKind::Skip);
+    }
+
+    #[test]
     fn split_batches_by_go() {
         assert_eq!(super::split_sql_batches("SELECT 1\nGO\nSELECT 2"), vec!["SELECT 1", "SELECT 2"]);
     }
@@ -1474,6 +1968,43 @@ SELECT 2;";
 
         assert_eq!(super::find_statement_at_cursor(sql, cursor), "CREATE PROCEDURE foo()\nBEGIN\n  SELECT 1;\nEND");
         assert_eq!(super::find_statement_at_cursor(sql, next_cursor), "SELECT 2");
+    }
+
+    #[test]
+    fn sqlserver_current_statement_keeps_procedure_batch_with_inner_semicolons() {
+        let sql = "\
+CREATE OR ALTER PROCEDURE dbo.usp_demo
+AS
+BEGIN
+  SELECT 1;
+  SELECT 2;
+END
+GO
+SELECT 3;";
+        let cursor = sql[..sql.find("SELECT 2").unwrap()].encode_utf16().count();
+        let next_cursor = sql[..sql.rfind("SELECT 3").unwrap()].encode_utf16().count();
+
+        assert_eq!(
+            super::find_statement_at_cursor_for_database(sql, cursor, DatabaseType::SqlServer),
+            "CREATE OR ALTER PROCEDURE dbo.usp_demo\nAS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND"
+        );
+        assert_eq!(super::find_statement_at_cursor_for_database(sql, next_cursor, DatabaseType::SqlServer), "SELECT 3");
+    }
+
+    #[test]
+    fn sqlserver_current_statement_keeps_alter_procedure_batch() {
+        let sql = "\
+ALTER PROC dbo.usp_demo
+AS
+BEGIN
+  UPDATE dbo.users SET name = name;
+END";
+        let cursor = sql[..sql.find("UPDATE").unwrap()].encode_utf16().count();
+
+        assert_eq!(
+            super::find_statement_at_cursor_for_database(sql, cursor, DatabaseType::SqlServer),
+            "ALTER PROC dbo.usp_demo\nAS\nBEGIN\n  UPDATE dbo.users SET name = name;\nEND"
+        );
     }
 
     #[test]

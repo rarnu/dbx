@@ -2,7 +2,22 @@
 import { computed, ref, onBeforeUnmount, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
 import { DynamicScroller, DynamicScrollerItem, RecycleScroller } from "vue-virtual-scroller";
-import { Braces, Copy, Eye, FileText, Trash2, Save, RefreshCw, Plus, Loader2, Pencil, WrapText } from "lucide-vue-next";
+import {
+  Braces,
+  Copy,
+  Eye,
+  FileText,
+  Terminal,
+  Trash2,
+  Save,
+  RefreshCw,
+  Plus,
+  Loader2,
+  Pencil,
+  WrapText,
+  IndentIncrease,
+  IndentDecrease,
+} from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -65,6 +80,9 @@ const isResizingMemberSheet = ref(false);
 const hashTableRef = ref<HTMLElement | null>(null);
 const hashFieldWidth = ref(280);
 const isResizingHashColumns = ref(false);
+const zsetTableRef = ref<HTMLElement | null>(null);
+const zsetScoreWidth = ref(220);
+const isResizingZsetColumns = ref(false);
 type RedisValueView = "json" | "raw";
 const REDIS_JSON_WRAP_STORAGE_KEY = "dbx-redis-json-word-wrap";
 const stringValueView = ref<RedisValueView>("raw");
@@ -83,6 +101,9 @@ const memberRawJsonHtml = computed(() =>
 );
 const hashGridStyle = computed(() => ({
   gridTemplateColumns: `${hashFieldWidth.value}px minmax(12rem, 1fr) 84px`,
+}));
+const zsetGridStyle = computed(() => ({
+  gridTemplateColumns: `${zsetScoreWidth.value}px minmax(0, 1fr) 84px`,
 }));
 const selectedMemberCanEdit = computed(
   () => selectedMemberContext.value != null && canEditRedisMemberDetail(selectedMemberContext.value.kind),
@@ -103,6 +124,8 @@ let memberSheetResizeStartX = 0;
 let memberSheetResizeStartWidth = 0;
 let hashResizeStartX = 0;
 let hashResizeStartWidth = 0;
+let zsetResizeStartX = 0;
+let zsetResizeStartWidth = 0;
 
 type RedisMemberContext =
   | { kind: "list"; index: number }
@@ -268,6 +291,64 @@ function handleStringInput() {
   }
 }
 
+function formatJsonText(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw);
+    return JSON.stringify(parsed, null, 2);
+  } catch {
+    return null;
+  }
+}
+
+function compressJsonText(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw);
+    return JSON.stringify(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function handleFormatStringJson() {
+  const result = formatJsonText(editValue.value);
+  if (result != null) {
+    editValue.value = result;
+    isEditing.value = true;
+  } else {
+    toast(t("redis.jsonFormatError"), 3000);
+  }
+}
+
+function handleCompressStringJson() {
+  const result = compressJsonText(editValue.value);
+  if (result != null) {
+    editValue.value = result;
+    isEditing.value = true;
+  } else {
+    toast(t("redis.jsonFormatError"), 3000);
+  }
+}
+
+function handleFormatMemberJson() {
+  const result = formatJsonText(memberEditValue.value);
+  if (result != null) {
+    memberEditValue.value = result;
+    isEditingMember.value = true;
+  } else {
+    toast(t("redis.jsonFormatError"), 3000);
+  }
+}
+
+function handleCompressMemberJson() {
+  const result = compressJsonText(memberEditValue.value);
+  if (result != null) {
+    memberEditValue.value = result;
+    isEditingMember.value = true;
+  } else {
+    toast(t("redis.jsonFormatError"), 3000);
+  }
+}
+
 async function applyDeleteKey() {
   await api.redisDeleteKey(props.connectionId, props.db, props.keyRaw);
   emit("deleted");
@@ -293,6 +374,94 @@ async function copyText(text: string) {
   try {
     await copyToClipboard(text);
     toast(t("redis.copied"), 2000);
+  } catch (e: any) {
+    toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+function escapeRedisArg(val: string): string {
+  return `"${val.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function generateInsertStatements(): string | null {
+  if (!data.value) return null;
+  if (data.value.value_is_binary) return null;
+
+  const key = data.value.key_display;
+  const type = data.value.key_type;
+  const commands: string[] = [];
+
+  const isCollection = ["list", "set", "zset", "hash"].includes(type);
+  if (isCollection) {
+    const total = data.value.total;
+    const loaded = collectionItems.value.length;
+    if (total != null && total > loaded) {
+      commands.push(`-- Note: Only ${loaded} of ${total} items included`);
+    }
+  }
+
+  switch (type) {
+    case "string":
+      commands.push(`SET ${escapeRedisArg(key)} ${escapeRedisArg(String(data.value.value))}`);
+      break;
+    case "list": {
+      const items = collectionItems.value.map((v) => escapeRedisArg(String(v))).join(" ");
+      commands.push(`RPUSH ${escapeRedisArg(key)} ${items}`);
+      break;
+    }
+    case "set": {
+      const members = collectionItems.value.map((v) => escapeRedisArg(String(v))).join(" ");
+      commands.push(`SADD ${escapeRedisArg(key)} ${members}`);
+      break;
+    }
+    case "zset": {
+      const pairs = collectionItems.value.map((v) => `${v.score} ${escapeRedisArg(String(v.member))}`).join(" ");
+      commands.push(`ZADD ${escapeRedisArg(key)} ${pairs}`);
+      break;
+    }
+    case "hash": {
+      const pairs = collectionItems.value
+        .map((v) => `${escapeRedisArg(String(v.field))} ${escapeRedisArg(String(v.value))}`)
+        .join(" ");
+      commands.push(`HSET ${escapeRedisArg(key)} ${pairs}`);
+      break;
+    }
+    case "stream": {
+      const entries = Array.isArray(data.value.value) ? data.value.value : [];
+      for (const entry of entries) {
+        const fields = Object.entries((entry as any).fields ?? {})
+          .map(([f, v]) => `${escapeRedisArg(f)} ${escapeRedisArg(String(v))}`)
+          .join(" ");
+        commands.push(`XADD ${escapeRedisArg(key)} * ${fields}`);
+      }
+      break;
+    }
+    default:
+      if (type === "ReJSON-RL" || type === "JSON") {
+        const json = JSON.stringify(data.value.value);
+        commands.push(`JSON.SET ${escapeRedisArg(key)} $ '${json}'`);
+      }
+      break;
+  }
+
+  if (data.value.ttl > 0) {
+    commands.push(`EXPIRE ${escapeRedisArg(key)} ${data.value.ttl}`);
+  }
+
+  return commands.join("\n");
+}
+
+async function copyInsertStatement() {
+  if (!data.value) return;
+  if (data.value.value_is_binary) {
+    toast(t("redis.copyInsertStatementBinary"), 3000);
+    return;
+  }
+  const stmt = generateInsertStatements();
+  if (!stmt) return;
+  try {
+    await copyToClipboard(stmt);
+    toast(t("redis.copyInsertStatement"), 2000);
   } catch (e: any) {
     toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
   }
@@ -388,6 +557,33 @@ function startResizeHashColumns(event: PointerEvent) {
   hashResizeStartWidth = hashFieldWidth.value;
   window.addEventListener("pointermove", resizeHashColumns);
   window.addEventListener("pointerup", stopResizeHashColumns);
+}
+
+function clampZsetScoreWidth(width: number) {
+  const containerWidth = zsetTableRef.value?.clientWidth ?? 900;
+  const min = 120;
+  const max = Math.max(min, containerWidth - 220);
+  return Math.min(max, Math.max(min, width));
+}
+
+function stopResizeZsetColumns() {
+  isResizingZsetColumns.value = false;
+  window.removeEventListener("pointermove", resizeZsetColumns);
+  window.removeEventListener("pointerup", stopResizeZsetColumns);
+}
+
+function resizeZsetColumns(event: PointerEvent) {
+  if (!isResizingZsetColumns.value) return;
+  const delta = event.clientX - zsetResizeStartX;
+  zsetScoreWidth.value = clampZsetScoreWidth(zsetResizeStartWidth + delta);
+}
+
+function startResizeZsetColumns(event: PointerEvent) {
+  isResizingZsetColumns.value = true;
+  zsetResizeStartX = event.clientX;
+  zsetResizeStartWidth = zsetScoreWidth.value;
+  window.addEventListener("pointermove", resizeZsetColumns);
+  window.addEventListener("pointerup", stopResizeZsetColumns);
 }
 
 function startEditMember() {
@@ -493,7 +689,10 @@ function startEditTtl() {
 async function saveTtl() {
   const val = ttlInput.value.trim();
   const ttl = val === "" || val === "-1" ? -1 : parseInt(val, 10);
-  if (isNaN(ttl)) return;
+  if (isNaN(ttl)) {
+    toast(t("redis.ttlInvalid"), 3000);
+    return;
+  }
   await api.redisSetTtl(props.connectionId, props.db, props.keyRaw, ttl);
   editingTtl.value = false;
   await load();
@@ -505,7 +704,10 @@ function cancelEditTtl() {
 
 // Hash
 async function hashSet() {
-  if (!newField.value) return;
+  if (!newField.value.trim()) {
+    toast(t("redis.fieldRequired"), 3000);
+    return;
+  }
   await api.redisHashSet(props.connectionId, props.db, props.keyRaw, newField.value, newValue.value);
   newField.value = "";
   newValue.value = "";
@@ -522,7 +724,10 @@ function requestHashDel(field: string) {
 
 // List
 async function listPush() {
-  if (!newValue.value) return;
+  if (!newValue.value.trim()) {
+    toast(t("redis.valueRequired"), 3000);
+    return;
+  }
   await api.redisListPush(props.connectionId, props.db, props.keyRaw, newValue.value);
   newValue.value = "";
   await load();
@@ -538,7 +743,10 @@ function requestListRemove(index: number) {
 
 // Set
 async function setAdd() {
-  if (!newValue.value) return;
+  if (!newValue.value.trim()) {
+    toast(t("redis.memberRequired"), 3000);
+    return;
+  }
   await api.redisSetAdd(props.connectionId, props.db, props.keyRaw, newValue.value);
   newValue.value = "";
   await load();
@@ -554,7 +762,10 @@ function requestSetRemove(member: string) {
 
 // ZSet
 async function zsetAdd() {
-  if (!newValue.value) return;
+  if (!newValue.value.trim()) {
+    toast(t("redis.memberRequired"), 3000);
+    return;
+  }
   const score = parseFloat(newScore.value || "0");
   await api.redisZadd(props.connectionId, props.db, props.keyRaw, newValue.value, score);
   newValue.value = "";
@@ -601,6 +812,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   stopResizeMemberSheet();
   stopResizeHashColumns();
+  stopResizeZsetColumns();
 });
 </script>
 
@@ -622,6 +834,14 @@ onBeforeUnmount(() => {
           /></Button>
           <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0" @click="copyValue"
             ><Copy class="h-3.5 w-3.5"
+          /></Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            class="h-7 w-7 shrink-0"
+            :title="t('redis.copyInsertStatement')"
+            @click="copyInsertStatement"
+            ><Terminal class="h-3.5 w-3.5"
           /></Button>
           <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0 text-destructive" @click="requestDeleteKey"
             ><Trash2 class="h-3.5 w-3.5"
@@ -689,6 +909,26 @@ onBeforeUnmount(() => {
             </Button>
           </div>
           <span class="flex-1" />
+          <Button
+            v-if="stringValueView === 'raw'"
+            variant="ghost"
+            size="sm"
+            class="h-6 rounded-[5px] px-2 text-xs"
+            :title="t('redis.formatJson')"
+            @click="handleFormatStringJson"
+          >
+            <IndentIncrease class="h-3.5 w-3.5" />
+          </Button>
+          <Button
+            v-if="stringValueView === 'raw'"
+            variant="ghost"
+            size="sm"
+            class="h-6 rounded-[5px] px-2 text-xs"
+            :title="t('redis.compressJson')"
+            @click="handleCompressStringJson"
+          >
+            <IndentDecrease class="h-3.5 w-3.5" />
+          </Button>
           <label class="flex items-center gap-1.5 text-muted-foreground">
             <WrapText class="h-3.5 w-3.5" />
             {{ t("redis.wordWrap") }}
@@ -966,7 +1206,7 @@ onBeforeUnmount(() => {
       </div>
 
       <!-- Sorted Set -->
-      <div v-else-if="data.key_type === 'zset'" class="flex-1 flex flex-col overflow-hidden">
+      <div v-else-if="data.key_type === 'zset'" ref="zsetTableRef" class="flex-1 flex flex-col overflow-hidden">
         <div class="flex items-center gap-2 px-4 py-1.5 border-b shrink-0">
           <span class="text-xs text-muted-foreground">{{
             collectionCountLabel("members", collectionItems.length, data.total)
@@ -978,9 +1218,15 @@ onBeforeUnmount(() => {
             ><Plus class="w-3 h-3 mr-1" />Add</Button
           >
         </div>
-        <div class="grid grid-cols-[100px_1fr_84px] border-b bg-muted/50 shrink-0">
-          <div class="px-3 py-1 text-xs font-medium text-muted-foreground border-r">Score</div>
-          <div class="px-3 py-1 text-xs font-medium text-muted-foreground">Member</div>
+        <div class="grid border-b bg-muted/50 shrink-0" :style="zsetGridStyle">
+          <div class="relative px-3 py-1 text-xs font-medium text-muted-foreground border-r select-none">
+            Score
+            <div
+              class="absolute -right-1 top-0 h-full w-2 cursor-col-resize touch-none"
+              @pointerdown.prevent="startResizeZsetColumns"
+            />
+          </div>
+          <div class="px-3 py-1 text-xs font-medium text-muted-foreground min-w-0">Member</div>
           <div />
         </div>
         <RecycleScroller
@@ -994,9 +1240,9 @@ onBeforeUnmount(() => {
           <template #default="{ item: row }">
             <div
               data-redis-value-row
-              class="dbx-editor-font-family grid grid-cols-[100px_1fr_84px] border-b text-sm hover:bg-accent/50 group cursor-pointer"
+              class="dbx-editor-font-family grid border-b text-sm hover:bg-accent/50 group cursor-pointer"
               :class="{ 'bg-accent/60': isSelectedMember(String(row.value.score), row.value.member) }"
-              :style="{ height: `${REDIS_COLLECTION_ROW_HEIGHT}px` }"
+              :style="{ ...zsetGridStyle, height: `${REDIS_COLLECTION_ROW_HEIGHT}px` }"
               @click="
                 viewMember(String(row.value.score), row.value.member, {
                   kind: 'zset',
@@ -1005,8 +1251,15 @@ onBeforeUnmount(() => {
                 })
               "
             >
-              <div class="px-3 py-1.5 text-muted-foreground text-xs border-r">{{ row.value.score }}</div>
-              <div class="px-3 py-1.5 truncate">{{ row.value.member }}</div>
+              <div
+                class="px-3 py-1.5 text-muted-foreground text-xs border-r min-w-0 truncate"
+                :title="String(row.value.score)"
+              >
+                {{ row.value.score }}
+              </div>
+              <div class="px-3 py-1.5 min-w-0 truncate" :title="String(row.value.member)">
+                {{ row.value.member }}
+              </div>
               <div class="flex items-center justify-center gap-1">
                 <Button
                   variant="ghost"
@@ -1140,12 +1393,34 @@ onBeforeUnmount(() => {
             <Badge variant="outline" class="shrink-0 text-xs">{{ selectedMemberDetail.format.toUpperCase() }}</Badge>
           </SheetTitle>
         </SheetHeader>
-        <textarea
-          v-if="isEditingMember"
-          v-model="memberEditValue"
-          class="dbx-editor-font-family min-h-0 flex-1 resize-none bg-background p-5 text-[13px] leading-6 outline-none"
-          spellcheck="false"
-        />
+        <template v-if="isEditingMember">
+          <div v-if="selectedMemberJsonDetail" class="flex h-9 items-center gap-2 border-b px-5 text-xs shrink-0">
+            <span class="flex-1" />
+            <Button
+              variant="ghost"
+              size="sm"
+              class="h-6 rounded-[5px] px-2 text-xs"
+              :title="t('redis.formatJson')"
+              @click="handleFormatMemberJson"
+            >
+              <IndentIncrease class="h-3.5 w-3.5" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              class="h-6 rounded-[5px] px-2 text-xs"
+              :title="t('redis.compressJson')"
+              @click="handleCompressMemberJson"
+            >
+              <IndentDecrease class="h-3.5 w-3.5" />
+            </Button>
+          </div>
+          <textarea
+            v-model="memberEditValue"
+            class="dbx-editor-font-family min-h-0 flex-1 resize-none bg-background p-5 text-[13px] leading-6 outline-none"
+            spellcheck="false"
+          />
+        </template>
         <template v-else-if="selectedMemberJsonDetail">
           <div class="flex h-9 items-center gap-2 border-b px-5 text-xs">
             <div class="flex overflow-hidden rounded-md border bg-muted/20 p-0.5">
@@ -1171,6 +1446,26 @@ onBeforeUnmount(() => {
               </Button>
             </div>
             <span class="flex-1" />
+            <Button
+              v-if="memberValueView === 'raw'"
+              variant="ghost"
+              size="sm"
+              class="h-6 rounded-[5px] px-2 text-xs"
+              :title="t('redis.formatJson')"
+              @click="handleFormatMemberJson"
+            >
+              <IndentIncrease class="h-3.5 w-3.5" />
+            </Button>
+            <Button
+              v-if="memberValueView === 'raw'"
+              variant="ghost"
+              size="sm"
+              class="h-6 rounded-[5px] px-2 text-xs"
+              :title="t('redis.compressJson')"
+              @click="handleCompressMemberJson"
+            >
+              <IndentDecrease class="h-3.5 w-3.5" />
+            </Button>
             <label class="flex items-center gap-1.5 text-muted-foreground">
               <WrapText class="h-3.5 w-3.5" />
               {{ t("redis.wordWrap") }}

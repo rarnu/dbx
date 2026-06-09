@@ -1,6 +1,7 @@
 export interface SqlSafetyOptions {
   allowWrites?: boolean;
   allowDangerous?: boolean;
+  allowMultipleStatements?: boolean;
 }
 
 export interface SqlSafetyDecision {
@@ -11,12 +12,37 @@ export interface SqlSafetyDecision {
 const READ_KEYWORDS = new Set(["select", "with", "show", "describe", "desc", "explain"]);
 const DANGEROUS_KEYWORDS = new Set(["drop", "truncate", "alter"]);
 
+function parseBooleanEnv(value: string | undefined): boolean | undefined {
+  if (value === undefined) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "1" || normalized === "true") return true;
+  if (normalized === "0" || normalized === "false") return false;
+  return undefined;
+}
+
 export function evaluateSqlSafety(sql: string, options: SqlSafetyOptions = {}): SqlSafetyDecision {
   const statements = splitSqlStatements(sql);
   if (statements.length === 0) return { allowed: false, reason: "SQL is empty." };
-  if (statements.length > 1) return { allowed: false, reason: "Only one SQL statement is allowed per MCP query." };
+  if (statements.length > 1 && !options.allowMultipleStatements) {
+    return { allowed: false, reason: "Only one SQL statement is allowed per query." };
+  }
 
-  const normalized = stripSqlCommentsAndStrings(statements[0]).trim();
+  for (let i = 0; i < statements.length; i++) {
+    const decision = evaluateSingleSqlStatementSafety(statements[i], options);
+    if (!decision.allowed && statements.length > 1) {
+      return {
+        allowed: false,
+        reason: `Statement ${i + 1}: ${decision.reason ?? "SQL blocked."}`,
+      };
+    }
+    if (!decision.allowed) return decision;
+  }
+
+  return { allowed: true };
+}
+
+function evaluateSingleSqlStatementSafety(sql: string, options: SqlSafetyOptions = {}): SqlSafetyDecision {
+  const normalized = stripSqlCommentsAndStrings(sql).trim();
   const firstKeyword = normalized.match(/^[a-zA-Z_]+/)?.[0]?.toLowerCase();
   if (!firstKeyword) return { allowed: false, reason: "SQL statement is not recognized." };
 
@@ -29,7 +55,7 @@ export function evaluateSqlSafety(sql: string, options: SqlSafetyOptions = {}): 
   if (!options.allowWrites && !READ_KEYWORDS.has(firstKeyword)) {
     return {
       allowed: false,
-      reason: "MCP SQL execution is read-only by default. Set DBX_MCP_ALLOW_WRITES=1 to allow write statements.",
+      reason: "MCP SQL execution is read-only for this session. Set DBX_MCP_ALLOW_WRITES=1 to allow write statements.",
     };
   }
 
@@ -46,13 +72,15 @@ export function evaluateSqlSafety(sql: string, options: SqlSafetyOptions = {}): 
 }
 
 export function sqlSafetyFromEnv(env: NodeJS.ProcessEnv = process.env): SqlSafetyOptions {
+  const allowWrites = parseBooleanEnv(env.DBX_MCP_ALLOW_WRITES);
+  const allowDangerous = parseBooleanEnv(env.DBX_MCP_ALLOW_DANGEROUS_SQL);
   return {
-    allowWrites: env.DBX_MCP_ALLOW_WRITES === "1" || env.DBX_MCP_ALLOW_WRITES === "true",
-    allowDangerous: env.DBX_MCP_ALLOW_DANGEROUS_SQL === "1" || env.DBX_MCP_ALLOW_DANGEROUS_SQL === "true",
+    allowWrites: allowWrites ?? true,
+    allowDangerous: allowDangerous ?? false,
   };
 }
 
-function splitSqlStatements(sql: string): string[] {
+export function splitSqlStatements(sql: string): string[] {
   const statements: string[] = [];
   let current = "";
   let quote: "'" | '"' | "`" | null = null;

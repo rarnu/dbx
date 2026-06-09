@@ -1,4 +1,4 @@
-import test from "node:test";
+import { test } from "vitest";
 import assert from "node:assert/strict";
 import { connectionUrlPlaceholder } from "../../apps/desktop/src/lib/connectionPresentation.ts";
 
@@ -8,9 +8,11 @@ const expected: Record<string, string> = {
   starrocks: "mysql://user:password@host:port/database",
   postgres: "postgresql://user:password@host:port/database",
   gaussdb: "postgresql://user:password@host:port/database",
+  kwdb: "postgresql://user:password@host:port/database",
   redshift: "postgresql://user:password@host:port/database",
   redis: "redis://:password@host:port/0",
   sqlite: "sqlite:///absolute/path/to/database.db",
+  rqlite: "http://user:password@host:4001",
   duckdb: "duckdb:///absolute/path/to/database.duckdb",
   access: "jdbc:ucanaccess:///absolute/path/to/database.accdb",
   mongodb: "mongodb://user:password@host:port/database",
@@ -20,6 +22,8 @@ const expected: Record<string, string> = {
   elasticsearch: "http://user:password@host:port",
   dameng: "dm://user:password@host:port",
   tdengine: "tdengine://user:password@host:6041/database",
+  xugu: "xugu://user:password@host:5138/database",
+  iotdb: "iotdb://user:password@host:6667/root.test",
   bigquery: "bigquery://https://www.googleapis.com/bigquery/v2:443/project-id",
   jdbc: "jdbc:mysql://host:3306/database",
 };
@@ -43,6 +47,7 @@ test("mysql-family types share the same placeholder", () => {
 test("postgres-family types share the same placeholder", () => {
   const postgres = connectionUrlPlaceholder("postgres");
   assert.equal(connectionUrlPlaceholder("gaussdb"), postgres);
+  assert.equal(connectionUrlPlaceholder("kwdb"), postgres);
   assert.equal(connectionUrlPlaceholder("redshift"), postgres);
 });
 

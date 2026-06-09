@@ -1,11 +1,48 @@
-import test from "node:test";
+import { test } from "vitest";
 import assert from "node:assert/strict";
+import { createPinia, setActivePinia } from "pinia";
+import { DEFAULT_SQL_FORMATTER_SETTINGS } from "../../apps/desktop/src/lib/sqlFormatterConfig.ts";
 import {
   AI_PROVIDER_PRESETS,
   DEFAULT_EDITOR_SETTINGS,
   normalizeAiConfig,
   normalizeEditorSettings,
+  useSettingsStore,
 } from "../../apps/desktop/src/stores/settingsStore.ts";
+
+const OLD_FONT_SIZE_KEY = "dbx-query-editor-font-size";
+
+function withMockLocalStorage(initial: Record<string, string>, run: () => void) {
+  const previousDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  const values = new Map(Object.entries(initial));
+  const localStorageMock = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      values.set(key, value);
+    },
+    removeItem: (key: string) => {
+      values.delete(key);
+    },
+    clear: () => {
+      values.clear();
+    },
+  };
+
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: localStorageMock,
+  });
+
+  try {
+    run();
+  } finally {
+    if (previousDescriptor) {
+      Object.defineProperty(globalThis, "localStorage", previousDescriptor);
+    } else {
+      delete (globalThis as any).localStorage;
+    }
+  }
+}
 
 test("defaults Redis scan page size to 1000 keys", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.redisScanPageSize, 1000);
@@ -23,12 +60,30 @@ test("normalizes saved query result page size", () => {
   assert.equal(normalizeEditorSettings({ pageSize: 0 }).pageSize, 100);
 });
 
+test("defaults export batch size to 10000 rows", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.exportBatchSize, 10000);
+  assert.equal(normalizeEditorSettings({}).exportBatchSize, 10000);
+  assert.equal(normalizeEditorSettings({ exportBatchSize: 2000 }).exportBatchSize, 2000);
+});
+
 test("normalizes editor theme settings", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.theme, "app");
   assert.equal(normalizeEditorSettings({}).theme, "app");
   assert.equal(normalizeEditorSettings({ theme: "app" }).theme, "app");
   assert.equal(normalizeEditorSettings({ theme: "vscode-light" }).theme, "vscode-light");
   assert.equal(normalizeEditorSettings({ theme: "invalid" as any }).theme, DEFAULT_EDITOR_SETTINGS.theme);
+});
+
+test("defaults dangerous SQL confirmation to enabled", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution, true);
+  assert.equal(normalizeEditorSettings({}).confirmDangerousSqlExecution, true);
+  assert.equal(normalizeEditorSettings({ confirmDangerousSqlExecution: false }).confirmDangerousSqlExecution, false);
+});
+
+test("defaults update notifications to enabled", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled, true);
+  assert.equal(normalizeEditorSettings({}).updateNotificationsEnabled, true);
+  assert.equal(normalizeEditorSettings({ updateNotificationsEnabled: false } as any).updateNotificationsEnabled, false);
 });
 
 test("defaults shortcut settings", () => {
@@ -39,6 +94,7 @@ test("defaults shortcut settings", () => {
   assert.equal(settings.shortcuts.copyCurrentRow, "Mod+D");
   assert.equal(settings.shortcuts.deleteCurrentRow, "Delete");
   assert.equal(settings.shortcuts.newQuery, "Mod+T");
+  assert.equal(settings.shortcuts.openSettings, "Mod+,");
   assert.equal(settings.shortcuts.focusSearch, "Mod+F");
   assert.equal(settings.shortcuts.zoomInUi, "Mod+=");
   assert.equal(settings.shortcuts.zoomOutUi, "Mod+-");
@@ -54,6 +110,7 @@ test("keeps saved shortcut overrides", () => {
       copyCurrentRow: "Alt+Shift+D",
       deleteCurrentRow: "Backspace",
       newQuery: "Shift+Mod+N",
+      openSettings: "Shift+Mod+P",
       zoomInUi: "Alt+Mod+=",
     } as any,
   });
@@ -62,6 +119,7 @@ test("keeps saved shortcut overrides", () => {
   assert.equal(settings.shortcuts.copyCurrentRow, "Alt+Shift+D");
   assert.equal(settings.shortcuts.deleteCurrentRow, "Backspace");
   assert.equal(settings.shortcuts.newQuery, "Shift+Mod+N");
+  assert.equal(settings.shortcuts.openSettings, "Shift+Mod+P");
   assert.equal(settings.shortcuts.zoomInUi, "Alt+Mod+=");
   assert.equal(settings.shortcuts.saveSql, "Mod+S");
 });
@@ -74,6 +132,11 @@ test("defaults sidebar activation to single click", () => {
 test("defaults active tab sidebar selection to off", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.autoSelectActiveSidebarNode, false);
   assert.equal(normalizeEditorSettings({}).autoSelectActiveSidebarNode, false);
+});
+
+test("defaults sidebar horizontal scroll to off", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll, false);
+  assert.equal(normalizeEditorSettings({}).sidebarAllowHorizontalScroll, false);
 });
 
 test("defaults data grid header display settings", () => {
@@ -93,8 +156,48 @@ test("keeps saved data grid header display settings", () => {
   assert.equal(settings.compactColumnHeaderActions, false);
 });
 
+test("normalizes data grid render mode", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.dataGridRenderMode, "canvas");
+  assert.equal(normalizeEditorSettings({}).dataGridRenderMode, "canvas");
+  assert.equal(normalizeEditorSettings({ dataGridRenderMode: "canvas" as any }).dataGridRenderMode, "canvas");
+  assert.equal(normalizeEditorSettings({ dataGridRenderMode: "unknown" as any }).dataGridRenderMode, "canvas");
+});
+
+test("normalizes table structure editor density", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.structureEditorDensity, "compact");
+  assert.equal(normalizeEditorSettings({}).structureEditorDensity, "compact");
+  assert.equal(normalizeEditorSettings({ structureEditorDensity: "standard" }).structureEditorDensity, "standard");
+  assert.equal(
+    normalizeEditorSettings({ structureEditorDensity: "comfortable" }).structureEditorDensity,
+    "comfortable",
+  );
+  assert.equal(normalizeEditorSettings({ structureEditorDensity: "invalid" as any }).structureEditorDensity, "compact");
+});
+
+test("normalizes grid drawer widths", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.tableInfoDrawerWidth, 320);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.cellDetailDrawerWidth, 320);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.cellDetailPanelLayout, "bottom");
+  assert.equal(normalizeEditorSettings({}).tableInfoDrawerWidth, 320);
+  assert.equal(normalizeEditorSettings({}).cellDetailDrawerWidth, 320);
+  assert.equal(normalizeEditorSettings({}).cellDetailPanelLayout, "bottom");
+  assert.equal(normalizeEditorSettings({ tableInfoDrawerWidth: 200 } as any).tableInfoDrawerWidth, 240);
+  assert.equal(normalizeEditorSettings({ cellDetailDrawerWidth: 200 } as any).cellDetailDrawerWidth, 260);
+  assert.equal(normalizeEditorSettings({ tableInfoDrawerWidth: 1000 } as any).tableInfoDrawerWidth, 900);
+  assert.equal(normalizeEditorSettings({ cellDetailDrawerWidth: 456.7 } as any).cellDetailDrawerWidth, 457);
+  assert.equal(normalizeEditorSettings({ cellDetailPanelLayout: "right" } as any).cellDetailPanelLayout, "right");
+  assert.equal(normalizeEditorSettings({ cellDetailPanelLayout: "invalid" } as any).cellDetailPanelLayout, "bottom");
+});
+
 test("keeps saved active tab sidebar selection", () => {
   assert.equal(normalizeEditorSettings({ autoSelectActiveSidebarNode: true } as any).autoSelectActiveSidebarNode, true);
+});
+
+test("keeps saved sidebar horizontal scroll preference", () => {
+  assert.equal(
+    normalizeEditorSettings({ sidebarAllowHorizontalScroll: true } as any).sidebarAllowHorizontalScroll,
+    true,
+  );
 });
 
 test("keeps saved sidebar activation", () => {
@@ -199,4 +302,102 @@ test("normalizeEditorSettings clamps UI scale into the supported range", () => {
 
 test("normalizeEditorSettings keeps valid UI scales with two-decimal precision", () => {
   assert.equal(normalizeEditorSettings({ uiScale: 1.125 }).uiScale, 1.13);
+});
+
+test("defaults SQL formatter settings", () => {
+  assert.deepEqual(DEFAULT_EDITOR_SETTINGS.sqlFormatter, {
+    keywordCase: "upper",
+    dataTypeCase: "preserve",
+    functionCase: "preserve",
+    useTabs: false,
+    tabWidth: 2,
+    logicalOperatorNewline: "before",
+    expressionWidth: 50,
+    linesBetweenQueries: 1,
+    denseOperators: false,
+    newlineBeforeSemicolon: false,
+  });
+  assert.deepEqual(normalizeEditorSettings({}).sqlFormatter, DEFAULT_EDITOR_SETTINGS.sqlFormatter);
+});
+
+test("normalizes saved SQL formatter settings", () => {
+  assert.deepEqual(
+    normalizeEditorSettings({
+      sqlFormatter: {
+        keywordCase: "lower",
+        functionCase: "upper",
+        dataTypeCase: "upper",
+        useTabs: true,
+        tabWidth: 4,
+        logicalOperatorNewline: "after",
+        expressionWidth: 120,
+        linesBetweenQueries: 2,
+        denseOperators: true,
+        newlineBeforeSemicolon: true,
+      },
+    } as any).sqlFormatter,
+    {
+      keywordCase: "lower",
+      functionCase: "upper",
+      dataTypeCase: "upper",
+      useTabs: true,
+      tabWidth: 4,
+      logicalOperatorNewline: "after",
+      expressionWidth: 120,
+      linesBetweenQueries: 2,
+      denseOperators: true,
+      newlineBeforeSemicolon: true,
+    },
+  );
+});
+
+test("keeps SQL formatter default objects distinct", () => {
+  const normalized = normalizeEditorSettings({});
+
+  assert.notEqual(DEFAULT_EDITOR_SETTINGS.sqlFormatter, DEFAULT_SQL_FORMATTER_SETTINGS);
+  assert.notEqual(normalized.sqlFormatter, DEFAULT_EDITOR_SETTINGS.sqlFormatter);
+  assert.notEqual(normalized.sqlFormatter, DEFAULT_SQL_FORMATTER_SETTINGS);
+});
+
+test("does not leak default-loaded SQL formatter mutations into defaults", () => {
+  withMockLocalStorage({}, () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    const editorDefaultKeywordCase = DEFAULT_EDITOR_SETTINGS.sqlFormatter.keywordCase;
+    const formatterDefaultKeywordCase = DEFAULT_SQL_FORMATTER_SETTINGS.keywordCase;
+
+    try {
+      store.editorSettings.sqlFormatter.keywordCase = "lower";
+
+      assert.notEqual(store.editorSettings.sqlFormatter, DEFAULT_EDITOR_SETTINGS.sqlFormatter);
+      assert.notEqual(store.editorSettings.sqlFormatter, DEFAULT_SQL_FORMATTER_SETTINGS);
+      assert.equal(DEFAULT_EDITOR_SETTINGS.sqlFormatter.keywordCase, editorDefaultKeywordCase);
+      assert.equal(DEFAULT_SQL_FORMATTER_SETTINGS.keywordCase, formatterDefaultKeywordCase);
+    } finally {
+      DEFAULT_EDITOR_SETTINGS.sqlFormatter.keywordCase = editorDefaultKeywordCase;
+      DEFAULT_SQL_FORMATTER_SETTINGS.keywordCase = formatterDefaultKeywordCase;
+    }
+  });
+});
+
+test("does not leak migrated SQL formatter mutations into defaults", () => {
+  withMockLocalStorage({ [OLD_FONT_SIZE_KEY]: "18" }, () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    const editorDefaultKeywordCase = DEFAULT_EDITOR_SETTINGS.sqlFormatter.keywordCase;
+    const formatterDefaultKeywordCase = DEFAULT_SQL_FORMATTER_SETTINGS.keywordCase;
+
+    try {
+      assert.equal(store.editorSettings.fontSize, 18);
+      store.editorSettings.sqlFormatter.keywordCase = "lower";
+
+      assert.notEqual(store.editorSettings.sqlFormatter, DEFAULT_EDITOR_SETTINGS.sqlFormatter);
+      assert.notEqual(store.editorSettings.sqlFormatter, DEFAULT_SQL_FORMATTER_SETTINGS);
+      assert.equal(DEFAULT_EDITOR_SETTINGS.sqlFormatter.keywordCase, editorDefaultKeywordCase);
+      assert.equal(DEFAULT_SQL_FORMATTER_SETTINGS.keywordCase, formatterDefaultKeywordCase);
+    } finally {
+      DEFAULT_EDITOR_SETTINGS.sqlFormatter.keywordCase = editorDefaultKeywordCase;
+      DEFAULT_SQL_FORMATTER_SETTINGS.keywordCase = formatterDefaultKeywordCase;
+    }
+  });
 });

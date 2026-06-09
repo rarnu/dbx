@@ -8,12 +8,23 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::time::Duration;
+
+use tokio::time::{Duration, MissedTickBehavior};
+
+use crate::models::connection::SshTunnelConfig;
 
 use super::file_validator::validate_file_path;
 
-/// Delay between SSH reconnect attempts.
-const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+/// Initial delay between SSH reconnect attempts.
+const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+/// Maximum delay for exponential backoff.
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+/// Maximum number of consecutive reconnect attempts before giving up.
+const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+/// How often an idle local listener verifies that the SSH session still answers.
+const IDLE_SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// Maximum time to wait for an explicit SSH ping response.
+const IDLE_SESSION_PING_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct SshClient;
 
@@ -37,11 +48,8 @@ async fn connect_and_authenticate(
     ssh_key_passphrase: &str,
     connect_timeout_secs: u64,
 ) -> Result<Handle<SshClient>, String> {
-    let config = Arc::new(Config {
-        nodelay: true,
-        keepalive_interval: Some(Duration::from_secs(30)),
-        ..Default::default()
-    });
+    let config =
+        Arc::new(Config { nodelay: true, keepalive_interval: Some(Duration::from_secs(30)), ..Default::default() });
     let connect_timeout = Duration::from_secs(connect_timeout_secs);
 
     let mut session =
@@ -90,8 +98,32 @@ async fn connect_and_authenticate(
 /// Accept connections on the local listener and forward them through the SSH session.
 /// Returns when the SSH session dies (listener error or session.is_closed()).
 async fn forward_loop(session: &Handle<SshClient>, listener: &TcpListener, remote_host: &str, remote_port: u16) {
+    let mut idle_check = tokio::time::interval(IDLE_SESSION_CHECK_INTERVAL);
+    idle_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
     loop {
-        let (mut stream, peer_addr) = match listener.accept().await {
+        let accepted = tokio::select! {
+            result = listener.accept() => result,
+            _ = idle_check.tick() => {
+                if session.is_closed() {
+                    log::warn!("SSH session closed while tunnel was idle");
+                    break;
+                }
+                match tokio::time::timeout(IDLE_SESSION_PING_TIMEOUT, session.send_ping()).await {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(e)) => {
+                        log::warn!("SSH idle ping failed: {e}");
+                        break;
+                    }
+                    Err(_) => {
+                        log::warn!("SSH idle ping timed out");
+                        break;
+                    }
+                }
+            }
+        };
+
+        let (mut stream, peer_addr) = match accepted {
             Ok(v) => v,
             Err(e) => {
                 log::error!("SSH tunnel listener error: {e}");
@@ -117,11 +149,7 @@ async fn forward_loop(session: &Handle<SshClient>, listener: &TcpListener, remot
             Ok(c) => c,
             Err(e) => {
                 log::error!("SSH direct-tcpip failed: {e}");
-                if session.is_closed() {
-                    log::warn!("SSH session closed after channel open failure");
-                    break;
-                }
-                continue;
+                break;
             }
         };
 
@@ -165,10 +193,13 @@ async fn forward_loop(session: &Handle<SshClient>, listener: &TcpListener, remot
 /// Main tunnel task: runs the forward loop and automatically reconnects
 /// the SSH session when it drops. The local TcpListener survives across
 /// reconnections so the tunnel appears continuously available to clients.
+/// Uses exponential backoff for reconnect attempts and gives up after
+/// MAX_RECONNECT_ATTEMPTS to avoid log storms from permanent failures.
+#[allow(clippy::too_many_arguments)]
 async fn tunnel_reconnect_loop(
     mut session: Handle<SshClient>,
-    ssh_host: String,
-    ssh_port: u16,
+    connect_host: String,
+    connect_port: u16,
     ssh_user: String,
     ssh_password: String,
     ssh_key_path: String,
@@ -179,25 +210,29 @@ async fn tunnel_reconnect_loop(
     remote_port: u16,
 ) {
     loop {
-        log::info!(
-            "SSH tunnel active: {}:{} -> {}:{}",
-            ssh_host, ssh_port, remote_host, remote_port
-        );
+        log::info!("SSH tunnel active: {}:{} -> {}:{}", connect_host, connect_port, remote_host, remote_port);
 
         forward_loop(&session, &listener, &remote_host, remote_port).await;
 
-        log::warn!(
-            "SSH tunnel connection lost ({}:{}), reconnecting...",
-            ssh_host, ssh_port
-        );
+        log::warn!("SSH tunnel connection lost ({}:{}), reconnecting...", connect_host, connect_port);
 
-        // Reconnect loop with backoff
+        // Reconnect with exponential backoff
+        let mut delay = INITIAL_RECONNECT_DELAY;
+        let mut attempts: u32 = 0;
+
         loop {
-            tokio::time::sleep(RECONNECT_DELAY).await;
+            if attempts >= MAX_RECONNECT_ATTEMPTS {
+                log::error!(
+                    "SSH tunnel ({connect_host}:{connect_port}): max reconnect attempts ({MAX_RECONNECT_ATTEMPTS}) exhausted, giving up"
+                );
+                return;
+            }
+
+            tokio::time::sleep(delay).await;
 
             match connect_and_authenticate(
-                &ssh_host,
-                ssh_port,
+                &connect_host,
+                connect_port,
                 &ssh_user,
                 &ssh_password,
                 &ssh_key_path,
@@ -208,24 +243,51 @@ async fn tunnel_reconnect_loop(
             {
                 Ok(new_session) => {
                     session = new_session;
-                    log::info!("SSH tunnel reconnected to {}:{}", ssh_host, ssh_port);
+                    log::info!(
+                        "SSH tunnel reconnected to {}:{} (attempt {})",
+                        connect_host,
+                        connect_port,
+                        attempts + 1
+                    );
                     break;
                 }
                 Err(e) => {
+                    attempts += 1;
                     log::error!(
-                        "SSH reconnect failed ({}:{}): {e}, retrying in {}s...",
-                        ssh_host,
-                        ssh_port,
-                        RECONNECT_DELAY.as_secs()
+                        "SSH reconnect failed ({}:{}, attempt {attempts}/{MAX_RECONNECT_ATTEMPTS}): {e}",
+                        connect_host,
+                        connect_port,
                     );
+                    // Exponential backoff: double the delay, cap at MAX_RECONNECT_DELAY
+                    delay = std::cmp::min(delay * 2, MAX_RECONNECT_DELAY);
                 }
             }
         }
     }
 }
 
+struct TunnelEntry {
+    handles: Vec<JoinHandle<()>>,
+    local_port: u16,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedTunnel {
+    connect_host: String,
+    connect_port: u16,
+    remote_host: String,
+    remote_port: u16,
+}
+
 pub struct TunnelManager {
-    tunnels: Mutex<HashMap<String, (JoinHandle<()>, u16)>>,
+    tunnels: Mutex<HashMap<String, TunnelEntry>>,
+}
+
+impl Default for TunnelManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TunnelManager {
@@ -248,14 +310,16 @@ impl TunnelManager {
         remote_port: u16,
         expose_to_lan: bool,
     ) -> Result<u16, String> {
-        let local_port = portpicker::pick_unused_port().ok_or("No available port")?;
-
-        let bind_addr = if expose_to_lan { "0.0.0.0" } else { "127.0.0.1" };
-        let listener =
-            TcpListener::bind((bind_addr, local_port)).await.map_err(|e| format!("Failed to bind local port: {e}"))?;
-
-        // Initial connection: fail fast on bad credentials
-        let session = connect_and_authenticate(
+        // Check cache under lock to avoid race with concurrent callers.
+        // Also evict stale entries whose background task has exited.
+        {
+            let mut tunnels = self.tunnels.lock().await;
+            if let Some(port) = Self::get_active_port(&mut tunnels, connection_id) {
+                return Ok(port);
+            }
+        }
+        // Slow SSH connection — do this outside the lock.
+        let (handle, local_port) = spawn_tunnel(
             ssh_host,
             ssh_port,
             ssh_user,
@@ -263,35 +327,252 @@ impl TunnelManager {
             ssh_key_path,
             ssh_key_passphrase,
             connect_timeout_secs,
+            remote_host,
+            remote_port,
+            expose_to_lan,
         )
         .await?;
 
-        let handle = tokio::spawn(tunnel_reconnect_loop(
-            session,
-            ssh_host.to_string(),
-            ssh_port,
-            ssh_user.to_string(),
-            ssh_password.to_string(),
-            ssh_key_path.to_string(),
-            ssh_key_passphrase.to_string(),
-            connect_timeout_secs,
-            listener,
-            remote_host.to_string(),
-            remote_port,
-        ));
-
-        self.tunnels.lock().await.insert(connection_id.to_string(), (handle, local_port));
-
+        // Re-check under lock: another caller may have beaten us.
+        let mut tunnels = self.tunnels.lock().await;
+        if let Some(port) = Self::get_active_port(&mut tunnels, connection_id) {
+            // Another task already created a live tunnel; abort ours.
+            handle.abort();
+            return Ok(port);
+        }
+        tunnels.insert(connection_id.to_string(), TunnelEntry { handles: vec![handle], local_port });
         Ok(local_port)
     }
 
+    /// Returns the local port for a cached tunnel entry, or `None` if the entry
+    /// is stale (all background handles have exited).
+    fn get_active_port(tunnels: &mut HashMap<String, TunnelEntry>, connection_id: &str) -> Option<u16> {
+        let entry = tunnels.get(connection_id)?;
+        if entry.handles.iter().all(|h| h.is_finished()) {
+            tunnels.remove(connection_id);
+            return None;
+        }
+        Some(entry.local_port)
+    }
+
+    pub async fn start_chain(
+        &self,
+        connection_id: &str,
+        hops: &[SshTunnelConfig],
+        remote_host: &str,
+        remote_port: u16,
+    ) -> Result<u16, String> {
+        if hops.is_empty() {
+            return Err("No SSH tunnel hops configured".to_string());
+        }
+        // Check cache under lock; evict stale entries.
+        {
+            let mut tunnels = self.tunnels.lock().await;
+            if let Some(port) = Self::get_active_port(&mut tunnels, connection_id) {
+                return Ok(port);
+            }
+        }
+
+        let mut handles = Vec::new();
+        let mut next_connect_endpoint: Option<(String, u16)> = None;
+        let mut final_local_port = 0;
+
+        for (index, hop) in hops.iter().enumerate() {
+            let is_last = index + 1 == hops.len();
+            let (connect_host, connect_port) =
+                next_connect_endpoint.clone().unwrap_or_else(|| (hop.host.clone(), hop.port));
+            let (target_host, target_port) = if is_last {
+                (remote_host.to_string(), remote_port)
+            } else {
+                (hops[index + 1].host.clone(), hops[index + 1].port)
+            };
+
+            let (handle, local_port) = spawn_tunnel(
+                &connect_host,
+                connect_port,
+                &hop.user,
+                &hop.password,
+                &hop.key_path,
+                &hop.key_passphrase,
+                effective_hop_timeout(hop),
+                &target_host,
+                target_port,
+                is_last && hop.expose_lan,
+            )
+            .await
+            .map_err(|err| format!("SSH hop {} failed: {err}", index + 1))?;
+
+            handles.push(handle);
+            final_local_port = local_port;
+            next_connect_endpoint = Some(("127.0.0.1".to_string(), local_port));
+        }
+
+        // Re-check under lock: another caller may have beaten us.
+        let mut tunnels = self.tunnels.lock().await;
+        if let Some(port) = Self::get_active_port(&mut tunnels, connection_id) {
+            for handle in handles {
+                handle.abort();
+            }
+            return Ok(port);
+        }
+        tunnels.insert(connection_id.to_string(), TunnelEntry { handles, local_port: final_local_port });
+        Ok(final_local_port)
+    }
+
     pub async fn local_port(&self, connection_id: &str) -> Option<u16> {
-        self.tunnels.lock().await.get(connection_id).map(|(_, port)| *port)
+        self.tunnels.lock().await.get(connection_id).map(|entry| entry.local_port)
     }
 
     pub async fn stop_tunnel(&self, connection_id: &str) {
-        if let Some((handle, _)) = self.tunnels.lock().await.remove(connection_id) {
-            handle.abort();
+        if let Some(entry) = self.tunnels.lock().await.remove(connection_id) {
+            for handle in entry.handles {
+                handle.abort();
+            }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_tunnel(
+    connect_host: &str,
+    connect_port: u16,
+    ssh_user: &str,
+    ssh_password: &str,
+    ssh_key_path: &str,
+    ssh_key_passphrase: &str,
+    connect_timeout_secs: u64,
+    remote_host: &str,
+    remote_port: u16,
+    expose_to_lan: bool,
+) -> Result<(JoinHandle<()>, u16), String> {
+    let local_port = portpicker::pick_unused_port().ok_or("No available port")?;
+
+    let bind_addr = if expose_to_lan { "0.0.0.0" } else { "127.0.0.1" };
+    let listener =
+        TcpListener::bind((bind_addr, local_port)).await.map_err(|e| format!("Failed to bind local port: {e}"))?;
+
+    // Initial connection: fail fast on bad credentials
+    let session = connect_and_authenticate(
+        connect_host,
+        connect_port,
+        ssh_user,
+        ssh_password,
+        ssh_key_path,
+        ssh_key_passphrase,
+        connect_timeout_secs,
+    )
+    .await?;
+
+    let handle = tokio::spawn(tunnel_reconnect_loop(
+        session,
+        connect_host.to_string(),
+        connect_port,
+        ssh_user.to_string(),
+        ssh_password.to_string(),
+        ssh_key_path.to_string(),
+        ssh_key_passphrase.to_string(),
+        connect_timeout_secs,
+        listener,
+        remote_host.to_string(),
+        remote_port,
+    ));
+
+    Ok((handle, local_port))
+}
+
+fn effective_hop_timeout(hop: &SshTunnelConfig) -> u64 {
+    if hop.connect_timeout_secs == 0 {
+        crate::models::connection::default_ssh_connect_timeout_secs()
+    } else {
+        hop.connect_timeout_secs
+    }
+}
+
+#[cfg(test)]
+fn plan_chain(
+    hops: &[SshTunnelConfig],
+    remote_host: &str,
+    remote_port: u16,
+    local_ports: &[u16],
+) -> Vec<PlannedTunnel> {
+    let mut planned = Vec::new();
+    let mut next_connect_endpoint: Option<(String, u16)> = None;
+    for (index, hop) in hops.iter().enumerate() {
+        let is_last = index + 1 == hops.len();
+        let (connect_host, connect_port) =
+            next_connect_endpoint.clone().unwrap_or_else(|| (hop.host.clone(), hop.port));
+        let (target_host, target_port) = if is_last {
+            (remote_host.to_string(), remote_port)
+        } else {
+            (hops[index + 1].host.clone(), hops[index + 1].port)
+        };
+        planned.push(PlannedTunnel { connect_host, connect_port, remote_host: target_host, remote_port: target_port });
+        if let Some(local_port) = local_ports.get(index) {
+            next_connect_endpoint = Some(("127.0.0.1".to_string(), *local_port));
+        }
+    }
+    planned
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{effective_hop_timeout, plan_chain, PlannedTunnel, TunnelManager};
+    use crate::models::connection::{default_ssh_connect_timeout_secs, SshTunnelConfig};
+
+    fn hop(id: &str, host: &str, port: u16) -> SshTunnelConfig {
+        SshTunnelConfig {
+            id: id.to_string(),
+            name: String::new(),
+            enabled: true,
+            host: host.to_string(),
+            port,
+            user: "user".to_string(),
+            password: "secret".to_string(),
+            key_path: String::new(),
+            key_passphrase: String::new(),
+            connect_timeout_secs: 5,
+            expose_lan: false,
+        }
+    }
+
+    #[test]
+    fn chain_plan_routes_each_hop_to_next_endpoint() {
+        let hops = vec![hop("a", "bastion-a", 22), hop("b", "bastion-b", 2200)];
+
+        let planned = plan_chain(&hops, "db.internal", 5432, &[41001, 41002]);
+
+        assert_eq!(
+            planned,
+            vec![
+                PlannedTunnel {
+                    connect_host: "bastion-a".to_string(),
+                    connect_port: 22,
+                    remote_host: "bastion-b".to_string(),
+                    remote_port: 2200,
+                },
+                PlannedTunnel {
+                    connect_host: "127.0.0.1".to_string(),
+                    connect_port: 41001,
+                    remote_host: "db.internal".to_string(),
+                    remote_port: 5432,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_hop_timeout_uses_default() {
+        let mut tunnel = hop("a", "bastion-a", 22);
+        tunnel.connect_timeout_secs = 0;
+
+        assert_eq!(effective_hop_timeout(&tunnel), default_ssh_connect_timeout_secs());
+    }
+
+    #[tokio::test]
+    async fn local_port_reuses_existing_chain_entry() {
+        let manager = TunnelManager::new();
+
+        assert_eq!(manager.local_port("missing").await, None);
+        manager.stop_tunnel("missing").await;
     }
 }

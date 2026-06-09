@@ -45,6 +45,7 @@ jobs:
             "${PRODUCT_NAME}_${VERSION}_aarch64.dmg"
             "${PRODUCT_NAME}_${VERSION}_x64.dmg"
             "${PRODUCT_NAME}_${VERSION}_x64-setup.exe"
+            "${PRODUCT_NAME}_${VERSION}_arm64-setup.exe"
           )
 
           for ASSET in "${ASSETS[@]}"; do
@@ -79,7 +80,8 @@ jobs:
           echo "SHA256 hashes:"
           compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_aarch64.dmg" "sha_dmg_arm64"
           compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_x64.dmg" "sha_dmg_x64"
-          compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_x64-setup.exe" "sha_exe"
+          compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_x64-setup.exe" "sha_exe_x64"
+          compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_arm64-setup.exe" "sha_exe_arm64"
 
       - name: Publish Homebrew Cask
         env:
@@ -97,38 +99,27 @@ jobs:
 
           cat > Casks/dbx.rb <<'RUBY_EOF'
           cask "dbx" do
+            arch arm: "aarch64", intel: "x64"
+
             version "__VERSION__"
+            sha256 arm:   "__SHA_ARM64__",
+                   intel: "__SHA_X64__"
 
-            on_arm do
-              url "https://github.com/__OWNER__/__APP__/releases/download/v#{version}/__PRODUCT___#{version}_aarch64.dmg",
-                  verified: "github.com/__OWNER__/__APP__/"
-              sha256 "__SHA_ARM64__"
-            end
-
-            on_intel do
-              url "https://github.com/__OWNER__/__APP__/releases/download/v#{version}/__PRODUCT___#{version}_x64.dmg",
-                  verified: "github.com/__OWNER__/__APP__/"
-              sha256 "__SHA_X64__"
-            end
-
+            url "https://github.com/__OWNER__/__APP__/releases/download/v#{version}/__PRODUCT___#{version}_#{arch}.dmg",
+                verified: "github.com/__OWNER__/__APP__/"
             name "DBX"
-            desc "Open-source database management tool"
-            homepage "https://github.com/__OWNER__/__APP__"
+            desc "Database management tool"
+            homepage "https://dbxio.com/"
 
-            livecheck do
-              url :url
-              strategy :github_latest
-            end
-
-            depends_on macos: ">= :big_sur"
+            depends_on macos: :big_sur
 
             app "DBX.app"
 
             zap trash: [
               "~/Library/Application Support/com.dbx.app",
               "~/Library/Caches/com.dbx.app",
-              "~/Library/Preferences/com.dbx.app.plist",
               "~/Library/Logs/com.dbx.app",
+              "~/Library/Preferences/com.dbx.app.plist",
             ]
           end
           RUBY_EOF
@@ -159,7 +150,8 @@ jobs:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          SHA_EXE="${{ steps.hashes.outputs.sha_exe }}"
+          SHA_EXE_X64="${{ steps.hashes.outputs.sha_exe_x64 }}"
+          SHA_EXE_ARM64="${{ steps.hashes.outputs.sha_exe_arm64 }}"
 
           git clone --depth 1 \
             "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/${REPO_OWNER}/scoop-bucket.git" \
@@ -171,11 +163,15 @@ jobs:
               "version": "${VERSION}",
               "description": "Open-source database management tool",
               "homepage": "https://github.com/${REPO_OWNER}/${APP_NAME}",
-              "license": "MIT",
+              "license": "Apache-2.0",
               "architecture": {
                   "64bit": {
                       "url": "https://github.com/${REPO_OWNER}/${APP_NAME}/releases/download/v${VERSION}/${PRODUCT_NAME}_${VERSION}_x64-setup.exe",
-                      "hash": "${SHA_EXE}"
+                      "hash": "${SHA_EXE_X64}"
+                  },
+                  "arm64": {
+                      "url": "https://github.com/${REPO_OWNER}/${APP_NAME}/releases/download/v${VERSION}/${PRODUCT_NAME}_${VERSION}_arm64-setup.exe",
+                      "hash": "${SHA_EXE_ARM64}"
                   }
               },
               "innosetup": false,
@@ -193,6 +189,9 @@ jobs:
                   "architecture": {
                       "64bit": {
                           "url": "https://github.com/${REPO_OWNER}/${APP_NAME}/releases/download/v\$version/${PRODUCT_NAME}_\$version_x64-setup.exe"
+                      },
+                      "arm64": {
+                          "url": "https://github.com/${REPO_OWNER}/${APP_NAME}/releases/download/v\$version/${PRODUCT_NAME}_\$version_arm64-setup.exe"
                       }
                   }
               }

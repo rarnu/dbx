@@ -2,6 +2,7 @@ pub mod agent_driver;
 pub mod clickhouse_driver;
 pub mod duckdb_driver;
 pub mod elasticsearch_driver;
+pub mod elasticsearch_sql;
 pub mod file_validator;
 pub mod mongo_driver;
 pub mod mysql;
@@ -9,10 +10,13 @@ pub mod ob_oracle;
 pub mod postgres;
 pub mod proxy_tunnel;
 pub mod redis_driver;
+pub mod rqlite_driver;
 pub mod sqlite;
 pub mod sqlserver;
 pub mod ssh_tunnel;
+pub mod transport_layer_tunnel;
 
+use reqwest::ClientBuilder;
 use std::future::Future;
 use std::time::Duration;
 
@@ -27,10 +31,14 @@ pub fn connection_timeout() -> Duration {
     Duration::from_secs(CONNECTION_TIMEOUT_SECS)
 }
 
+pub fn http_client_builder(timeout: Duration) -> ClientBuilder {
+    reqwest::Client::builder().connect_timeout(timeout).no_proxy()
+}
+
 const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 pub fn safe_i64_to_json(v: i64) -> serde_json::Value {
-    if v > JS_MAX_SAFE_INTEGER || v < -JS_MAX_SAFE_INTEGER {
+    if !(-JS_MAX_SAFE_INTEGER..=JS_MAX_SAFE_INTEGER).contains(&v) {
         serde_json::Value::String(v.to_string())
     } else {
         serde_json::Value::Number(v.into())
@@ -86,7 +94,7 @@ pub fn parse_connect_timeout_with_fallback(url: &str, fallback: Duration) -> Dur
             || key.eq_ignore_ascii_case("connectionTimeout")
         {
             if let Ok(v) = value.parse::<u64>() {
-                if v >= 1 && v <= 300 {
+                if (1..=300).contains(&v) {
                     return Duration::from_secs(v);
                 }
             }

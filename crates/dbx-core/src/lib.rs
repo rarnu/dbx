@@ -1,4 +1,8 @@
+pub mod agent_catalog;
+pub mod agent_connection;
+pub mod agent_kv;
 pub mod agent_manager;
+pub mod agent_runtime;
 pub mod agent_service;
 pub mod ai;
 pub mod cloud_sync;
@@ -12,12 +16,14 @@ pub mod database_export;
 pub mod database_search_sql;
 pub mod db;
 pub mod db_admin_sql;
+pub mod driver_runtime;
 pub mod external;
 pub mod history;
 pub mod jdbc;
 pub mod models;
 pub mod mongo_ops;
 pub mod object_source_sql;
+pub mod path_utils;
 pub mod plugins;
 pub mod query;
 pub mod query_cancel;
@@ -31,7 +37,9 @@ pub mod sql;
 pub mod sql_analysis;
 pub mod sql_dialect;
 pub mod sql_editability;
+pub mod sql_file_import;
 pub mod storage;
+pub mod table_export;
 pub mod table_import;
 pub mod table_structure_sql;
 pub mod text_export;
@@ -46,6 +54,10 @@ pub fn download_candidate_urls(github_url: &str, r2_path: &str) -> Vec<String> {
     vec![format!("{R2_CDN_BASE}{r2_path}"), github_url.to_string()]
 }
 
+use std::pin::Pin;
+
+type ResponseFuture = Pin<Box<dyn std::future::Future<Output = Result<reqwest::Response, String>> + Send>>;
+
 pub async fn race_download(
     client: &reqwest::Client,
     github_url: &str,
@@ -53,11 +65,9 @@ pub async fn race_download(
     user_agent: &str,
 ) -> Result<reqwest::Response, String> {
     use futures::future::select_ok;
-    use std::pin::Pin;
 
     let urls = download_candidate_urls(github_url, r2_path);
-    let mut futs: Vec<Pin<Box<dyn std::future::Future<Output = Result<reqwest::Response, String>> + Send>>> =
-        Vec::with_capacity(urls.len());
+    let mut futs: Vec<ResponseFuture> = Vec::with_capacity(urls.len());
 
     for url in urls {
         let client = client.clone();
@@ -70,7 +80,7 @@ pub async fn race_download(
                 .await
                 .and_then(|r| r.error_for_status())
                 .map_err(|e| format!("{e}"))
-        }) as Pin<Box<dyn std::future::Future<Output = Result<reqwest::Response, String>> + Send>>);
+        }) as ResponseFuture);
     }
 
     match select_ok(futs).await {

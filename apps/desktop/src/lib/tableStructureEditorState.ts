@@ -114,6 +114,7 @@ export const DATA_TYPE_OPTIONS: Record<string, string[]> = {
     "oid",
   ],
   sqlite: ["integer", "real", "text", "blob", "numeric"],
+  rqlite: ["integer", "real", "text", "blob", "numeric"],
   sqlserver: [
     "bit",
     "tinyint",
@@ -230,6 +231,28 @@ export const DATA_TYPE_OPTIONS: Record<string, string[]> = {
   ],
 };
 
+const DATA_TYPE_OPTION_ALIASES: Partial<Record<DatabaseType, string>> = {
+  doris: "mysql",
+  starrocks: "mysql",
+  goldendb: "mysql",
+  sundb: "mysql",
+  gaussdb: "postgres",
+  kwdb: "postgres",
+  opengauss: "postgres",
+  redshift: "postgres",
+  highgo: "postgres",
+  vastbase: "postgres",
+  kingbase: "postgres",
+  dameng: "oracle",
+  "oceanbase-oracle": "oracle",
+  iris: "oracle",
+};
+
+export function getDataTypeOptions(dbType: DatabaseType | undefined): string[] {
+  const key = dbType ? (DATA_TYPE_OPTION_ALIASES[dbType] ?? dbType) : "";
+  return DATA_TYPE_OPTIONS[key] ?? [];
+}
+
 export const DEFAULT_TYPE_LENGTHS: Record<string, string> = {
   tinyint: "4",
   smallint: "6",
@@ -273,16 +296,36 @@ export function parseExtraToColumnExtra(extra: string | null | undefined, databa
     if (lower.includes("on update current_timestamp")) {
       result.onUpdateCurrentTimestamp = true;
     }
-  } else if (databaseType === "postgres") {
+  } else if (
+    databaseType === "postgres" ||
+    databaseType === "gaussdb" ||
+    databaseType === "kwdb" ||
+    databaseType === "opengauss" ||
+    databaseType === "highgo" ||
+    databaseType === "vastbase" ||
+    databaseType === "kingbase"
+  ) {
     const identityMatch = lower.match(/generated\s+(by\s+default|always)\s+as\s+identity/i);
     if (identityMatch) {
+      const sequenceMatch = lower.match(/start\s+with\s*(-?\d+)\s+increment\s+by\s*(-?\d+)/i);
       result.identity = {
         generation: identityMatch[1].toUpperCase() === "BY DEFAULT" ? "BY DEFAULT" : "ALWAYS",
       };
+      if (sequenceMatch) {
+        result.identity.seed = Number(sequenceMatch[1]);
+        result.identity.increment = Number(sequenceMatch[2]);
+      }
     }
   } else if (databaseType === "sqlserver") {
     if (lower.includes("identity")) {
       result.autoIncrement = true;
+      const identityMatch = lower.match(/identity\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)/i);
+      if (identityMatch) {
+        result.identity = {
+          seed: Number(identityMatch[1]),
+          increment: Number(identityMatch[2]),
+        };
+      }
     }
   }
 
@@ -364,6 +407,7 @@ function isTemporalPrecisionType(dbType: DatabaseType | undefined, baseType: str
       return ["time", "datetime", "timestamp"].includes(normalized);
     case "postgres":
     case "gaussdb":
+    case "kwdb":
     case "opengauss":
     case "highgo":
     case "vastbase":

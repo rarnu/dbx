@@ -129,6 +129,10 @@ pub fn build_query_pagination_execution_plan(
         return plan;
     }
 
+    if options.database_type == Some(DatabaseType::SqlServer) && starts_with_cte(&options.query_base_sql) {
+        return plan;
+    }
+
     if options.use_agent_cursor && options.pagination.offset == 0 {
         plan.sql_to_execute = options.query_base_sql;
         plan.page_limit = Some(options.pagination.limit);
@@ -174,6 +178,23 @@ pub fn build_paginated_query_sql(options: PaginatedQuerySqlOptions) -> QuerySqlB
         return ok(add_mysql_limit(&statement, safe_limit, safe_offset));
     }
 
+    if options.database_type == Some(DatabaseType::Elasticsearch) {
+        // If the user wrote their own LIMIT, leave the SQL alone — they
+        // explicitly bounded the result set and the front-end will paginate
+        // client-side. Otherwise wrap with an explicit OFFSET (even when
+        // 0) so the ES driver can tell a plan-wrapped query from one the
+        // user wrote, which decides whether affected_rows should reflect
+        // the index total or the row count we actually returned.
+        if has_top_level_limit(&statement) {
+            return err("unsupported");
+        }
+        return ok(format!("{statement} LIMIT {safe_limit} OFFSET {safe_offset};"));
+    }
+
+    if options.database_type == Some(DatabaseType::Oracle) {
+        return ok(format!("{statement};"));
+    }
+
     if options.database_type.is_some_and(uses_fetch_first) {
         return ok(add_fetch_first_limit(&statement, safe_limit, safe_offset));
     }
@@ -186,6 +207,11 @@ pub fn build_count_query_sql(options: CountQuerySqlOptions) -> QuerySqlBuildResu
         return err(single_statement_error_reason(&options.original_sql));
     };
     if unsupported_pagination_type(options.database_type) {
+        return err("unsupported");
+    }
+    // ES SQL can't wrap a SELECT in `SELECT COUNT(*) FROM (...)` — the
+    // driver already reports the true match count via affected_rows.
+    if options.database_type == Some(DatabaseType::Elasticsearch) {
         return err("unsupported");
     }
 
@@ -221,7 +247,9 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
     }
 
     let aliases = build_derived_column_aliases(&options.result_columns);
-    let use_derived_column_aliases = options.database_type != Some(DatabaseType::Mysql);
+    let use_derived_column_aliases = options.database_type != Some(DatabaseType::Mysql)
+        && options.database_type != Some(DatabaseType::Sqlite)
+        && options.database_type != Some(DatabaseType::DuckDb);
     let sort_alias = if use_derived_column_aliases {
         aliases
             .get(options.column_index)
@@ -268,10 +296,7 @@ fn err(reason: &str) -> QuerySqlBuildResult {
 }
 
 fn unsupported_pagination_type(database_type: Option<DatabaseType>) -> bool {
-    matches!(
-        database_type,
-        Some(DatabaseType::Neo4j | DatabaseType::MongoDb | DatabaseType::Redis | DatabaseType::Elasticsearch)
-    )
+    matches!(database_type, Some(DatabaseType::Neo4j | DatabaseType::MongoDb | DatabaseType::Redis))
 }
 
 fn single_selectable_statement(original_sql: &str) -> Result<String, ()> {
@@ -287,7 +312,7 @@ fn single_selectable_statement(original_sql: &str) -> Result<String, ()> {
     if statement.len() != base_sql.trim_end_matches(';').trim().len() {
         return Err(());
     }
-    let upper = statement.trim_start().to_ascii_uppercase();
+    let upper = statement.trim_start_matches(';').trim_start().to_ascii_uppercase();
     if !(upper.starts_with("SELECT") || upper.starts_with("WITH")) {
         return Err(());
     }
@@ -296,6 +321,10 @@ fn single_selectable_statement(original_sql: &str) -> Result<String, ()> {
     }
 
     Ok(statement)
+}
+
+fn starts_with_cte(sql: &str) -> bool {
+    sql.trim_start().trim_start_matches(';').trim_start().to_ascii_uppercase().starts_with("WITH")
 }
 
 fn single_statement_error_reason(original_sql: &str) -> &'static str {
@@ -331,11 +360,32 @@ fn add_sql_server_top(sql: &str, limit: usize) -> String {
     if has_top_level_select_top(sql) {
         return sql.to_string();
     }
-    if sql.len() >= 6 && sql[..6].to_ascii_uppercase() == "SELECT" {
-        format!("SELECT TOP ({limit}){}", &sql[6..])
+    if sql.len() >= 6 && sql[..6].eq_ignore_ascii_case("SELECT") {
+        let rest = &sql[6..];
+        if let Some((leading, after_modifier)) = strip_sql_server_select_modifier(rest, "DISTINCT") {
+            return format!("SELECT{leading}DISTINCT TOP ({limit}){after_modifier}");
+        }
+        if let Some((leading, after_modifier)) = strip_sql_server_select_modifier(rest, "ALL") {
+            return format!("SELECT{leading}ALL TOP ({limit}){after_modifier}");
+        }
+        format!("SELECT TOP ({limit}){rest}")
     } else {
         format!("SELECT TOP ({limit}) * FROM ({sql}) [dbx_page]")
     }
+}
+
+fn strip_sql_server_select_modifier<'a>(rest: &'a str, modifier: &str) -> Option<(&'a str, &'a str)> {
+    let trimmed = rest.trim_start();
+    let leading_ws_len = rest.len() - trimmed.len();
+    let candidate = trimmed.get(..modifier.len())?;
+    let after_modifier = trimmed.get(modifier.len()..)?;
+    if !candidate.eq_ignore_ascii_case(modifier) {
+        return None;
+    }
+    if after_modifier.chars().next().is_some_and(is_sql_token_part) {
+        return None;
+    }
+    Some((&rest[..leading_ws_len], after_modifier))
 }
 
 fn sql_server_statement_for_derived_table(statement: &str) -> String {
@@ -598,7 +648,7 @@ mod tests {
             offset: 200,
         });
 
-        assert_eq!(result.ok, true);
+        assert!(result.ok);
         assert_eq!(result.sql.unwrap(), "SELECT id, name FROM users LIMIT 100 OFFSET 200;");
     }
 
@@ -611,7 +661,7 @@ mod tests {
             offset: 0,
         });
 
-        assert_eq!(result.ok, true);
+        assert!(result.ok);
         assert_eq!(result.sql.unwrap(), "SELECT TOP (100) id FROM users ORDER BY id DESC");
     }
 
@@ -624,8 +674,50 @@ mod tests {
             offset: 0,
         });
 
-        assert_eq!(result.ok, true);
+        assert!(result.ok);
         assert_eq!(result.sql.unwrap(), "SELECT TOP (100) COUNT(*) FROM TicketInfo");
+    }
+
+    #[test]
+    fn inserts_sqlserver_top_after_distinct_modifier() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT DISTINCT ProjectType FROM JDDR_sys_BasicConfig_ProjectInfo_Data".to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT DISTINCT TOP (100) ProjectType FROM JDDR_sys_BasicConfig_ProjectInfo_Data"
+        );
+    }
+
+    #[test]
+    fn inserts_sqlserver_top_after_all_modifier() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT ALL ProjectType FROM JDDR_sys_BasicConfig_ProjectInfo_Data".to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert!(result.ok);
+        assert_eq!(result.sql.unwrap(), "SELECT ALL TOP (100) ProjectType FROM JDDR_sys_BasicConfig_ProjectInfo_Data");
+    }
+
+    #[test]
+    fn does_not_treat_sqlserver_select_prefix_as_all_modifier() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT AllProjectType FROM JDDR_sys_BasicConfig_ProjectInfo_Data".to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert!(result.ok);
+        assert_eq!(result.sql.unwrap(), "SELECT TOP (100) AllProjectType FROM JDDR_sys_BasicConfig_ProjectInfo_Data");
     }
 
     #[test]
@@ -637,8 +729,37 @@ mod tests {
             offset: 0,
         });
 
-        assert_eq!(result.ok, true);
+        assert!(result.ok);
         assert_eq!(result.sql.unwrap(), "SELECT TOP 1000 * FROM TicketInfo");
+    }
+
+    #[test]
+    fn sqlserver_cte_pagination_plan_executes_original_sql() {
+        let sql = ";WITH ranked AS (SELECT id FROM dbo.users) SELECT * FROM ranked".to_string();
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.clone(),
+            query_base_sql: sql.clone(),
+            database_type: Some(DatabaseType::SqlServer),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: false,
+        });
+
+        assert_eq!(plan.sql_to_execute, sql);
+        assert!(plan.page_sql.is_none());
+        assert!(plan.count_sql.is_none());
+        assert_eq!(plan.page_limit, None);
+        assert_eq!(plan.page_offset, None);
+    }
+
+    #[test]
+    fn sqlserver_cte_count_query_is_not_wrapped_as_derived_table() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: ";WITH cte AS (SELECT 1 AS id) SELECT * FROM cte".to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+        });
+
+        assert!(!result.ok);
+        assert!(result.sql.is_none());
     }
 
     #[test]
@@ -650,7 +771,7 @@ mod tests {
             offset: 0,
         });
 
-        assert_eq!(result.ok, true);
+        assert!(result.ok);
         assert_eq!(result.sql.unwrap(), "SELECT TOP (100) @@version");
     }
 
@@ -667,10 +788,22 @@ mod tests {
     }
 
     #[test]
-    fn uses_fetch_first_pagination_for_oracle() {
+    fn oracle_pagination_skips_sql_clause() {
         let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
             original_sql: "SELECT id FROM users".to_string(),
             database_type: Some(DatabaseType::Oracle),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert_eq!(result.sql.unwrap(), "SELECT id FROM users;");
+    }
+
+    #[test]
+    fn uses_fetch_first_pagination_for_db2() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT id FROM users".to_string(),
+            database_type: Some(DatabaseType::Db2),
             limit: 100,
             offset: 0,
         });

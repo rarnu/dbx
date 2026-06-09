@@ -2,7 +2,26 @@ import { access, readFile } from "node:fs/promises";
 import { bridgePortFilePath, dbPath, appDataDir } from "./paths.js";
 import { inspectConnectionStore } from "./connections.js";
 
-export const DIRECT_QUERY_TYPES = ["postgres", "redshift", "mysql", "doris", "starrocks", "sqlite", "gaussdb", "opengauss"] as const;
+export const DIRECT_QUERY_TYPES = [
+  "postgres",
+  "redshift",
+  "mysql",
+  "doris",
+  "starrocks",
+  "sqlite",
+  "rqlite",
+  "gaussdb",
+  "kwdb",
+  "opengauss",
+] as const;
+
+export type DirectQueryType = (typeof DIRECT_QUERY_TYPES)[number];
+
+const DIRECT_QUERY_TYPE_SET = new Set<string>(DIRECT_QUERY_TYPES);
+
+export function isDirectQueryType(dbType: string): dbType is DirectQueryType {
+  return DIRECT_QUERY_TYPE_SET.has(dbType);
+}
 
 export const BRIDGE_REQUIRED_TYPES = [
   "redis",
@@ -17,6 +36,7 @@ export const BRIDGE_REQUIRED_TYPES = [
   "highgo",
   "vastbase",
   "goldendb",
+  "databend",
   "yashandb",
   "databricks",
   "saphana",
@@ -27,17 +47,20 @@ export const BRIDGE_REQUIRED_TYPES = [
   "oceanbase-oracle",
   "gbase",
   "tdengine",
+  "iotdb",
   "h2",
   "snowflake",
   "trino",
   "hive",
   "db2",
   "informix",
+  "iris",
   "neo4j",
   "cassandra",
   "bigquery",
   "kylin",
   "sundb",
+  "xugu",
   "jdbc",
   "access",
 ] as const;

@@ -201,6 +201,13 @@ const clickhouseCapabilities = capabilities({
   comment: true,
 });
 
+const accessCapabilities = capabilities({
+  dialect: "h2",
+  createTable: true,
+  addColumn: true,
+  createIndex: true,
+});
+
 const capabilityByType: Partial<Record<DatabaseType, TableStructureCapabilities>> = {
   mysql: mysqlCapabilities,
   doris: mysqlCapabilities,
@@ -209,18 +216,22 @@ const capabilityByType: Partial<Record<DatabaseType, TableStructureCapabilities>
   sundb: mysqlCapabilities,
   postgres: postgresCapabilities,
   gaussdb: postgresCapabilities,
+  kwdb: postgresCapabilities,
   opengauss: postgresCapabilities,
   redshift: redshiftCapabilities,
   highgo: postgresCapabilities,
   vastbase: postgresCapabilities,
   kingbase: postgresCapabilities,
   sqlite: sqliteCapabilities,
+  rqlite: sqliteCapabilities,
   duckdb: duckdbCapabilities,
   sqlserver: sqlserverCapabilities,
   oracle: oracleCapabilities,
   dameng: oracleCapabilities,
   "oceanbase-oracle": oracleCapabilities,
+  iris: oracleCapabilities,
   h2: h2Capabilities,
+  access: accessCapabilities,
   clickhouse: clickhouseCapabilities,
 };
 

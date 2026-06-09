@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::models::connection::DatabaseType;
-use crate::sql_dialect::{is_schema_aware, quote_table_identifier};
+use crate::sql_dialect::{is_schema_aware, qualified_table_name, quote_table_identifier};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -10,6 +10,15 @@ pub enum DatabaseObjectType {
     View,
     Procedure,
     Function,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TableChildObjectType {
+    Column,
+    Index,
+    ForeignKey,
+    Trigger,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,6 +73,18 @@ pub struct TableAdminSqlOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     pub table_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropTableChildObjectSqlOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_type: Option<DatabaseType>,
+    pub object_type: TableChildObjectType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    pub table_name: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,6 +144,15 @@ pub fn build_duckdb_attach_database_sql(options: DuckDbAttachDatabaseSqlOptions)
     )
 }
 
+pub fn build_create_user_sql(username: &str, password: &str, tablespace: &str) -> String {
+    format!(
+        "CREATE USER {} IDENTIFIED BY {} DEFAULT TABLESPACE {};",
+        quote_table_identifier(Some(DatabaseType::Dameng), username),
+        quote_sql_string(password),
+        quote_table_identifier(Some(DatabaseType::Dameng), tablespace)
+    )
+}
+
 pub fn build_drop_object_sql(options: DropObjectSqlOptions) -> String {
     format!(
         "DROP {} {};",
@@ -132,7 +162,82 @@ pub fn build_drop_object_sql(options: DropObjectSqlOptions) -> String {
 }
 
 pub fn build_drop_table_sql(options: TableAdminSqlOptions) -> String {
-    format!("DROP TABLE {};", qualified_name(options.database_type, options.schema.as_deref(), &options.table_name))
+    let table = qualified_name(options.database_type, options.schema.as_deref(), &options.table_name);
+    if matches!(options.database_type, Some(DatabaseType::Iotdb)) {
+        return format!("DELETE TIMESERIES {};", iotdb_timeseries_pattern(&table));
+    }
+    format!("DROP TABLE {table};")
+}
+
+pub fn build_drop_table_child_object_sql(options: DropTableChildObjectSqlOptions) -> Result<String, String> {
+    let database_type = options.database_type;
+    let table = qualified_name(database_type, options.schema.as_deref(), &options.table_name);
+    let name = quote_rename_identifier(database_type, &options.name);
+    match options.object_type {
+        TableChildObjectType::Column => Ok(format!("ALTER TABLE {table} DROP COLUMN {name};")),
+        TableChildObjectType::Index => {
+            if matches!(database_type, Some(DatabaseType::ClickHouse | DatabaseType::Redshift)) {
+                return Err(format!("Dropping indexes is not supported for {}.", database_label(database_type)));
+            }
+            if matches!(database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb | DatabaseType::SqlServer)) {
+                return Ok(format!("DROP INDEX {name} ON {table};"));
+            }
+            if matches!(
+                database_type,
+                Some(
+                    DatabaseType::Postgres
+                        | DatabaseType::Gaussdb
+                        | DatabaseType::Kwdb
+                        | DatabaseType::OpenGauss
+                        | DatabaseType::Highgo
+                        | DatabaseType::Vastbase
+                        | DatabaseType::Kingbase
+                        | DatabaseType::Oracle
+                        | DatabaseType::Dameng
+                        | DatabaseType::OceanbaseOracle
+                        | DatabaseType::Iris
+                )
+            ) && options.schema.as_deref().is_some_and(|schema| !schema.is_empty())
+            {
+                let schema = quote_rename_identifier(database_type, options.schema.as_deref().unwrap());
+                return Ok(format!("DROP INDEX {schema}.{name};"));
+            }
+            Ok(format!("DROP INDEX {name};"))
+        }
+        TableChildObjectType::ForeignKey => {
+            if matches!(database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb)) {
+                Ok(format!("ALTER TABLE {table} DROP FOREIGN KEY {name};"))
+            } else {
+                Ok(format!("ALTER TABLE {table} DROP CONSTRAINT {name};"))
+            }
+        }
+        TableChildObjectType::Trigger => {
+            if matches!(
+                database_type,
+                Some(
+                    DatabaseType::Postgres
+                        | DatabaseType::Gaussdb
+                        | DatabaseType::Kwdb
+                        | DatabaseType::OpenGauss
+                        | DatabaseType::Highgo
+                        | DatabaseType::Vastbase
+                        | DatabaseType::Kingbase
+                )
+            ) {
+                Ok(format!("DROP TRIGGER {name} ON {table};"))
+            } else if matches!(database_type, Some(DatabaseType::SqlServer)) {
+                Ok(format!("DROP TRIGGER {name};"))
+            } else if database_type.is_some_and(is_schema_aware)
+                && options.schema.as_deref().is_some_and(|schema| !schema.is_empty())
+                && !matches!(database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb))
+            {
+                let schema = quote_rename_identifier(database_type, options.schema.as_deref().unwrap());
+                Ok(format!("DROP TRIGGER {schema}.{name};"))
+            } else {
+                Ok(format!("DROP TRIGGER {name};"))
+            }
+        }
+    }
 }
 
 pub fn build_empty_table_sql(options: TableAdminSqlOptions) -> String {
@@ -141,13 +246,16 @@ pub fn build_empty_table_sql(options: TableAdminSqlOptions) -> String {
         Some(DatabaseType::ClickHouse) => format!("ALTER TABLE {table} DELETE WHERE 1 = 1;"),
         Some(DatabaseType::Bigquery) => format!("DELETE FROM {table} WHERE TRUE;"),
         Some(DatabaseType::Cassandra | DatabaseType::Hive | DatabaseType::Kylin) => format!("TRUNCATE TABLE {table};"),
+        Some(DatabaseType::Iotdb) => format!("DELETE FROM {};", iotdb_timeseries_pattern(&table)),
         _ => format!("DELETE FROM {table};"),
     }
 }
 
 pub fn build_truncate_table_sql(options: TableAdminSqlOptions) -> String {
     let table = qualified_name(options.database_type, options.schema.as_deref(), &options.table_name);
-    if matches!(options.database_type, Some(DatabaseType::Sqlite | DatabaseType::DuckDb)) {
+    if matches!(options.database_type, Some(DatabaseType::Iotdb)) {
+        format!("DELETE FROM {};", iotdb_timeseries_pattern(&table))
+    } else if matches!(options.database_type, Some(DatabaseType::Sqlite | DatabaseType::DuckDb)) {
         format!("DELETE FROM {table};")
     } else {
         format!("TRUNCATE TABLE {table};")
@@ -164,7 +272,7 @@ pub fn build_create_schema_sql(options: SchemaNameSqlOptions) -> String {
 
 pub fn build_drop_schema_sql(options: SchemaNameSqlOptions) -> String {
     let schema = quote_table_identifier(options.database_type, &options.name);
-    if matches!(options.database_type, Some(DatabaseType::Postgres | DatabaseType::Gaussdb)) {
+    if matches!(options.database_type, Some(DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::Kwdb)) {
         format!("DROP SCHEMA {schema} CASCADE;")
     } else {
         format!("DROP SCHEMA {schema};")
@@ -269,6 +377,7 @@ fn is_postgres_like_rename(database_type: DatabaseType) -> bool {
         DatabaseType::Postgres
             | DatabaseType::Redshift
             | DatabaseType::Gaussdb
+            | DatabaseType::Kwdb
             | DatabaseType::Kingbase
             | DatabaseType::Highgo
             | DatabaseType::Vastbase
@@ -282,7 +391,11 @@ fn is_oracle_like_rename(database_type: DatabaseType) -> bool {
 fn is_postgres_like_structure_copy(database_type: DatabaseType) -> bool {
     matches!(
         database_type,
-        DatabaseType::Postgres | DatabaseType::Redshift | DatabaseType::Gaussdb | DatabaseType::OpenGauss
+        DatabaseType::Postgres
+            | DatabaseType::Redshift
+            | DatabaseType::Gaussdb
+            | DatabaseType::Kwdb
+            | DatabaseType::OpenGauss
     )
 }
 
@@ -303,6 +416,9 @@ fn quote_rename_identifier(database_type: Option<DatabaseType>, name: &str) -> S
 }
 
 fn qualified_name(database_type: Option<DatabaseType>, schema: Option<&str>, name: &str) -> String {
+    if matches!(database_type, Some(DatabaseType::Iotdb)) {
+        return qualified_table_name(database_type, schema, name);
+    }
     if database_type.is_some_and(is_schema_aware) && schema.is_some_and(|schema| !schema.is_empty()) {
         format!(
             "{}.{}",
@@ -311,6 +427,15 @@ fn qualified_name(database_type: Option<DatabaseType>, schema: Option<&str>, nam
         )
     } else {
         quote_rename_identifier(database_type, name)
+    }
+}
+
+fn iotdb_timeseries_pattern(path: &str) -> String {
+    let path = path.trim().trim_end_matches(';');
+    if path.ends_with(".*") || path.ends_with(".**") {
+        path.to_string()
+    } else {
+        format!("{path}.*")
     }
 }
 
@@ -396,6 +521,14 @@ mod tests {
     }
 
     #[test]
+    fn builds_dameng_create_user_sql_with_escaped_values() {
+        assert_eq!(
+            build_create_user_sql("app\"user", "pa'ss", "main\"space"),
+            "CREATE USER \"app\"\"user\" IDENTIFIED BY 'pa''ss' DEFAULT TABLESPACE \"main\"\"space\";"
+        );
+    }
+
+    #[test]
     fn builds_drop_and_clear_table_sql() {
         let options = TableAdminSqlOptions {
             database_type: Some(DatabaseType::Postgres),
@@ -445,6 +578,30 @@ mod tests {
             }),
             "DELETE FROM \"events\";"
         );
+        assert_eq!(
+            build_drop_table_sql(TableAdminSqlOptions {
+                database_type: Some(DatabaseType::Iotdb),
+                schema: Some("root.test".to_string()),
+                table_name: "DCU_101".to_string(),
+            }),
+            "DELETE TIMESERIES root.test.DCU_101.*;"
+        );
+        assert_eq!(
+            build_empty_table_sql(TableAdminSqlOptions {
+                database_type: Some(DatabaseType::Iotdb),
+                schema: Some("root.test".to_string()),
+                table_name: "root.test.DCU_101".to_string(),
+            }),
+            "DELETE FROM root.test.DCU_101.*;"
+        );
+        assert_eq!(
+            build_truncate_table_sql(TableAdminSqlOptions {
+                database_type: Some(DatabaseType::Iotdb),
+                schema: Some("root.test".to_string()),
+                table_name: "DCU_101".to_string(),
+            }),
+            "DELETE FROM root.test.DCU_101.*;"
+        );
     }
 
     #[test]
@@ -474,10 +631,80 @@ mod tests {
         );
         assert_eq!(
             build_drop_schema_sql(SchemaNameSqlOptions {
-                database_type: Some(DatabaseType::Gaussdb),
+                database_type: Some(DatabaseType::Kwdb),
                 name: "analytics".to_string(),
             }),
             "DROP SCHEMA \"analytics\" CASCADE;"
+        );
+    }
+
+    #[test]
+    fn builds_drop_table_child_object_sql() {
+        assert_eq!(
+            build_drop_table_child_object_sql(DropTableChildObjectSqlOptions {
+                database_type: Some(DatabaseType::Postgres),
+                object_type: TableChildObjectType::Column,
+                schema: Some("public".to_string()),
+                table_name: "orders".to_string(),
+                name: "status".to_string(),
+            })
+            .unwrap(),
+            "ALTER TABLE \"public\".\"orders\" DROP COLUMN \"status\";"
+        );
+        assert_eq!(
+            build_drop_table_child_object_sql(DropTableChildObjectSqlOptions {
+                database_type: Some(DatabaseType::Mysql),
+                object_type: TableChildObjectType::Index,
+                schema: None,
+                table_name: "orders".to_string(),
+                name: "idx_orders_status".to_string(),
+            })
+            .unwrap(),
+            "DROP INDEX `idx_orders_status` ON `orders`;"
+        );
+        assert_eq!(
+            build_drop_table_child_object_sql(DropTableChildObjectSqlOptions {
+                database_type: Some(DatabaseType::Postgres),
+                object_type: TableChildObjectType::Index,
+                schema: Some("public".to_string()),
+                table_name: "orders".to_string(),
+                name: "idx_orders_status".to_string(),
+            })
+            .unwrap(),
+            "DROP INDEX \"public\".\"idx_orders_status\";"
+        );
+        assert_eq!(
+            build_drop_table_child_object_sql(DropTableChildObjectSqlOptions {
+                database_type: Some(DatabaseType::Mysql),
+                object_type: TableChildObjectType::ForeignKey,
+                schema: None,
+                table_name: "orders".to_string(),
+                name: "fk_orders_user".to_string(),
+            })
+            .unwrap(),
+            "ALTER TABLE `orders` DROP FOREIGN KEY `fk_orders_user`;"
+        );
+        assert_eq!(
+            build_drop_table_child_object_sql(DropTableChildObjectSqlOptions {
+                database_type: Some(DatabaseType::SqlServer),
+                object_type: TableChildObjectType::ForeignKey,
+                schema: Some("dbo".to_string()),
+                table_name: "orders".to_string(),
+                name: "fk_orders_user".to_string(),
+            })
+            .unwrap(),
+            "ALTER TABLE [dbo].[orders] DROP CONSTRAINT [fk_orders_user];"
+        );
+        assert_eq!(
+            build_drop_table_child_object_sql(DropTableChildObjectSqlOptions {
+                database_type: Some(DatabaseType::Postgres),
+                object_type: TableChildObjectType::Trigger,
+                schema: Some("public".to_string()),
+                table_name: "orders".to_string(),
+                name: "orders_audit".to_string(),
+            })
+            .unwrap(),
+            "DROP TRIGGER \"orders_audit\" ON \"public\".\"orders\";"
         );
     }
 
@@ -494,7 +721,7 @@ mod tests {
         );
         assert_eq!(
             build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
-                database_type: Some(DatabaseType::Postgres),
+                database_type: Some(DatabaseType::Kwdb),
                 schema: Some("public".to_string()),
                 source_name: "users".to_string(),
                 target_name: "users_copy".to_string(),
